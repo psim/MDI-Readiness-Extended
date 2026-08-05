@@ -1,5 +1,47 @@
 # Test-MdiReadiness.ps1
 
+> ## ⚠️ THIS IS NOT AN OFFICIAL MICROSOFT SCRIPT
+>
+> This is an **unofficial, modified version** of the
+> [Test-MdiReadiness.ps1](https://github.com/microsoft/Microsoft-Defender-for-Identity/tree/main/Test-MdiReadiness)
+> script originally published by Microsoft. Modifications by **Pietro Di Simplicio**.
+>
+> **It is not affiliated with, endorsed by, approved by, or supported by Microsoft in any way.**
+> Microsoft provides no support for it — do not open Microsoft support cases about this version.
+> For the official, supported tool, use the
+> [original script](https://github.com/microsoft/Microsoft-Defender-for-Identity).
+>
+> ### No warranty and no liability
+>
+> This script is provided **"AS IS"** and **"WITH ALL FAULTS"**, without warranty of any kind, either
+> express or implied, including without limitation any warranties of merchantability, fitness for a
+> particular purpose, accuracy, or non-infringement.
+>
+> **The author accepts no responsibility and no liability whatsoever** if this script does not work,
+> produces incorrect or incomplete results, or causes any problem of any kind — including, without
+> limitation, service interruption, downtime, misconfiguration, loss of data, loss of profits, or any
+> direct, indirect, incidental, special, consequential or punitive damages, even if advised of the
+> possibility of such damage.
+>
+> **You use it entirely at your own risk.** The entire risk as to the results, performance and
+> consequences of using this script rests with you. You are solely responsible for validating its
+> behaviour and its output before relying on either.
+>
+> ### Before you run it
+>
+> - It **reads configuration from your domain controllers** and other servers, and opens network
+>   connections to them. Some checks require elevated privileges and remote WMI access.
+> - **Review the code, and test it in a non-production environment first.**
+> - The optional `-RemediationScript` switch **generates** a script that would change audit policy,
+>   registry values and firewall rules on domain controllers. Nothing is ever applied automatically —
+>   review the generated script and run it with `-WhatIf` before applying anything.
+> - Checks reflect Microsoft's published documentation at the time of writing and **may become
+>   outdated**. Always verify against the current
+>   [official documentation](https://learn.microsoft.com/defender-for-identity/).
+>
+> Original work Copyright (c) Microsoft Corporation, used under the terms of the upstream repository's
+> [MIT licence](https://github.com/microsoft/Microsoft-Defender-for-Identity/blob/main/LICENSE).
+
 The Test-MdiReadiness.ps1 script will query your domain, domain controllers and CA servers to report if the different **Microsoft Defender for Identity** prerequisites are in place or not. It creates an html report and a detailed json file with all the collected data.
 
 It will check the domain for the following items:
