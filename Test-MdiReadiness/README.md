@@ -4,7 +4,7 @@
 >
 > This is an **unofficial, modified version** of the
 > [Test-MdiReadiness.ps1](https://github.com/microsoft/Microsoft-Defender-for-Identity/tree/main/Test-MdiReadiness)
-> script originally published by Microsoft. Modifications by **Pietro Di Simplicio**.
+> script originally published by Microsoft.
 >
 > **It is not affiliated with, endorsed by, approved by, or supported by Microsoft in any way.**
 > Microsoft provides no support for it — do not open Microsoft support cases about this version.
@@ -17,7 +17,7 @@
 > express or implied, including without limitation any warranties of merchantability, fitness for a
 > particular purpose, accuracy, or non-infringement.
 >
-> **The author accepts no responsibility and no liability whatsoever** if this script does not work,
+> **No responsibility and no liability is accepted whatsoever** if this script does not work,
 > produces incorrect or incomplete results, or causes any problem of any kind — including, without
 > limitation, service interruption, downtime, misconfiguration, loss of data, loss of profits, or any
 > direct, indirect, incidental, special, consequential or punitive damages, even if advised of the
@@ -238,20 +238,79 @@ if ($LASTEXITCODE -ne 0) { throw "MDI readiness regressed" }
 ## The HTML report
 
 The report is a **single self-contained HTML file** with no external dependencies, so it renders identically on an
-isolated domain controller with no internet access. It contains:
+isolated domain controller with no internet access.
 
-- an **Overview** dashboard with KPI cards, SVG donut charts and bar charts (overall readiness, port probe results,
-  name resolution success rate per method, pass rate per prerequisite and readiness per server)
-- a consolidated **Issues found** table, sorted by severity, that merges failed checks, blocked ports, unresolvable
-  NNR targets and sensor v3.x blockers
-- a **Trend** tab charting readiness across runs when `-BaselinePath` is used
+### Overview
+
+A dashboard of KPI cards and SVG charts: overall readiness, port probe results, name resolution success rate per
+method, pass rate per prerequisite and readiness per server. Below it, a consolidated **Issues found** table that
+merges failed checks, blocked ports, unresolvable NNR targets and sensor v3.x blockers, sorted by severity.
+
+![Overview tab](docs/01-overview.png)
+
+### Domain controllers
+
+Every domain controller in scope with the outcome of each prerequisite check, plus sensor service health and clock
+skew. Column headings link to the matching Microsoft documentation.
+
+![Domain controllers tab](docs/02-domain-controllers.png)
+
+### Network ports
+
+The port matrix, the **Network Name Resolution matrix** used to troubleshoot the *Low success rate of active name
+resolution* health alert, the list of ports that need attention, and probe latency.
+
+![Network ports tab](docs/03-network-ports.png)
+
+### Sensor v3.x
+
+Per-server verdict on the sensor v3.x prerequisites and in-place migration eligibility, with the exact blocker for
+each server.
+
+![Sensor v3.x tab](docs/04-sensor-v3.png)
+
+### Capacity
+
+Estimated sensor v2.x resource requirements based on the measured packet rate, alongside the published sizing table
+and guidance for the official sizing tool.
+
+![Capacity tab](docs/05-capacity.png)
+
+### Trend
+
+Readiness across runs when `-BaselinePath` is used, so progress through a remediation or migration is visible.
+
+![Trend tab](docs/06-trend.png)
+
+### Domain services
+
+Domain-wide auditing, Deleted Objects container permissions, and any CA or Microsoft Entra Connect servers found.
+
+![Domain services tab](docs/07-domain-services.png)
+
+### Remediation
+
+The generated remediation script, and the checks that cannot be performed automatically.
+
+![Remediation tab](docs/08-remediation.png)
+
+### Classic view
+
+One click returns the original single-page layout, for anyone who prefers the report they already know. The data is
+identical — only the presentation changes.
+
+![Classic view](docs/09-classic-view.png)
+
+Other report features:
+
 - **clickable tabs** per area, each deep-linkable (for example `mdi-contoso.com.html#tab-ports`) and filterable with a
   free-text search box
-- **Export CSV** of the active tab, and a **light/dark theme** toggle that remembers the choice
+- **Export CSV** of the active tab
 - a responsive layout that adapts from ultrawide down to phone width, and a print stylesheet that expands every tab
   and preserves all colours so *Print / PDF* produces a complete, colour-accurate document
 
-![example html report](html-report.png)
+> The screenshots above were produced from an anonymized sample report. Host names, domain names and IP addresses are
+> replaced with documentation values (`contoso.com`, RFC 5737 `192.0.2.0/24`).
 
 ```txt
 NAME

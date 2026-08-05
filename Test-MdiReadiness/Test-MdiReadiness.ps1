@@ -16,8 +16,6 @@
         originally published by Microsoft at
         https://github.com/microsoft/Microsoft-Defender-for-Identity
 
-        Modifications by Pietro Di Simplicio.
-
         NOT AN OFFICIAL MICROSOFT SCRIPT. It is not affiliated with, endorsed by,
         approved by, or supported by Microsoft in any way. Microsoft provides no
         support for it. Do not raise Microsoft support cases about this version.
@@ -29,12 +27,12 @@
         without limitation any warranties of merchantability, fitness for a
         particular purpose, accuracy, or non-infringement.
 
-        THE AUTHOR ACCEPTS NO RESPONSIBILITY AND NO LIABILITY WHATSOEVER if this
-        script does not work, produces incorrect or incomplete results, or causes
-        any problem of any kind. This includes, without limitation, service
-        interruption, downtime, misconfiguration, loss of data, loss of profits, or
-        any direct, indirect, incidental, special, consequential or punitive
-        damages, even if advised of the possibility of such damage.
+        NO RESPONSIBILITY AND NO LIABILITY IS ACCEPTED WHATSOEVER if this script does
+        not work, produces incorrect or incomplete results, or causes any problem of
+        any kind. This includes, without limitation, service interruption, downtime,
+        misconfiguration, loss of data, loss of profits, or any direct, indirect,
+        incidental, special, consequential or punitive damages, even if advised of
+        the possibility of such damage.
 
         YOU USE IT ENTIRELY AT YOUR OWN RISK. The entire risk as to the results,
         performance and consequences of using this script rests with you. You are
