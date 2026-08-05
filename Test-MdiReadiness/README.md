@@ -1,15 +1,17 @@
 # Test-MdiReadiness.ps1
 
-> ## ⚠️ THIS IS NOT AN OFFICIAL MICROSOFT SCRIPT
+> ## ⚠️ Personal project — not an official Microsoft product
 >
 > This is an **unofficial, modified version** of the
 > [Test-MdiReadiness.ps1](https://github.com/microsoft/Microsoft-Defender-for-Identity/tree/main/Test-MdiReadiness)
 > script originally published by Microsoft.
 >
-> **It is not affiliated with, endorsed by, approved by, or supported by Microsoft in any way.**
+> **It is a personal project. It is not an official Microsoft product, is not endorsed or approved by
+> Microsoft, and is not covered by any Microsoft support agreement or service level agreement.**
 > Microsoft provides no support for it — do not open Microsoft support cases about this version.
 > For the official, supported tool, use the
 > [original script](https://github.com/microsoft/Microsoft-Defender-for-Identity).
+> Views and code here are the author's own.
 >
 > ### No warranty and no liability
 >
