@@ -41,9 +41,23 @@
         relying on either.
 
         BEFORE YOU RUN IT. This script reads configuration from domain controllers
-        and other servers, and opens network connections to them. Some checks
-        require elevated privileges and remote WMI access. Review the code, and
-        test it in a non-production environment first.
+        and other servers, and opens network connections to them. Nothing is written
+        to your environment. Review the code, and test it in a non-production
+        environment first.
+
+        It runs from a domain-joined workstation or member server and needs:
+          - the RSAT ActiveDirectory PowerShell module
+          - read permissions in the domains being scanned (Enterprise Admin for -Forest)
+          - WMI access to each target server: TCP 135 and the RPC dynamic port range
+          - ICMP to each target server, since every per-server check is gated behind a
+            connectivity test
+
+        There is no cloud dependency: the script uses the ActiveDirectory module, WMI
+        over RPC/DCOM, LDAP/ADSI and raw sockets, so it runs the same way against
+        on-premises domain controllers as against cloud-hosted ones.
+
+        Across WAN links, raise -PortProbeTimeoutMs above its 1500 ms default so a
+        slow link is not reported as a blocked port.
 
         The optional -RemediationScript switch GENERATES a script that would change
         audit policy, registry values and firewall rules. It is never executed

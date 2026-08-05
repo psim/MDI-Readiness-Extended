@@ -75,6 +75,53 @@ It will test the Entra Connect servers for the following items:
 - [Power scheme is set to *high performance*](https://aka.ms/mdi/powersettings)
 - [Required network ports](https://learn.microsoft.com/defender-for-identity/deploy/prerequisites-sensor-version-2#required-ports)
 
+## Running on-premises
+
+The script has no cloud dependency. It uses the `ActiveDirectory` module, WMI over RPC/DCOM, LDAP/ADSI and raw
+TCP/UDP sockets — all classic on-premises technologies — so it runs the same whether your domain controllers are
+physical, on-premises virtual machines, or hosted in a cloud IaaS platform.
+
+Nothing is written to your environment. The only feature that produces change is `-RemediationScript`, and that
+*generates* a script file without ever executing it.
+
+### Requirements on the machine you run it from
+
+- Domain-joined workstation or member server, with the **RSAT Active Directory PowerShell module** installed
+- An account with read permissions in the domains being scanned (Enterprise Admin for `-Forest`)
+- **WMI access to each target server**: TCP 135 plus the RPC dynamic port range (49152-65535 on modern Windows).
+  This is the same requirement the official
+  [sizing tool](https://github.com/microsoft/Microsoft-Defender-for-Identity-Sizing-Tool) has.
+- **ICMP to each target server.** Every per-server check is gated behind a connectivity test, so a domain
+  controller that does not answer ping is reported as *Server is not available* and skipped.
+
+Start conservatively against a single domain controller before widening the scope:
+
+```powershell
+.\Test-MdiReadiness.ps1 -DomainController 'dc01.contoso.com' -SkipNetworkPorts -Verbose
+```
+
+### Things that behave differently on a real network
+
+| Situation | What to do |
+|---|---|
+| **Domain controllers across WAN links or multiple sites** | The default 1500 ms probe timeout is tuned for a LAN and can report a slow link as blocked. Raise it with `-PortProbeTimeoutMs 5000`. The **Probe latency** table in the report separates *blocked* from *reachable but slow*. |
+| **Firewalls between tiers or sites** | If WMI cannot reach a server, the port probes fall back to testing that server *from the machine running the script*, which is the opposite direction to the one Defender for Identity requires. The report states which direction was used, in the *Probed from* line. |
+| **Large forests** | Runtime grows with the number of domain controllers. LDAP targets are capped per domain and Network Name Resolution targets are sampled — tune with `-MaxLdapTargetsPerDomain` and `-MaxNnrTargets`, or set either to `0` to test all of them. |
+| **Production traffic levels** | Capacity planning is only meaningful under real load, and the default 120-second sample is short. Use `-CapacityPlanningDuration 3600` or longer, or the official sizing tool, which samples for 24 hours. |
+| **Network Name Resolution** | NNR must work against *every* device the sensor observes, not only domain controllers. Pass a representative sample of workstations and member servers with `-NnrTargetComputer`, otherwise the check only proves the domain controllers can resolve each other. |
+
+### Tested configurations
+
+These checks have been verified against **Windows Server 2022** domain controllers in a **single-domain forest**.
+
+The following are supported by the script but have not been verified, so test them in a lab first:
+
+- Windows Server 2012 R2, 2016 and 2019 domain controllers. These run older Windows PowerShell 5.1 builds, and
+  some of the code paths here were written to work around defects found in specific 5.1 builds.
+- Multi-domain and multi-forest environments (`-Forest`, `-MultiForest`)
+- Read-only domain controllers
+- AD FS, AD CS and Microsoft Entra Connect servers that are not domain controllers
+
 ## Forest-wide scanning
 
 Use `-Forest` to enumerate and test **every domain controller of every domain in the forest** in a single run, and
