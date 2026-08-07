@@ -206,7 +206,7 @@
 #Requires -Version 4.0
 #requires -Module ActiveDirectory
 
-[CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = 'IncludeCA')]
+[CmdletBinding(SupportsShouldProcess = $true)]
 param (
     [Parameter(Mandatory = $false, HelpMessage = 'Path to a folder where the reports are be saved')]
     [string] $Path = '.',
@@ -216,13 +216,13 @@ param (
     [switch] $Forest,
     [Parameter(Mandatory = $false, HelpMessage = 'Specific Domain Controller(s) to work against. If not specified, it will query AD for the list of DCs in the domain')]
     [string[]] [Alias('DC')] $DomainController = $null,
-    [Parameter(Mandatory = $false, ParameterSetName = 'IncludeCA', HelpMessage = 'Specific Certificate Authority server(s) to work against. If not specified, it will query AD for the members of the "Cert Publishers" group')]
+    [Parameter(Mandatory = $false, HelpMessage = 'Specific Certificate Authority server(s) to work against. If not specified, it will query AD for the members of the "Cert Publishers" group')]
     [string[]] [Alias('CA')] $CAServer = $null,
-    [Parameter(Mandatory = $false, ParameterSetName = 'SkipCA', HelpMessage = 'Skip Certificate Authority servers')]
+    [Parameter(Mandatory = $false, HelpMessage = 'Skip Certificate Authority servers')]
     [switch] $SkipCA,
-    [Parameter(Mandatory = $false, ParameterSetName = 'IncludeEntraConnect', HelpMessage = 'Specific Entra Connect server(s) to work against. If not specified, it will query AD User for the "*configured to synchronize to tenant*" description')]
+    [Parameter(Mandatory = $false, HelpMessage = 'Specific Entra Connect server(s) to work against. If not specified, it will query AD User for the "*configured to synchronize to tenant*" description')]
     [string[]] [Alias('EC')] $EntraConnectServer = $null,
-    [Parameter(Mandatory = $false, ParameterSetName = 'SkipEntraConnect', HelpMessage = 'Skip Entra Connect servers')]
+    [Parameter(Mandatory = $false, HelpMessage = 'Skip Entra Connect servers')]
     [switch] $SkipEntraConnect,
     [Parameter(Mandatory = $false, HelpMessage = 'Skip the MDI required network port tests')]
     [switch] $SkipNetworkPorts,
@@ -4834,6 +4834,17 @@ function Test-mdiReadinessResult {
 #endregion
 
 #region Main
+
+# These pairs used to be expressed as parameter sets, which made PowerShell reject any command line
+# that touched two of them: -SkipCA together with -SkipEntraConnect failed with "Parameter set cannot
+# be resolved", as did -CAServer together with -EntraConnectServer. Only the genuine conflicts are
+# rejected here, so every sensible combination is accepted.
+if ($CAServer -and $SkipCA) {
+    throw 'Use either -CAServer or -SkipCA, not both.'
+}
+if ($EntraConnectServer -and $SkipEntraConnect) {
+    throw 'Use either -EntraConnectServer or -SkipEntraConnect, not both.'
+}
 
 if (-not $Domain) { $Domain = $env:USERDNSDOMAIN }
 if (-not $Domain) {
