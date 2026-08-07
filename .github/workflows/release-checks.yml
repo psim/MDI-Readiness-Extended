@@ -1,0 +1,79 @@
+name: Release checks
+
+# Runs on every tag and on pull requests so a release can never ship a script whose declared
+# version disagrees with the tag it was published under.
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    paths:
+      - 'Test-MdiReadiness/**'
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Script parses
+        shell: pwsh
+        run: |
+          $path = 'Test-MdiReadiness/Test-MdiReadiness.ps1'
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $path).Path, [ref]$null, [ref]$errors)
+          if ($errors) {
+            $errors | ForEach-Object { Write-Host "::error file=$path,line=$($_.Extent.StartLineNumber)::$($_.Message)" }
+            exit 1
+          }
+          Write-Host 'Parsed with no errors'
+
+      - name: Declared version matches the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $path = 'Test-MdiReadiness/Test-MdiReadiness.ps1'
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $path).Path, [ref]$tokens, [ref]$errors)
+
+          # The settings block is evaluated rather than pattern matched, so the check reads the value the
+          # script would actually use.
+          $assignment = $ast.FindAll({
+              param($node)
+              $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$settings'
+            }, $true)[0]
+          if (-not $assignment) { Write-Host '::error::No $settings block found'; exit 1 }
+          . ([scriptblock]::Create($assignment.Extent.Text))
+
+          $declared = [string]$settings.ScriptVersion
+          $tag = '${{ github.ref_name }}' -replace '^v', ''
+          Write-Host "declared: $declared"
+          Write-Host "tag     : $tag"
+          if ($declared -ne $tag) {
+            Write-Host "::error::ScriptVersion is '$declared' but the tag is '$tag'. Update `$settings.ScriptVersion before tagging."
+            exit 1
+          }
+
+      - name: Changelog has an entry for the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}' -replace '^v', ''
+          $changelog = Get-Content 'Test-MdiReadiness/CHANGELOG.md' -Raw
+          if ($changelog -notmatch [regex]::Escape("## [$tag]")) {
+            Write-Host "::error::CHANGELOG.md has no '## [$tag]' section"
+            exit 1
+          }
+          Write-Host "Found the changelog entry for $tag"
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
+          $results = Invoke-ScriptAnalyzer -Path 'Test-MdiReadiness/Test-MdiReadiness.ps1' -Severity Error
+          if ($results) {
+            $results | ForEach-Object { Write-Host "::error line=$($_.Line)::$($_.RuleName): $($_.Message)" }
+            exit 1
+          }
+          Write-Host 'No analyzer errors'

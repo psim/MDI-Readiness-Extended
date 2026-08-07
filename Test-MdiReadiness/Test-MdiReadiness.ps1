@@ -276,6 +276,11 @@ param (
 
 $settings = @{
 
+    # Single source of truth for the version. It is surfaced in the HTML report footer, in the -AsJson
+    # output and in the baseline history, so a report or a trend can always be traced back to the build
+    # that produced it. A release workflow checks this value against the git tag.
+    ScriptVersion                   = '1.0.0'
+
     AdvancedAuditPolicyDCs          = @'
 Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Setting Value
 System,Security System Extension,{0CCE9211-69AE-11D9-BED3-505054503030},Success and Failure,3
@@ -1468,7 +1473,11 @@ function Get-mdiSensorV3Readiness {
     $blockers = @($checks | Where-Object { $_.Requirement -eq 'Required' -and $_.Status -ne $true })
     $migrationWarnings = @($checks | Where-Object { $_.Requirement -eq 'Migration' -and $_.Status -eq $false })
 
-    $sensorState = if (-not $hasV2Sensor -and $isOnboarded -and $isSenseRunning) { 'No v2.x sensor (activate v3.x)' }
+    # The state must not advise activating the v3.x sensor on a server that cannot run it. A Windows
+    # Server 2016 domain controller with Defender for Endpoint onboarded satisfies the first branch's
+    # conditions, yet it fails the operating system requirement, so the blockers are checked as well.
+    $sensorState = if (-not $hasV2Sensor -and $isOnboarded -and $isSenseRunning -and $blockers.Count -eq 0) { 'No v2.x sensor (activate v3.x)' }
+    elseif (-not $hasV2Sensor -and $blockers.Count -gt 0) { 'No sensor installed and not eligible for v3.x (use v2.x)' }
     elseif ($hasV2Sensor -and $v2ServiceState -ne 'Running') { 'v2.x sensor installed but not running' }
     elseif ($hasV2Sensor) { 'v2.x sensor running' }
     else { 'No Defender for Identity sensor detected' }
@@ -1591,43 +1600,33 @@ function Get-mdiDeletedObjectsPermission {
     # The Directory Service Account must be able to read the Deleted Objects container, otherwise MDI cannot resolve
     # deleted entities. Source: https://aka.ms/mdi/dsa-permissions
     try {
-        $ds = [adsi]('LDAP://{0}/ROOTDSE' -f $Domain)
-        $deletedObjectsDn = 'CN=Deleted Objects,{0}' -f $ds.defaultNamingContext.Value
-        $ldapPath = 'LDAP://{0}/{1}' -f $Domain, $deletedObjectsDn
+        $rootDse = Get-ADRootDSE -Server $Domain -ErrorAction Stop
+        $deletedObjectsDn = 'CN=Deleted Objects,{0}' -f $rootDse.defaultNamingContext
 
-        # The container is a system object, so it must be requested explicitly with the "show deleted" LDAP control
-        $entry = New-Object -TypeName System.DirectoryServices.DirectoryEntry -ArgumentList $ldapPath
-        $searcher = New-Object -TypeName System.DirectoryServices.DirectorySearcher -ArgumentList $entry
-        $searcher.SearchScope = [System.DirectoryServices.SearchScope]::Base
-        $searcher.Tombstone = $true
-        $searcher.SecurityMasks = [System.DirectoryServices.SecurityMasks]::Dacl
-        [void] $searcher.PropertiesToLoad.Add('ntsecuritydescriptor')
-        $result = $searcher.FindOne()
+        # The container is a system object and is hidden from an ordinary bind: a DirectorySearcher rooted directly
+        # at its distinguished name fails with "There is no such object on the server" even for a domain admin,
+        # because the show-deleted control has to be in effect when the object is resolved rather than only when it
+        # is searched. Get-ADObject -IncludeDeletedObjects applies that control correctly.
+        $container = Get-ADObject -Identity $deletedObjectsDn -Server $Domain -IncludeDeletedObjects `
+            -Properties nTSecurityDescriptor -ErrorAction Stop
 
-        if ($null -eq $result) {
+        $acl = $container.nTSecurityDescriptor
+        if ($null -eq $acl) {
             return [PSCustomObject]@{
                 isDeletedObjectsPermissionOk = 'N/A'
-                details                      = [PSCustomObject]@{ Detail = 'The Deleted Objects container could not be read'; Trustees = @() }
+                details                      = [PSCustomObject]@{ Detail = 'The Deleted Objects container has no readable security descriptor'; Trustees = @() }
             }
         }
 
-        $descriptor = New-Object -TypeName System.Security.AccessControl.RawSecurityDescriptor `
-            -ArgumentList ($result.Properties['ntsecuritydescriptor'][0], 0)
-
-        # LIST_CONTENTS (0x4) and READ_PROPERTY (0x10) are what "read" means on this container
-        $readMask = 0x4 -bor 0x10
-        $trustees = @(foreach ($ace in $descriptor.DiscretionaryAcl) {
-                if ($ace.AceType -ne 'AccessAllowed' -and $ace.AceType -ne 'AccessAllowedObject') { continue }
-                if (($ace.AccessMask -band $readMask) -eq 0) { continue }
-                $sid = [string] $ace.SecurityIdentifier
-                $name = try {
-                    (New-Object -TypeName System.Security.Principal.SecurityIdentifier -ArgumentList $sid).Translate(
-                        [System.Security.Principal.NTAccount]).Value
-                } catch { $sid }
-                [PSCustomObject]@{ Sid = $sid; Name = $name }
+        # LIST_CONTENTS and READ_PROPERTY are what "read" means on this container
+        $trustees = @(foreach ($ace in $acl.Access) {
+                if ([string] $ace.AccessControlType -ne 'Allow') { continue }
+                $rights = [string] $ace.ActiveDirectoryRights
+                if ($rights -notmatch 'ListChildren' -and $rights -notmatch 'ReadProperty' -and $rights -notmatch 'GenericRead' -and $rights -notmatch 'GenericAll') { continue }
+                [string] $ace.IdentityReference
             })
 
-        $granted = @($trustees | Select-Object -ExpandProperty Name -Unique)
+        $granted = @($trustees | Where-Object { $_ } | Select-Object -Unique)
 
         # Without an explicit DSA name the check can only report who has access; it is informational in that case.
         $status = if (-not $DirectoryServiceAccount) {
@@ -1944,6 +1943,9 @@ function Get-mdiBaselineHistory {
 
     $entry = [PSCustomObject]@{
         Timestamp     = [datetime]::Now.ToString('s')
+        # Recorded per run so a trend that spans an upgrade can be read correctly: a different version
+        # may check different things, which would otherwise look like a sudden change in the estate.
+        ScriptVersion = [string] $settings.ScriptVersion
         ChecksPassed  = [int] $Statistics.ChecksPassed
         ChecksTotal   = [int] $Statistics.ChecksTotal
         ServersTotal  = [int] $Statistics.TotalServers
@@ -4717,7 +4719,7 @@ function Set-MdiReadinessReport {
   <span>Forest <b>@@FOREST@@</b></span>
   <span>Schema <b>@@SCHEMA@@</b></span>
   <span>Full details <a href="@@JSONPATH@@">@@JSONFILE@@</a></span>
-  <span>Generated by <a href="https://aka.ms/mdi/Test-MdiReadiness">Test-MdiReadiness.ps1</a> on @@TIMESTAMP@@</span>
+  <span>Generated by <a href="https://aka.ms/mdi/Test-MdiReadiness">Test-MdiReadiness.ps1</a> @@VERSION@@ on @@TIMESTAMP@@</span>
 </div>
 <p class="disclaimer"><b>Personal project &mdash; not an official Microsoft product.</b> This report was produced by an unofficial, modified version of Test-MdiReadiness.ps1. It is not an official Microsoft product, is not endorsed or approved by Microsoft, and is not covered by any Microsoft support agreement. It is provided "as is", with no warranty and no liability of any kind, and its findings must be verified against the current <a href="https://learn.microsoft.com/defender-for-identity/">official documentation</a> before you act on them. Use at your own risk.</p>
 </div>
@@ -4754,6 +4756,7 @@ function Set-MdiReadinessReport {
     Replace('@@VERDICTTEXT@@', $verdictText).
     Replace('@@JSONPATH@@', (ConvertTo-mdiHtmlEncoded $jsonReportFilePath)).
     Replace('@@JSONFILE@@', (ConvertTo-mdiHtmlEncoded (Split-Path -Leaf $jsonReportFilePath))).
+    Replace('@@VERSION@@', (ConvertTo-mdiHtmlEncoded ('v' + [string] $settings.ScriptVersion))).
     Replace('@@TIMESTAMP@@', (ConvertTo-mdiHtmlEncoded ([datetime]::Now.ToString('yyyy-MM-dd HH:mm'))))
 
     $htmlReportFile = Join-Path -Path $Path -ChildPath "mdi-$Domain.html"
@@ -4821,6 +4824,7 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
     }
 
     $report = @{
+        ScriptVersion          = $settings.ScriptVersion
         Domain                 = if ($Forest) { $forestInfo.Name } else { $Domain }
         Forest                 = $forestInfo.Name
         DomainsInScope         = $domainsInScope
