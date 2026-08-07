@@ -112,15 +112,16 @@ Start conservatively against a single domain controller before widening the scop
 
 ### Tested configurations
 
-These checks have been verified against **Windows Server 2022** domain controllers in a **single-domain forest**.
+These checks have been verified against a forest containing **Windows Server 2016, 2019, 2022 and 2025** domain
+controllers, an **AD CS** server and a **Microsoft Entra Connect** host, with a member server as an additional Network
+Name Resolution target.
 
 The following are supported by the script but have not been verified, so test them in a lab first:
 
-- Windows Server 2012 R2, 2016 and 2019 domain controllers. These run older Windows PowerShell 5.1 builds, and
-  some of the code paths here were written to work around defects found in specific 5.1 builds.
+- Windows Server 2012 R2 domain controllers
 - Multi-domain and multi-forest environments (`-Forest`, `-MultiForest`)
 - Read-only domain controllers
-- AD FS, AD CS and Microsoft Entra Connect servers that are not domain controllers
+- AD FS servers that are not domain controllers
 
 ## Forest-wide scanning
 
@@ -219,7 +220,23 @@ same verdicts the official tool uses (`Yes`, `Yes, but additional resources requ
 
 Only domain controllers are sized — standalone AD FS, AD CS and Entra Connect servers have negligible sensor impact.
 The report also records CPU and memory utilization, and flags hyper-threading, since the published figures exclude
-hyper-threaded cores.
+hyper-threaded cores. All domain controllers are sampled concurrently, so the sample period is the same for every
+server and the total time does not grow with the size of the forest.
+
+### Sample length matters
+
+The official method uses the **15 busiest minutes of a 24 hour period**. The default sample is 120 seconds, which is
+shorter than that window, so the whole sample is averaged instead and the report marks the verdict as an estimate.
+
+A short sample also makes the spike check inert: it compares the busy rate against the average, and on a sample this
+short they are the same number, so a server with heavy but brief bursts is still reported as supported. The report
+highlights the **Peak** column when it is well above the average so you can apply that judgement yourself.
+
+Sample for at least 15 minutes during a representative busy period for a more meaningful result:
+
+```powershell
+.\Test-MdiReadiness.ps1 -Forest -CapacityPlanning -CapacityPlanningDuration 900
+```
 
 > **This is an approximation, not a replacement.** For a formal sizing exercise run the official
 > [Microsoft Defender for Identity Sizing Tool](https://github.com/microsoft/Microsoft-Defender-for-Identity-Sizing-Tool)
@@ -321,7 +338,8 @@ each server.
 ### Capacity
 
 Estimated sensor v2.x resource requirements based on the measured packet rate, alongside the published sizing table
-and guidance for the official sizing tool.
+and guidance for the official sizing tool. A banner states how the sample should be read, and short samples are marked
+as estimates rather than presented as firm verdicts.
 
 ![Capacity tab](docs/05-capacity.png)
 

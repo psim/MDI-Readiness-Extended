@@ -109,6 +109,11 @@
     .PARAMETER CapacityPlanningDuration
         Number of seconds to sample the packet rate on each domain controller. Defaults to 120. The documented method
         samples for 24 hours (86400) and takes the busiest 15 minutes.
+
+        A sample shorter than 15 minutes (900) cannot contain a busy window, so the whole sample is averaged and the
+        verdict is marked as an estimate in the report. It also makes the spike test inert: that test compares the
+        busy rate against the average, and on a short sample they are the same number, so a server with heavy but
+        brief bursts is still reported as supported. Check the Peak column when the sample is short.
     .PARAMETER CapacityPlanningInterval
         Seconds between packet rate samples. Defaults to 5, matching the documented collection interval.
     .PARAMETER RemediationScript
@@ -386,6 +391,10 @@ S-1-1-0,48,3,194
         SpikeRatio         = 3
         # 'the 15 busiest minutes over a 24 hour period'
         BusyWindowMinutes  = 15
+        # Servers are sampled concurrently so they share one measurement window. 0 means all of them
+        # at once; a cap only matters in very large forests, where each concurrent sample costs a WMI
+        # session on the machine running this script.
+        MaxParallelSamples = 64
         OfficialToolUrl    = 'https://aka.ms/mdi/sizingtool'
         OfficialRepoUrl    = 'https://github.com/microsoft/Microsoft-Defender-for-Identity-Sizing-Tool'
         DocumentationUrl   = 'https://learn.microsoft.com/defender-for-identity/deploy/capacity-planning'
@@ -477,6 +486,14 @@ function Get-mdiRemoteTempFolder {
         }
 
     } catch {
+        $envTempPath = 'C:\Windows\Temp'
+    }
+
+    # Get-WmiObject is called with -ErrorAction SilentlyContinue, so an unreachable or
+    # WMI-blocked server yields $null rather than an exception and the catch above never
+    # runs. Without this guard the function returns $null and every caller then fails on
+    # "Join-Path : Cannot bind argument to parameter 'Path' because it is null".
+    if ([string]::IsNullOrWhiteSpace($envTempPath)) {
         $envTempPath = 'C:\Windows\Temp'
     }
     $envTempPath
@@ -1075,10 +1092,20 @@ function Get-mdiRequiredPorts {
         # WMI remote execution is not always possible. Fall back to probing the server from the machine running this
         # script, which still detects firewalls blocking the ports, but only in the reverse direction.
         Write-Verbose -Message "Unable to run the port probes on $ComputerName, falling back to probing it remotely"
+
+        # In this direction the probes test what is reachable *inbound* to the server. Ports scoped to
+        # DomainController (LDAP and Global Catalog) are only ever served by a domain controller, so probing
+        # them against a CA, Entra Connect or member server always fails and would be reported as a blocked
+        # required port. They are kept only when the server being tested is itself a domain controller.
+        $isDomainController = @($Plan.DomainControllers | Where-Object {
+                $_.Name -eq $ComputerName -or $_.IP -eq $ComputerName
+            }).Count -gt 0
+        $fallbackScopes = if ($isDomainController) { @('NetworkDevice', 'DomainController') } else { @('NetworkDevice') }
+
         $fallbackPlan = $Plan.PSObject.Copy()
         $fallbackPlan.NnrTargets = @([PSCustomObject]@{ Name = $ComputerName; IP = $ComputerName })
         $fallbackPlan.DomainControllers = @([PSCustomObject]@{ Name = $ComputerName; IP = $ComputerName })
-        $fallbackPlan.Probes = @($Plan.Probes | Where-Object { $_.Scope -in @('NetworkDevice', 'DomainController') })
+        $fallbackPlan.Probes = @($Plan.Probes | Where-Object { $_.Scope -in $fallbackScopes })
         $details = @(Invoke-mdiPortProbePlan -Plan $fallbackPlan)
         $probeSource = 'This computer (inbound to the server)'
     }
@@ -2020,27 +2047,30 @@ function New-mdiTrendChart {
 
 #region Capacity planning
 
-function Get-mdiTrafficSample {
+<#
+    The sampling loop lives in a standalone script block, with every setting passed in as an
+    argument, so that the same code can run either in this session or inside a runspace that
+    has no access to the script scope.
+#>
+$script:mdiTrafficSampleScript = {
     param (
-        [Parameter(Mandatory = $true)] [string] $ComputerName,
-        [Parameter(Mandatory = $true)] [int] $DurationSeconds,
-        [Parameter(Mandatory = $true)] [int] $IntervalSeconds
+        [string] $ComputerName,
+        [int] $DurationSeconds,
+        [int] $IntervalSeconds,
+        [string] $PerfClass,
+        [string] $CpuPerfClass,
+        [string] $MemoryPerfClass,
+        [string] $ExcludeAdapterName
     )
 
-    $capacity = $settings.CapacityPlanning
     $samples = New-Object -TypeName System.Collections.ArrayList
     $deadline = [datetime]::Now.AddSeconds($DurationSeconds)
 
     do {
         try {
-            $perfParams = @{
-                ComputerName = $ComputerName
-                Namespace    = 'root\cimv2'
-                Class        = $capacity.PerfClass
-                Property     = 'Name', 'PacketsPersec'
-                ErrorAction  = 'Stop'
-            }
-            $adapters = @(Get-WmiObject @perfParams | Where-Object { $_.Name -notmatch $capacity.ExcludeAdapterName })
+            $adapters = @(Get-WmiObject -ComputerName $ComputerName -Namespace 'root\cimv2' -Class $PerfClass `
+                    -Property 'Name', 'PacketsPersec' -ErrorAction Stop |
+                    Where-Object { $_.Name -notmatch $ExcludeAdapterName })
             if ($adapters.Count -eq 0) { return $null }
 
             $total = 0
@@ -2050,15 +2080,15 @@ function Get-mdiTrafficSample {
             $cpuPercent = $null
             $availableMb = $null
             try {
-                $cpu = @(Get-WmiObject -ComputerName $ComputerName -Namespace 'root\cimv2' -Class $capacity.CpuPerfClass `
+                $cpu = @(Get-WmiObject -ComputerName $ComputerName -Namespace 'root\cimv2' -Class $CpuPerfClass `
                         -Property 'Name', 'PercentProcessorTime' -ErrorAction Stop |
                         Where-Object { $_.Name -eq '_Total' })[0]
                 if ($cpu) { $cpuPercent = [double] $cpu.PercentProcessorTime }
-                $memory = Get-WmiObject -ComputerName $ComputerName -Namespace 'root\cimv2' -Class $capacity.MemoryPerfClass `
+                $memory = Get-WmiObject -ComputerName $ComputerName -Namespace 'root\cimv2' -Class $MemoryPerfClass `
                     -Property 'AvailableMBytes' -ErrorAction Stop
                 if ($memory) { $availableMb = [double] $memory.AvailableMBytes }
             } catch {
-                Write-Verbose -Message ('Unable to sample CPU/memory utilisation on {0}: {1}' -f $ComputerName, $_.Exception.Message)
+                # Utilisation is supplementary: a server that does not expose these classes is still sized
             }
 
             [void] $samples.Add([PSCustomObject]@{
@@ -2075,6 +2105,92 @@ function Get-mdiTrafficSample {
 
     if ($samples.Count -eq 0) { return $null }
     , $samples.ToArray()
+}
+
+function Get-mdiTrafficSampleSet {
+    <#
+        Samples several servers at the same time, each in its own runspace.
+
+        Sampling sequentially made the total run time grow with the number of domain controllers
+        (four DCs at 120 seconds cost eight minutes), and worse, each server was measured over a
+        different wall-clock window, so the numbers could not be compared with each other. Running
+        the samples together keeps the cost at roughly one sample period for the whole forest and
+        measures every server over the same window.
+    #>
+    param (
+        [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [string[]] $ComputerName,
+        [Parameter(Mandatory = $true)] [int] $DurationSeconds,
+        [Parameter(Mandatory = $true)] [int] $IntervalSeconds,
+        [Parameter(Mandatory = $false)] [int] $MaxParallel = 0
+    )
+
+    $collected = @{}
+    $targets = @($ComputerName | Where-Object { $_ })
+    if ($targets.Count -eq 0) { return $collected }
+
+    $capacity = $settings.CapacityPlanning
+    # Every server at once by default, so they share one measurement window. The cap exists for very
+    # large forests, where hundreds of concurrent WMI sessions would strain the machine running this.
+    $throttle = if ($MaxParallel -gt 0) { [Math]::Min($MaxParallel, $targets.Count) } else { $targets.Count }
+    if ($throttle -lt $targets.Count) {
+        Write-Verbose -Message ('Sampling {0} server(s) {1} at a time; batches are not measured over the same window' -f $targets.Count, $throttle)
+    }
+
+    $pool = [runspacefactory]::CreateRunspacePool(1, $throttle)
+    $pool.Open()
+    $pending = New-Object -TypeName System.Collections.ArrayList
+    try {
+        foreach ($target in $targets) {
+            $shell = [powershell]::Create()
+            $shell.RunspacePool = $pool
+            [void] $shell.AddScript($script:mdiTrafficSampleScript).
+                AddArgument($target).
+                AddArgument($DurationSeconds).
+                AddArgument($IntervalSeconds).
+                AddArgument($capacity.PerfClass).
+                AddArgument($capacity.CpuPerfClass).
+                AddArgument($capacity.MemoryPerfClass).
+                AddArgument($capacity.ExcludeAdapterName)
+            [void] $pending.Add([PSCustomObject]@{
+                    Computer = $target
+                    Shell    = $shell
+                    Handle   = $shell.BeginInvoke()
+                })
+        }
+
+        foreach ($job in $pending) {
+            try {
+                $output = $job.Shell.EndInvoke($job.Handle)
+                $rows = @($output | Where-Object { $_ })
+                $collected[$job.Computer] = if ($rows.Count -gt 0) { $rows } else { $null }
+            } catch {
+                Write-Verbose -Message ('Traffic sampling failed on {0}: {1}' -f $job.Computer, $_.Exception.Message)
+                $collected[$job.Computer] = $null
+            } finally {
+                $job.Shell.Dispose()
+            }
+        }
+    } finally {
+        $pool.Close()
+        $pool.Dispose()
+    }
+
+    $collected
+}
+
+function Get-mdiTrafficSample {
+    param (
+        [Parameter(Mandatory = $true)] [string] $ComputerName,
+        [Parameter(Mandatory = $true)] [int] $DurationSeconds,
+        [Parameter(Mandatory = $true)] [int] $IntervalSeconds
+    )
+
+    $capacity = $settings.CapacityPlanning
+    $output = & $script:mdiTrafficSampleScript $ComputerName $DurationSeconds $IntervalSeconds `
+        $capacity.PerfClass $capacity.CpuPerfClass $capacity.MemoryPerfClass $capacity.ExcludeAdapterName
+    $rows = @($output | Where-Object { $_ })
+    if ($rows.Count -eq 0) { return $null }
+    , $rows
 }
 
 function Get-mdiBusyPacketsPerSecond {
@@ -2122,7 +2238,8 @@ function Get-mdiCapacityPlanning {
     param (
         [Parameter(Mandatory = $true)] [string] $ComputerName,
         [Parameter(Mandatory = $false)] [int] $DurationSeconds = 120,
-        [Parameter(Mandatory = $false)] [int] $IntervalSeconds = 5
+        [Parameter(Mandatory = $false)] [int] $IntervalSeconds = 5,
+        [Parameter(Mandatory = $false)] [object[]] $TrafficSample = $null
     )
 
     $capacity = $settings.CapacityPlanning
@@ -2159,17 +2276,24 @@ function Get-mdiCapacityPlanning {
     if ($totalRamGb -le 0) { return & $notSized 'Missing RAM data' 'Unable to read the installed memory over WMI' }
 
     # --- Traffic sample ----------------------------------------------------------------------------------------
-    Write-Verbose -Message ("Sampling network traffic on {0} for {1}s at {2}s intervals" -f $ComputerName, $DurationSeconds, $IntervalSeconds)
-    $sample = Get-mdiTrafficSample -ComputerName $ComputerName -DurationSeconds $DurationSeconds -IntervalSeconds $IntervalSeconds
-    if ($null -eq $sample) {
+    # The caller normally samples every server at once and passes the result in. Sampling here is the
+    # fallback for a single server. Note the local name differs from the parameter: PowerShell variable
+    # names are case insensitive, so $sample and $Sample would be the same variable.
+    if ($TrafficSample) {
+        $collected = @($TrafficSample)
+    } else {
+        Write-Verbose -Message ("Sampling network traffic on {0} for {1}s at {2}s intervals" -f $ComputerName, $DurationSeconds, $IntervalSeconds)
+        $collected = Get-mdiTrafficSample -ComputerName $ComputerName -DurationSeconds $DurationSeconds -IntervalSeconds $IntervalSeconds
+    }
+    if ($null -eq $collected -or @($collected).Count -eq 0) {
         return & $notSized 'Missing traffic data' 'Unable to read the network performance counters over WMI'
     }
 
-    $traffic = Get-mdiBusyPacketsPerSecond -Sample $sample -WindowMinutes $capacity.BusyWindowMinutes
+    $traffic = Get-mdiBusyPacketsPerSecond -Sample $collected -WindowMinutes $capacity.BusyWindowMinutes
     $busy = $traffic.BusyPacketsPerSec
 
-    $cpuSamples = @($sample | Where-Object { $null -ne $_.CpuPercent } | ForEach-Object { [double] $_.CpuPercent })
-    $memSamples = @($sample | Where-Object { $null -ne $_.AvailableMb } | ForEach-Object { [double] $_.AvailableMb })
+    $cpuSamples = @($collected | Where-Object { $null -ne $_.CpuPercent } | ForEach-Object { [double] $_.CpuPercent })
+    $memSamples = @($collected | Where-Object { $null -ne $_.AvailableMb } | ForEach-Object { [double] $_.AvailableMb })
     $avgCpuPercent = if ($cpuSamples.Count -gt 0) { [int] [math]::Round(($cpuSamples | Measure-Object -Average).Average) } else { $null }
     $maxCpuPercent = if ($cpuSamples.Count -gt 0) { [int] [math]::Round(($cpuSamples | Measure-Object -Maximum).Maximum) } else { $null }
     $minAvailableGb = if ($memSamples.Count -gt 0) { [math]::Round((($memSamples | Measure-Object -Minimum).Minimum) / 1024, 2) } else { $null }
@@ -2817,6 +2941,22 @@ function Get-mdiDomainControllerReadiness {
         })
     Write-Verbose -Message "Found $($dcs.Count) Domain Controller(s)"
 
+    # Capacity sampling happens up front for every reachable domain controller at once. Done inside the
+    # loop below it would run one server at a time, so the wall-clock cost grew with the size of the
+    # forest and no two servers were measured over the same period.
+    $capacitySamples = @{}
+    if ($CapacityPlan) {
+        $reachable = @($dcs | Where-Object { $_.FQDN -and (Test-Connection -ComputerName $_.FQDN -Count 2 -Quiet) } |
+                ForEach-Object { $_.FQDN })
+        if ($reachable.Count -gt 0) {
+            Write-Verbose -Message ('Sampling network traffic on {0} domain controller(s) in parallel for {1}s at {2}s intervals' -f
+                $reachable.Count, $CapacityPlan.DurationSeconds, $CapacityPlan.IntervalSeconds)
+            $capacitySamples = Get-mdiTrafficSampleSet -ComputerName $reachable `
+                -DurationSeconds $CapacityPlan.DurationSeconds -IntervalSeconds $CapacityPlan.IntervalSeconds `
+                -MaxParallel $settings.CapacityPlanning.MaxParallelSamples
+        }
+    }
+
     foreach ($dc in $dcs) {
 
 
@@ -2894,7 +3034,8 @@ function Get-mdiDomainControllerReadiness {
             if ($CapacityPlan) {
                 Write-Verbose -Message "Estimating sensor capacity for $($dc.FQDN)"
                 $capacity = Get-mdiCapacityPlanning -ComputerName $dc.FQDN `
-                    -DurationSeconds $CapacityPlan.DurationSeconds -IntervalSeconds $CapacityPlan.IntervalSeconds
+                    -DurationSeconds $CapacityPlan.DurationSeconds -IntervalSeconds $CapacityPlan.IntervalSeconds `
+                    -TrafficSample $capacitySamples[[string] $dc.FQDN]
                 if ($capacity.isCapacityOk -ne 'N/A') { $dc.Add('CapacitySufficient', $capacity.isCapacityOk) }
                 $details.Add('CapacityDetails', $capacity.details)
             }
@@ -2929,7 +3070,10 @@ function Get-mdiCAReadiness {
     } else {
         Write-Verbose -Message "Using the provided list of CA server(s)"
     }
-    $cas = @($CAServer | ForEach-Object {
+    # Piping $null into ForEach-Object still runs the body once with $_ set to $null, and
+    # Get-ADComputer -Identity $null raises a parameter binding error that -ErrorAction cannot
+    # suppress and try/catch does not intercept. Empty entries are therefore removed first.
+    $cas = @($CAServer | Where-Object { $_ } | ForEach-Object {
             try {
                 $caComputer = Get-ADComputer -Identity $_ -Server $Domain -Properties DNSHostName, IPv4Address, OperatingSystem -ErrorAction SilentlyContinue
                 @{
@@ -3043,7 +3187,8 @@ function Get-mdiEntraConnectReadiness {
     } else {
         Write-Verbose -Message "Using the provided list of Entra Connect server(s)"
     }
-    $ecs = @($EntraConnectServer | ForEach-Object {
+    # Same null guard as the CA discovery above: an empty result must not reach -Identity.
+    $ecs = @($EntraConnectServer | Where-Object { $_ } | ForEach-Object {
             try {
                 $ecsComputer = Get-ADComputer -Identity $_ -Server $Domain -Properties DNSHostName, IPv4Address, OperatingSystem -ErrorAction SilentlyContinue
                 @{
@@ -3599,15 +3744,46 @@ function Get-mdiCapacityHtml {
     }
 
     $lines = New-Object -TypeName System.Collections.ArrayList
+
+    # The short-sample caveat governs how every number below must be read, so it goes first and
+    # is styled as a warning. Left at the bottom as a grey footnote it was routinely missed.
+    $partial = @($servers | Where-Object { $_.Details.CapacityDetails.FullBusyWindow -eq $false })
+    if ($partial.Count -gt 0) {
+        $seconds = [int] (@($servers.Details.CapacityDetails.SampleSeconds) | Measure-Object -Maximum).Maximum
+        # The whole concatenation is parenthesised before -f: the format operator binds tighter than +,
+        # so without the parentheses only the last fragment would be formatted and every placeholder in
+        # the earlier fragments would render literally as {0}, {1} and so on.
+        [void] $lines.Add((('<div class="callout warn"><span class="ico">&#9888;</span><div class="body">' +
+                    '<b>Estimate only &mdash; this is not a formal sizing.</b>' +
+                    '<p>Microsoft sizes a sensor on the <b>15 busiest minutes of a 24 hour period</b>. This run sampled ' +
+                    'only <b>{0} second(s)</b> per server, so there is no busy window to pick from and the whole sample ' +
+                    'was averaged instead. Treat the verdict as a quick check for an obviously undersized server, not as ' +
+                    'a sizing decision.</p>' +
+                    '<p>Because the busy figure equals the average on a sample this short, the <b>spike test cannot ' +
+                    'trigger</b>: a server with heavy but brief bursts will still be reported as supported. Compare the ' +
+                    '<b>Peak</b> column against the average to judge that yourself.</p>' +
+                    '<p>Sample for longer with <code>-CapacityPlanningDuration {1}</code> (at least {2} minutes) during ' +
+                    'a representative busy period, or run the official <a href="{3}">TriSizingTool</a>, which samples ' +
+                    'over 24 hours.</p></div></div>') -f
+                $seconds, ([int] $capacity.BusyWindowMinutes * 60), [int] $capacity.BusyWindowMinutes, $capacity.OfficialToolUrl))
+    } else {
+        [void] $lines.Add((('<div class="callout info"><span class="ico">&#8505;</span><div class="body">' +
+                    '<b>Sampled over a full busy window.</b>' +
+                    '<p>The sample was long enough to take the highest rolling {0}-minute average, which is the figure ' +
+                    'Microsoft''s method uses. It still covers only the sampled period rather than a full day, so for a ' +
+                    'formal exercise use the official <a href="{1}">TriSizingTool</a>.</p></div></div>') -f
+                [int] $capacity.BusyWindowMinutes, $capacity.OfficialToolUrl))
+    }
+
     [void] $lines.Add('<div class="table-scroll"><table>')
-    [void] $lines.Add('<tr><th class="left">Server</th><th>Sensor supported</th><th>Busy packets/sec</th><th>Average</th><th>Peak</th><th>Traffic band</th><th>Sensor needs</th><th>Server has</th><th>CPU used</th><th>RAM free</th><th class="left">Detail</th></tr>')
+    [void] $lines.Add('<tr><th class="left">Server</th><th>Sensor supported</th><th>Sample</th><th>Busy packets/sec</th><th>Average</th><th>Peak</th><th>Traffic band</th><th>Sensor needs</th><th>Server has</th><th>CPU used</th><th>RAM free</th><th class="left">Detail</th></tr>')
 
     foreach ($srv in ($servers | Sort-Object FQDN)) {
         $c = $srv.Details.CapacityDetails
         $status = [string] $c.Status
 
         if ($null -eq $c.BusyPacketsPerSec) {
-            [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="grey">{1}</td><td class="grey" colspan="8">n/a</td><td class="left">{2}</td></tr>' -f
+            [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="grey">{1}</td><td class="grey" colspan="9">n/a</td><td class="left">{2}</td></tr>' -f
                     (ConvertTo-mdiHtmlEncoded ([string] $srv.FQDN)), (ConvertTo-mdiHtmlEncoded $status),
                     (ConvertTo-mdiHtmlEncoded ([string] $c.Detail))))
             continue
@@ -3620,12 +3796,36 @@ function Get-mdiCapacityHtml {
             'No' { 'red' }
             default { 'grey' }
         }
+        # A verdict from a sample shorter than the busy window is provisional, so it is never shown
+        # in plain green: that would imply more confidence than the measurement supports.
+        $sampleText = '{0} s' -f [int] $c.SampleSeconds
+        $sampleClass = 'mono'
+        if ($c.FullBusyWindow -eq $false) {
+            $sampleText = '{0} s, partial' -f [int] $c.SampleSeconds
+            $sampleClass = 'mono amber'
+            if ($class -eq 'green') { $class = 'amber' }
+            $status = $status + ' (estimate)'
+        }
+
+        # On a short sample the automatic spike test is inert, so the ratio is surfaced instead.
+        $peakClass = 'mono'
+        $peakText = [string][int] $c.PeakPacketsPerSec
+        if ([int] $c.AveragePacketsPerSec -gt 0) {
+            $ratio = [double] $c.PeakPacketsPerSec / [double] $c.AveragePacketsPerSec
+            if ($ratio -ge $capacity.SpikeRatio) {
+                $peakClass = 'mono amber'
+                $peakText = '{0} ({1}x avg)' -f [int] $c.PeakPacketsPerSec, (ConvertTo-mdiSvgNumber ([math]::Round($ratio, 1)))
+            }
+        }
+
         $cores = '{0} core(s){1}' -f [int] $c.PhysicalCores, $(if ($c.HyperThreaded) { ' *' } else { '' })
         $cpuUsed = if ($null -ne $c.AvgCpuPercent) { '{0}% avg / {1}% max' -f [int] $c.AvgCpuPercent, [int] $c.MaxCpuPercent } else { 'n/a' }
         $ramFree = if ($null -ne $c.MinAvailableRamGb) { '{0} GB min' -f (ConvertTo-mdiSvgNumber ([double] $c.MinAvailableRamGb)) } else { 'n/a' }
-        [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="{1}">{2}</td><td class="mono">{3}</td><td class="mono">{4}</td><td class="mono">{5}</td><td class="mono">{6}</td><td class="mono">{7} core / {8} GB</td><td class="mono">{9} / {10} GB</td><td class="mono">{11}</td><td class="mono">{12}</td><td class="left">{13}</td></tr>' -f
+        [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="{1}">{2}</td><td class="{3}">{4}</td><td class="mono">{5}</td><td class="mono">{6}</td><td class="{7}">{8}</td><td class="mono">{9}</td><td class="mono">{10} core / {11} GB</td><td class="mono">{12} / {13} GB</td><td class="mono">{14}</td><td class="mono">{15}</td><td class="left">{16}</td></tr>' -f
                 (ConvertTo-mdiHtmlEncoded ([string] $srv.FQDN)), $class, (ConvertTo-mdiHtmlEncoded $status),
-                [int] $c.BusyPacketsPerSec, [int] $c.AveragePacketsPerSec, [int] $c.PeakPacketsPerSec,
+                $sampleClass, (ConvertTo-mdiHtmlEncoded $sampleText),
+                [int] $c.BusyPacketsPerSec, [int] $c.AveragePacketsPerSec,
+                $peakClass, (ConvertTo-mdiHtmlEncoded $peakText),
                 (ConvertTo-mdiHtmlEncoded ([string] $c.Band)),
                 (ConvertTo-mdiSvgNumber ([double] $c.RequiredCpu)), (ConvertTo-mdiSvgNumber ([double] $c.RequiredRamGb)),
                 (ConvertTo-mdiHtmlEncoded $cores), (ConvertTo-mdiSvgNumber ([double] $c.TotalRamGb)),
@@ -3636,13 +3836,6 @@ function Get-mdiCapacityHtml {
 
     if (@($servers | Where-Object { $_.Details.CapacityDetails.HyperThreaded }).Count -gt 0) {
         [void] $lines.Add('<p class="muted">* Hyper-threading is enabled. The published sizing figures exclude hyper-threaded cores, and Microsoft recommends not relying on them because they can cause sensor health issues. Only physical cores are counted above.</p>')
-    }
-
-    $partial = @($servers | Where-Object { $_.Details.CapacityDetails.FullBusyWindow -eq $false })
-    if ($partial.Count -gt 0) {
-        $seconds = [int] (@($servers.Details.CapacityDetails.SampleSeconds) | Measure-Object -Maximum).Maximum
-        [void] $lines.Add(('<p class="muted"><b>Estimate only.</b> The sample covered {0} second(s) per server, shorter than the {1}-minute busy window the official method uses, so the whole sample was averaged instead. Re-run with a longer <code>-CapacityPlanningDuration</code>, or use the official <a href="{2}">TriSizingTool</a> which samples over 24 hours.</p>' -f
-                $seconds, [int] $capacity.BusyWindowMinutes, $capacity.OfficialToolUrl))
     }
 
     # The published sizing table, so the verdict above can be checked against the source
@@ -3886,7 +4079,7 @@ function Get-mdiReportStyle {
   --text:#111827; --muted:#5b6577; --heading:#0f172a;
   --brand:#0f6cbd; --brand-2:#6d28d9;
   --ok:#0e7a37; --ok-bg:#d8f0e0; --bad:#b40e1c; --bad-bg:#fadfe1;
-  --warn:#8f3a06; --warn-bg:#fbe8d0; --na:#6b7280; --na-bg:#e6e9ee;
+  --warn:#8f3a06; --warn-bg:#fbe8d0; --na:#6b7280; --na-bg:#e6e9ee; --brand-bg:#e3effb;
   --shadow:0 1px 2px rgba(16,24,40,.06),0 4px 12px rgba(16,24,40,.05);
   --radius:14px;
   --maxw:1880px;
@@ -4045,6 +4238,20 @@ td.left{overflow-wrap:break-word}
 .pill.na{background:var(--na-bg);color:var(--na)}
 .empty-state{background:var(--ok-bg);color:var(--ok);border-radius:10px;padding:16px 18px;font-weight:600;margin:0}
 
+/* ---------- callout ---------- */
+/* Used where a caveat changes how the numbers on the page must be read, so it has to be
+   impossible to mistake for a footnote. */
+.callout{border-radius:10px;padding:15px 18px;margin:0 0 20px;border:1px solid;
+  display:flex;gap:13px;align-items:flex-start;line-height:1.55}
+.callout .ico{font-size:19px;line-height:1.25;flex:none}
+.callout .body{min-width:0}
+.callout b{font-weight:700}
+.callout p{margin:7px 0 0}
+.callout.warn{background:var(--warn-bg);border-color:var(--warn);color:var(--text)}
+.callout.warn b{color:var(--warn)}
+.callout.info{background:var(--brand-bg,rgba(59,130,246,.09));border-color:var(--brand);color:var(--text)}
+.callout.info b{color:var(--brand)}
+
 /* ---------- filter ---------- */
 .filter{display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
 .filter input{flex:1;min-width:220px;max-width:380px;padding:9px 13px;border:1px solid var(--border);border-radius:9px;
@@ -4089,6 +4296,9 @@ html[data-view="classic"] .filter,html[data-view="classic"] .section-intro,
 html[data-view="classic"] .trend{display:none}
 html[data-view="classic"] #tab-trend{display:none!important}
 html[data-view="classic"] .table-scroll{border:0;border-radius:0;background:none;overflow-x:auto}
+/* The callout changes how the numbers on the page must be read, so it stays visible in the
+   classic view too, just flattened to match that plainer style. */
+html[data-view="classic"] .callout{border-radius:0;border-width:1px;padding:10px 14px;margin:0 0 12px}
 html[data-view="classic"] table{border-collapse:collapse;width:auto;background:#fff}
 html[data-view="classic"] td,html[data-view="classic"] th{border:1px solid #aeb0b5;padding:5px;text-align:center;
   vertical-align:middle;font-size:14px;text-transform:none;letter-spacing:normal}
@@ -4140,6 +4350,7 @@ html[data-view="classic"] .empty-state{background:none;color:#212121;padding:0;f
   @page{size:A4 landscape;margin:10mm}
   body{background:#fff}
   .tabs,.hero-actions,.filter{display:none!important}
+  .callout{page-break-inside:avoid}
   /* Every tab becomes a section of the printed document */
   .panel{display:block!important;page-break-before:always;animation:none}
   .panel:first-of-type{page-break-before:avoid}
