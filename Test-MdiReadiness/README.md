@@ -273,12 +273,24 @@ values and firewall rules on domain controllers.
 
 ## Trend tracking
 
-`-BaselinePath` records each run in a compact history file and charts how readiness evolves over time in the
-**Trend** tab. Use the same path on every run:
+Each run is recorded in a compact history file and the **Trend** tab charts how readiness evolves over time.
+This happens **by default**, in the report folder, so a second run always has something to compare against:
 
 ```powershell
-.\Test-MdiReadiness.ps1 -Forest -BaselinePath 'C:\MDI\history'
+.\Test-MdiReadiness.ps1 -Forest -Path 'C:\MDI\Reports'
 ```
+
+Use `-BaselinePath` to keep the history somewhere else, which is useful when the reports themselves are
+written to a fresh folder each time:
+
+```powershell
+.\Test-MdiReadiness.ps1 -Forest -Path 'C:\MDI\Reports' -BaselinePath 'C:\MDI\history'
+```
+
+Use `-SkipTrend` when nothing should be written outside the report itself.
+
+The version of the script is recorded with every entry, so a trend that spans an upgrade can be read
+correctly rather than appearing as a sudden change in the estate.
 
 ## Running as a scheduled compliance gate
 

@@ -122,8 +122,11 @@
         firewall rules, stopped sensor services and clock resynchronisation). The generated script supports -WhatIf and
         must be reviewed before it is run.
     .PARAMETER BaselinePath
-        Folder where a compact run history is kept, so the report can chart how readiness evolves between runs. Use the
-        same path on every run. Defaults to no history.
+        Folder where a compact run history is kept, so the report can chart how readiness evolves between runs.
+        Defaults to the report folder, so history is recorded on every run without having to ask for it. Use
+        this only when the history should live somewhere other than the reports.
+    .PARAMETER SkipTrend
+        Do not record this run in the trend history, and do not write anything outside the report itself.
     .PARAMETER DirectoryServiceAccount
         The Directory Service Account(s) configured for the domain, used to assert that they have read access to the
         Deleted Objects container. Without this parameter the check only reports which principals currently have access.
@@ -238,8 +241,10 @@ param (
     [int] $CapacityPlanningInterval = 5,
     [Parameter(Mandatory = $false, HelpMessage = 'Generate a PowerShell remediation script for the findings that can be fixed automatically')]
     [switch] $RemediationScript,
-    [Parameter(Mandatory = $false, HelpMessage = 'Folder where a run history is kept so the report can chart the readiness trend')]
+    [Parameter(Mandatory = $false, HelpMessage = 'Folder where a run history is kept so the report can chart the readiness trend. Defaults to the report folder')]
     [string] $BaselinePath = $null,
+    [Parameter(Mandatory = $false, HelpMessage = 'Do not record this run in the trend history')]
+    [switch] $SkipTrend,
     [Parameter(Mandatory = $false, HelpMessage = 'Directory Service Account(s) that must have read access to the Deleted Objects container')]
     [string[]] [Alias('DSA')] $DirectoryServiceAccount = $null,
     [Parameter(Mandatory = $false, HelpMessage = 'Maximum tolerated clock difference, in minutes, between this computer and each sensor server')]
@@ -4615,7 +4620,9 @@ function Set-MdiReadinessReport {
         [Parameter(Mandatory = $true)] [string] $Domain,
         [Parameter(Mandatory = $true)] [string] $Path,
         [Parameter(Mandatory = $true)] [object[]] $ReportData,
-        [Parameter(Mandatory = $false)] [object] $Remediation = $null
+        [Parameter(Mandatory = $false)] [object] $Remediation = $null,
+        [Parameter(Mandatory = $false)] [string] $BaselinePath = $null,
+        [Parameter(Mandatory = $false)] [switch] $SkipTrend
     )
 
     $jsonReportFile = Join-Path -Path $Path -ChildPath "mdi-$Domain.json"
@@ -4703,12 +4710,16 @@ function Set-MdiReadinessReport {
     $stats = Get-mdiReportStatistics -ReportData $ReportData
     $htmlOverview = Get-mdiOverviewHtml -Statistics $stats -ReportData $ReportData
 
-    $htmlTrend = if ($BaselinePath) {
-        $baseline = Get-mdiBaselineHistory -BaselinePath $BaselinePath -Domain $Domain -Statistics $stats
+    # History is recorded by default, next to the reports, so a second run always has something to
+    # compare against. Left opt-in, the trend was almost never populated and the tab stayed empty.
+    $trendPath = if ($SkipTrend) { $null } elseif ($BaselinePath) { $BaselinePath } else { $Path }
+
+    $htmlTrend = if ($trendPath) {
+        $baseline = Get-mdiBaselineHistory -BaselinePath $trendPath -Domain $Domain -Statistics $stats
         Write-Verbose ('Baseline history: {0} ({1} run(s))' -f $baseline.Path, @($baseline.History).Count)
         New-mdiTrendChart -History $baseline.History
     } else {
-        '<p class="muted">Trend tracking is disabled. Re-run with <code>-BaselinePath</code> pointing at a folder to record history and chart how readiness evolves between runs.</p>'
+        '<p class="muted">Trend tracking was disabled for this run with <code>-SkipTrend</code>. Without it, each run is recorded in the report folder and the chart shows how readiness evolves.</p>'
     }
 
     $htmlDeletedObjects = if ($ReportData.DomainDeletedObjects) {
@@ -5003,7 +5014,8 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
         }
     }
 
-    $htmlReportFile = Set-MdiReadinessReport -Domain $report.Domain -Path $Path -ReportData $report -Remediation $remediation
+    $htmlReportFile = Set-MdiReadinessReport -Domain $report.Domain -Path $Path -ReportData $report `
+        -Remediation $remediation -BaselinePath $BaselinePath -SkipTrend:$SkipTrend
 
     $result = Test-mdiReadinessResult -ReportData $report
 
