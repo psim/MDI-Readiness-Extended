@@ -1601,32 +1601,77 @@ function Get-mdiDeletedObjectsPermission {
     # deleted entities. Source: https://aka.ms/mdi/dsa-permissions
     try {
         $rootDse = Get-ADRootDSE -Server $Domain -ErrorAction Stop
-        $deletedObjectsDn = 'CN=Deleted Objects,{0}' -f $rootDse.defaultNamingContext
+        $namingContext = [string] $rootDse.defaultNamingContext
+        $deletedObjectsDn = 'CN=Deleted Objects,{0}' -f $namingContext
 
-        # The container is a system object and is hidden from an ordinary bind: a DirectorySearcher rooted directly
-        # at its distinguished name fails with "There is no such object on the server" even for a domain admin,
-        # because the show-deleted control has to be in effect when the object is resolved rather than only when it
-        # is searched. Get-ADObject -IncludeDeletedObjects applies that control correctly.
-        $container = Get-ADObject -Identity $deletedObjectsDn -Server $Domain -IncludeDeletedObjects `
-            -Properties nTSecurityDescriptor -ErrorAction Stop
+        # The container is a hidden system object and its security descriptor is awkward to read: binding
+        # straight at its distinguished name fails outright, and asking a named server for the descriptor
+        # can return an object with no descriptor attached. A domain bind is what works consistently, so
+        # that is tried first and the directory module is kept as a fallback.
+        $granted = $null
+        $readMethod = $null
 
-        $acl = $container.nTSecurityDescriptor
-        if ($null -eq $acl) {
-            return [PSCustomObject]@{
-                isDeletedObjectsPermissionOk = 'N/A'
-                details                      = [PSCustomObject]@{ Detail = 'The Deleted Objects container has no readable security descriptor'; Trustees = @() }
+        try {
+            $root = New-Object -TypeName System.DirectoryServices.DirectoryEntry -ArgumentList ('LDAP://{0}/{1}' -f $Domain, $namingContext)
+            $searcher = New-Object -TypeName System.DirectoryServices.DirectorySearcher -ArgumentList $root
+            $searcher.Filter = '(&(objectClass=container)(name=Deleted Objects))'
+            $searcher.SearchScope = [System.DirectoryServices.SearchScope]::OneLevel
+            $searcher.Tombstone = $true
+            $searcher.SecurityMasks = [System.DirectoryServices.SecurityMasks]::Dacl
+            [void] $searcher.PropertiesToLoad.Add('ntsecuritydescriptor')
+            $found = $searcher.FindOne()
+            if ($found -and $found.Properties['ntsecuritydescriptor'].Count -gt 0) {
+                $descriptor = New-Object -TypeName System.Security.AccessControl.RawSecurityDescriptor `
+                    -ArgumentList ($found.Properties['ntsecuritydescriptor'][0], 0)
+                # LIST_CONTENTS (0x4) and READ_PROPERTY (0x10) are what "read" means on this container
+                $readMask = 0x4 -bor 0x10
+                $granted = @(foreach ($ace in $descriptor.DiscretionaryAcl) {
+                        if ($ace.AceType -ne 'AccessAllowed' -and $ace.AceType -ne 'AccessAllowedObject') { continue }
+                        if (($ace.AccessMask -band $readMask) -eq 0) { continue }
+                        $sid = [string] $ace.SecurityIdentifier
+                        try {
+                            (New-Object -TypeName System.Security.Principal.SecurityIdentifier -ArgumentList $sid).Translate(
+                                [System.Security.Principal.NTAccount]).Value
+                        } catch { $sid }
+                    })
+                $readMethod = 'directory search'
+            }
+        } catch {
+            Write-Verbose -Message ('Domain bind could not read the Deleted Objects descriptor: {0}' -f $_.Exception.Message)
+        }
+
+        if ($null -eq $granted -or @($granted).Count -eq 0) {
+            try {
+                $container = Get-ADObject -Identity $deletedObjectsDn -Server $Domain -IncludeDeletedObjects `
+                    -Properties nTSecurityDescriptor -ErrorAction Stop
+                if ($container.nTSecurityDescriptor) {
+                    $granted = @(foreach ($ace in $container.nTSecurityDescriptor.Access) {
+                            if ([string] $ace.AccessControlType -ne 'Allow') { continue }
+                            $rights = [string] $ace.ActiveDirectoryRights
+                            if ($rights -notmatch 'ListChildren|ReadProperty|GenericRead|GenericAll') { continue }
+                            [string] $ace.IdentityReference
+                        })
+                    $readMethod = 'directory module'
+                }
+            } catch {
+                Write-Verbose -Message ('Get-ADObject could not read the Deleted Objects descriptor: {0}' -f $_.Exception.Message)
             }
         }
 
-        # LIST_CONTENTS and READ_PROPERTY are what "read" means on this container
-        $trustees = @(foreach ($ace in $acl.Access) {
-                if ([string] $ace.AccessControlType -ne 'Allow') { continue }
-                $rights = [string] $ace.ActiveDirectoryRights
-                if ($rights -notmatch 'ListChildren' -and $rights -notmatch 'ReadProperty' -and $rights -notmatch 'GenericRead' -and $rights -notmatch 'GenericAll') { continue }
-                [string] $ace.IdentityReference
-            })
+        if ($null -eq $granted -or @($granted).Count -eq 0) {
+            return [PSCustomObject]@{
+                isDeletedObjectsPermissionOk = 'N/A'
+                details                      = [PSCustomObject]@{
+                    Container = $deletedObjectsDn
+                    Trustees  = @()
+                    Detail    = ('The container was found but its security descriptor was not returned. Reading a DACL needs READ_CONTROL, ' +
+                        'which the default permissions on this container do not grant to every administrator. Check it manually on a domain ' +
+                        'controller with: dsacls "{0}"') -f $deletedObjectsDn
+                }
+            }
+        }
 
-        $granted = @($trustees | Where-Object { $_ } | Select-Object -Unique)
+        $granted = @($granted | Where-Object { $_ } | Select-Object -Unique)
 
         # Without an explicit DSA name the check can only report who has access; it is informational in that case.
         $status = if (-not $DirectoryServiceAccount) {
