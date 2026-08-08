@@ -34,9 +34,10 @@
 > - It **reads configuration from your domain controllers** and other servers, and opens network
 >   connections to them. Some checks require elevated privileges and remote WMI access.
 > - **Review the code, and test it in a non-production environment first.**
-> - The optional `-RemediationScript` switch **generates** a script that would change audit policy,
+> - Every run **generates** a `Fix-MdiReadiness-<domain>.ps1` that would change audit policy,
 >   registry values and firewall rules on domain controllers. Nothing is ever applied automatically —
->   review the generated script and run it with `-WhatIf` before applying anything.
+>   review the generated script and run it with `-WhatIf` before applying anything. Use
+>   `-SkipRemediationScript` to suppress it.
 > - Checks reflect Microsoft's published documentation at the time of writing and **may become
 >   outdated**. Always verify against the current
 >   [official documentation](https://learn.microsoft.com/defender-for-identity/).
@@ -81,8 +82,8 @@ The script has no cloud dependency. It uses the `ActiveDirectory` module, WMI ov
 TCP/UDP sockets — all classic on-premises technologies — so it runs the same whether your domain controllers are
 physical, on-premises virtual machines, or hosted in a cloud IaaS platform.
 
-Nothing is written to your environment. The only feature that produces change is `-RemediationScript`, and that
-*generates* a script file without ever executing it.
+Nothing is written to your environment. The remediation script is *generated* as a file beside the report and is
+never executed by this script.
 
 ### Requirements on the machine you run it from
 
@@ -248,7 +249,7 @@ Sample for at least 15 minutes during a representative busy period for a more me
 
 ## Remediation script
 
-`-RemediationScript` writes a `Fix-MdiReadiness-<domain>.ps1` next to the reports containing the commands that fix the
+Every run writes a `Fix-MdiReadiness-<domain>.ps1` next to the reports containing the commands that fix the
 findings that can be fixed automatically:
 
 | Finding | Generated remediation |
@@ -263,13 +264,18 @@ findings that can be fixed automatically:
 | Sensor v3.x blockers | Documented as comments — these need manual action (MDE onboarding, cumulative update) |
 
 The generated script supports `-WhatIf`. **Always review it before running it** — it changes audit policy, registry
-values and firewall rules on domain controllers.
+values and firewall rules on domain controllers. It is only ever written by this script, never executed.
+
+Each change is applied over PowerShell remoting where that is available and over WMI where it is not, so it works
+in environments that keep WinRM disabled. Use `-Transport WinRM` or `-Transport WMI` to force one of them.
 
 ```powershell
-.\Test-MdiReadiness.ps1 -Forest -RemediationScript
-.\Fix-MdiReadiness-contoso.com.ps1 -WhatIf     # preview
-.\Fix-MdiReadiness-contoso.com.ps1             # apply
+.\Test-MdiReadiness.ps1 -Forest                 # the script is generated automatically
+.\Fix-MdiReadiness-contoso.com.ps1 -WhatIf      # preview
+.\Fix-MdiReadiness-contoso.com.ps1              # apply
 ```
+
+Use `-SkipRemediationScript` when nothing should be written beside the report itself.
 
 ## Trend tracking
 
