@@ -3144,7 +3144,7 @@ function Get-mdiDomainControllerReadiness {
 
             Write-Verbose -Message "Testing sensor health for $($dc.FQDN)"
             $sensorHealth = Get-mdiSensorHealth -ComputerName $dc.FQDN
-            if ($sensorHealth.isSensorHealthOk -ne 'N/A') { $dc.Add('SensorHealth', $sensorHealth.isSensorHealthOk) }
+            if ([string] $sensorHealth.isSensorHealthOk -ne 'N/A') { $dc.Add('SensorHealth', $sensorHealth.isSensorHealthOk) }
             $details.Add('SensorHealthDetails', $sensorHealth.details)
 
             Write-Verbose -Message "Testing time synchronization for $($dc.FQDN)"
@@ -3166,7 +3166,7 @@ function Get-mdiDomainControllerReadiness {
                 $capacity = Get-mdiCapacityPlanning -ComputerName $dc.FQDN `
                     -DurationSeconds $CapacityPlan.DurationSeconds -IntervalSeconds $CapacityPlan.IntervalSeconds `
                     -TrafficSample $capacitySamples[[string] $dc.FQDN]
-                if ($capacity.isCapacityOk -ne 'N/A') { $dc.Add('CapacitySufficient', $capacity.isCapacityOk) }
+                if ([string] $capacity.isCapacityOk -ne 'N/A') { $dc.Add('CapacitySufficient', $capacity.isCapacityOk) }
                 $details.Add('CapacityDetails', $capacity.details)
             }
 
@@ -3273,7 +3273,7 @@ function Get-mdiCAReadiness {
 
             Write-Verbose -Message "Testing sensor health for $($ca.FQDN)"
             $sensorHealth = Get-mdiSensorHealth -ComputerName $ca.FQDN
-            if ($sensorHealth.isSensorHealthOk -ne 'N/A') { $ca.Add('SensorHealth', $sensorHealth.isSensorHealthOk) }
+            if ([string] $sensorHealth.isSensorHealthOk -ne 'N/A') { $ca.Add('SensorHealth', $sensorHealth.isSensorHealthOk) }
             $details.Add('SensorHealthDetails', $sensorHealth.details)
 
             Write-Verbose -Message "Testing time synchronization for $($ca.FQDN)"
@@ -3378,7 +3378,7 @@ function Get-mdiEntraConnectReadiness {
 
             Write-Verbose -Message "Testing sensor health for $($ec.FQDN)"
             $sensorHealth = Get-mdiSensorHealth -ComputerName $ec.FQDN
-            if ($sensorHealth.isSensorHealthOk -ne 'N/A') { $ec.Add('SensorHealth', $sensorHealth.isSensorHealthOk) }
+            if ([string] $sensorHealth.isSensorHealthOk -ne 'N/A') { $ec.Add('SensorHealth', $sensorHealth.isSensorHealthOk) }
             $details.Add('SensorHealthDetails', $sensorHealth.details)
 
             Write-Verbose -Message "Testing time synchronization for $($ec.FQDN)"
