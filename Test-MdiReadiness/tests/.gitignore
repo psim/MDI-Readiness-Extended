@@ -1,0 +1,3 @@
+# The suites read the script from this folder; copy it in before running.
+Test-MdiReadiness.ps1
+
