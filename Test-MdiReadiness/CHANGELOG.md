@@ -15,6 +15,39 @@ The version is defined once, in the `$settings` block of the script, and appears
 footer, in the `-AsJson` output and in each baseline history entry, so any report or trend can be
 traced back to the build that produced it.
 
+## [1.1.1] - 2026-08-14
+
+Correctness release. Roughly 120 defects were found by an automated hunt against the lab forest and
+fixed. No parameter, report section or JSON field changed, so an existing `-BaselinePath` history and
+any `-AsJson` consumer keep working.
+
+Almost every fix belongs to one family: **the script stated something it had not measured.** The
+recurring shapes were an unread value presented as a measured one, a partial scan presented as a
+verdict, and one host counted twice.
+
+### Fixed
+
+- A check that could not be read is never reported as a check that failed, in any KPI, chart, table
+  or console line. Unmeasured population is carried in the denominator instead of being dropped.
+- A scan that stopped part way, or that enumerated no server at all, no longer prints a readiness
+  verdict or scores green. It says the scan did not complete and asks for a re-run.
+- An area switched off with a `-Skip*` switch is reported as not examined rather than as a failure
+  to evaluate.
+- One physical server is counted once however its name was spelled where it was discovered, and a
+  server that is not ready always appears in the issue list.
+- Audit policy is read from the machine's own system policy; a backup containing only per-user
+  policy is reported as unreadable rather than mistaken for it.
+- The generated remediation script only covers checks that were actually measured, never weakens a
+  setting that already passes, and reports a failing command as failed.
+- Numeric and locale hardening: a packet rate too large for a 32-bit counter no longer aborts the
+  run, and timestamps and parsing no longer depend on the operator's culture.
+
+### Added
+
+- A behavioural regression test suite: 142 files, 3,699 assertions, run against every change. Each
+  test was mutation-tested - the defect was reintroduced, the test confirmed red, then restored.
+- The report screenshots in `docs/` were regenerated from a current run.
+
 ## [1.1.0] - 2026-08-09
 
 Correctness release. Every entry below was found by testing against a real multi-domain forest, and

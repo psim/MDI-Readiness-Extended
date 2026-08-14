@@ -502,7 +502,7 @@ $settings = @{
     # Single source of truth for the version. It is surfaced in the HTML report footer, in the -AsJson
     # output and in the baseline history, so a report or a trend can always be traced back to the build
     # that produced it. A release workflow checks this value against the git tag.
-    ScriptVersion                   = '1.1.0'
+    ScriptVersion                   = '1.1.1'
 
     AdvancedAuditPolicyDCs          = @'
 Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Setting Value
@@ -4716,9 +4716,30 @@ function New-mdiRemediationScript {
             $regPath = $spec.KeyPath
             $regValue = $spec.ValueName
             $expected = $spec.ExpectedValue
-            # The expected value can be a regular expression alternation, so the first branch is the value to set
+            # The expected value can be a regular expression alternation, so the first branch is the
+            # value to set WHEN THE SETTING NEEDS SETTING. It is not the value to force unconditionally.
             $value = (($expected -split '\|')[0]).Trim()
-            & $add ('            New-ItemProperty -Path ''HKLM:\{0}'' -Name ''{1}'' -Value {2} -PropertyType DWord -Force | Out-Null' -f (& $lit $regPath), (& $lit $regValue), ([int] $value))
+            # The emitted script checks the CURRENT value before writing, because these settings are
+            # per-VALUE while the finding that triggered this section is per-SERVER: NtlmAuditing goes
+            # false if ANY of the three values is wrong, and the generator then rewrote all three.
+            # RestrictSendingNTLMTraffic accepts '1|2' - 1 is "Audit all", 2 is "Deny all", and both
+            # PASS - so a domain controller already hardened to 2 had its policy silently relaxed to 1
+            # by a script generated to fix an unrelated missing value. Measured on the shipped
+            # generator and confirmed against the AST of the emitted script: server at 2 (passing),
+            # only AuditNTLMInDomain wrong, emitted remediation writes 1. An administrator running the
+            # remediation an MDI readiness tool produced would have weakened the estate it assessed,
+            # with no warning and nothing in the report to say it had happened.
+            #
+            # The guard is evaluated on the target at run time rather than baked in here, because one
+            # script block is emitted for ALL affected servers and their current values differ. The
+            # match is the same right-anchored alternation the reader uses, so "already acceptable"
+            # means exactly what the check means by it. A value that is absent or unreadable does not
+            # match, so it is still written - the repair path is unaffected.
+            & $add '            $mdiCurrent = $null'
+            & $add ('            try {{ $mdiCurrent = (Get-ItemProperty -Path ''HKLM:\{0}'' -ErrorAction Stop).''{1}'' }} catch {{ }}' -f (& $lit $regPath), (& $lit $regValue))
+            & $add ('            if ([string] $mdiCurrent -notmatch ''^(?:{0})$'') {{' -f (& $lit $expected))
+            & $add ('                New-ItemProperty -Path ''HKLM:\{0}'' -Name ''{1}'' -Value {2} -PropertyType DWord -Force | Out-Null' -f (& $lit $regPath), (& $lit $regValue), ([int] $value))
+            & $add '            }'
         }
         & $add '        }'
         & $add '        } catch {'
@@ -5516,6 +5537,7 @@ function Get-mdiBaselineHistory {
     param (
         [Parameter(Mandatory = $true)] [string] $BaselinePath,
         [Parameter(Mandatory = $true)] [string] $Domain,
+        [Parameter(Mandatory = $false)] [AllowNull()] [string] $Forest = $null,
         [Parameter(Mandatory = $true)] [object] $Statistics,
         [Parameter(Mandatory = $false)] [int] $KeepRuns = 60
     )
@@ -5528,6 +5550,16 @@ function Get-mdiBaselineHistory {
         # Recorded per run so a trend that spans an upgrade can be read correctly: a different version
         # may check different things, which would otherwise look like a sudden change in the estate.
         ScriptVersion = [string] $settings.ScriptVersion
+        # WHICH ESTATE this run measured. The history file is named after the domain, but a file name is
+        # not an identity: a baseline copied or renamed between customers, or a domain name that exists
+        # in two forests (contoso.com in a lab and in production is the ordinary case, not an exotic
+        # one), was compared against the current run as though it were the same estate. Measured on the
+        # shipped renderer: a baseline from a DIFFERENT forest, and one from a DIFFERENT domain, both
+        # rendered "up 20 pt vs previous run" - a confident improvement figure computed from a stranger's
+        # estate, and a percentage-point number is exactly what gets copied into a status report.
+        # Recorded on both sides so the delta can refuse the comparison instead of inventing it.
+        Domain        = [string] $Domain
+        Forest        = [string] $Forest
         # A fingerprint of WHAT was measured, so two runs can be told apart from two measurements of
         # the same thing. The history stores aggregate counts only, so a run that added a check, or one
         # taken after a domain controller was decommissioned, produced a different ratio for reasons
@@ -5992,6 +6024,31 @@ function New-mdiTrendChart {
     $sameVersion = ([string]::IsNullOrWhiteSpace($previousVersion) -or [string]::IsNullOrWhiteSpace($currentVersion) -or
         [string]::Equals($previousVersion, $currentVersion, [StringComparison]::OrdinalIgnoreCase))
 
+    # The ESTATE is part of comparability too, and it was the one identity never checked. The history
+    # file is named after the domain, but the name of a file is not proof of what is inside it: a
+    # baseline copied between customers, restored from the wrong backup, or a domain name that lives in
+    # two forests all produced a delta between two different estates. Measured on the shipped renderer,
+    # both a different-forest and a different-domain baseline rendered "up 20 pt vs previous run".
+    #
+    # Compared with the same rules DNS uses and the rest of this file already applies to domain names -
+    # case-insensitively and ignoring a trailing dot - so 'CONTOSO.COM.' and 'contoso.com' are one
+    # estate and do not suppress a delta that should be drawn.
+    #
+    # Guarded on BOTH sides recording a value, exactly like the version check above: histories written
+    # before these fields existed must fall through to the fingerprint checks rather than be declared
+    # incomparable on a property they never had. That keeps every existing baseline working.
+    $estateName = { param($p) ([string] $p).Trim().TrimEnd('.') }
+    $sameEstatePart = {
+        param($a, $b)
+        $x = & $estateName $a
+        $y = & $estateName $b
+        ([string]::IsNullOrWhiteSpace($x) -or [string]::IsNullOrWhiteSpace($y) -or
+            [string]::Equals($x, $y, [StringComparison]::OrdinalIgnoreCase))
+    }
+    $sameDomain = & $sameEstatePart $previous.Domain $current.Domain
+    $sameForest = & $sameEstatePart $previous.Forest $current.Forest
+    $sameEstate = ($sameDomain -and $sameForest)
+
     # Sorted at compare time rather than trusting the writer to have sorted. The writer does sort, but a
     # history file written by an earlier version, edited by hand, or merged from elsewhere carries the
     # names in whatever order it had, and comparing the joined strings then reported "the set of servers
@@ -6024,9 +6081,18 @@ function New-mdiTrendChart {
     $samePopulation = ($prevDenominator -eq $currDenominator)
 
     if (-not $hasFingerprint -or -not $sameChecks -or -not $sameServers -or -not $samePopulation -or
-        -not $sameVersion -or $prevDenominator -le 0 -or $currDenominator -le 0) {
+        -not $sameVersion -or -not $sameEstate -or $prevDenominator -le 0 -or $currDenominator -le 0) {
         $reason = if (-not $hasFingerprint) {
             'the previous run predates the comparison fingerprint'
+        } elseif (-not $sameEstate) {
+            # Named explicitly. "Not comparable" without a reason invites the reader to assume a
+            # transient glitch and ignore it, when the actual cause is that the baseline belongs to
+            # somebody else's estate and should be removed from this folder.
+            if (-not $sameDomain) {
+                'the baseline is from a different domain ({0} then {1})' -f (& $estateName $previous.Domain), (& $estateName $current.Domain)
+            } else {
+                'the baseline is from a different forest ({0} then {1})' -f (& $estateName $previous.Forest), (& $estateName $current.Forest)
+            }
         } elseif (-not $sameVersion) {
             'the scanner version changed ({0} then {1})' -f $previousVersion, $currentVersion
         } elseif (-not $sameServers) {
@@ -6389,6 +6455,20 @@ $script:mdiTrafficSampleScript = {
             #
             # Counting the readable adapters separately restores the distinction. No adapter with a
             # readable counter means no sample, which is the same answer as no adapter at all above.
+            #
+            # A NEGATIVE per-adapter rate is rejected here, not merely at the aggregate. Packets/sec is
+            # a rate and cannot be below zero: a negative reading is a wrapped or broken counter, and
+            # Get-mdiPacketRateReading already refuses one for exactly that reason. But it only ever
+            # sees the TOTAL, and the total is taken here - so a broken adapter CANCELLED a working one
+            # and the aggregate guard was handed a plausible number. Measured on the shipped sampler:
+            # one adapter reading 100000 packets/sec correctly returns CapacitySufficient=False ("not
+            # supported ... at or above the 100000 packets/sec ceiling"); adding a second adapter
+            # reading -99500 produced a total of 500 and turned the same server into
+            # CapacitySufficient=True, "The server has enough resources for a sensor v2.x at 500 busy
+            # packets/sec". A subtracted reading is the one direction that flatters the verdict, and it
+            # flips the answer on precisely the busiest servers - the ones where being wrong costs most.
+            # Skipped rather than zeroed, and not counted as read: a broken counter is a reading that
+            # never arrived, which is the state every caller already handles.
             $total = 0
             $readAdapterCount = 0
             foreach ($adapter in $adapters) {
@@ -6400,11 +6480,14 @@ $script:mdiTrafficSampleScript = {
                     $parsed = [double] 0
                     if (-not [double]::TryParse($raw, [Globalization.NumberStyles]::Float,
                             [Globalization.CultureInfo]::InvariantCulture, [ref] $parsed)) { continue }
+                    if ($parsed -lt 0) { continue }
                     $total += $parsed
                     $readAdapterCount++
                 } else {
                     try {
-                        $total += [double] $raw
+                        $value = [double] $raw
+                        if ($value -lt 0) { continue }
+                        $total += $value
                         $readAdapterCount++
                     } catch {
                         # A value that cannot be made a number is not a reading of zero
@@ -9858,7 +9941,16 @@ function Merge-mdiSensorV3ReadyDetails {
         $unknownChecks = @(foreach ($unknown in $unknowns) { [string] $unknown.Name })
     } else {
         $blockerMessages = @(@(@($First.Blockers) + @($Second.Blockers)) | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
-        $actionableBlockers = @(@(@($First.ActionableBlockers) + @($Second.ActionableBlockers)) | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+        # ABSENT and PRESENT-BUT-EMPTY are different answers here, and reading the stored lists directly
+        # cannot tell them apart: both read back as $null. Absent means "never classified, fall back to
+        # Blockers"; empty means "classified, and none of them are work worth doing". Two blobs that
+        # BOTH omitted the property therefore merged into a present-but-EMPTY list, which flipped every
+        # real blocker to nothing-to-do and deleted from the remediation script precisely the findings
+        # the fallback in Get-mdiV3ActionableBlocker exists to preserve - and this branch runs only for
+        # blobs with no Checks, i.e. the earlier-version and foreign reports that are exactly the ones
+        # missing the property. Each side is RESOLVED through that one computation before the union, so
+        # a side that never carried the classification still contributes its blockers.
+        $actionableBlockers = @(@(@(Get-mdiV3ActionableBlocker -Detail $First) + @(Get-mdiV3ActionableBlocker -Detail $Second)) | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
         $unknownChecks = @(@(@($First.UnknownChecks) + @($Second.UnknownChecks)) | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
     }
 
@@ -11603,7 +11695,18 @@ function Get-mdiIssueList {
         # probe results and the sensor v3 blockers are detail records, and rules further down report
         # them - so keying only on the check properties would raise a "nothing was measured" row for a
         # server whose measurements are sitting in the very same object.
-        $hasAnyDetail = @($srv.Details.PSObject.Properties | Where-Object { $null -ne $_.Value }).Count -gt 0
+        # Read through Get-mdiDetailEntry, the shared shape-agnostic reader, NOT PSObject.Properties.
+        # Every producer stores Details as [ordered]@{}, and PSObject.Properties on a dictionary
+        # enumerates the .NET MEMBERS of the dictionary - Count, IsReadOnly, Keys, Values, IsFixedSize,
+        # SyncRoot, IsSynchronized - never its entries. Measured on the shipped functions: an EMPTY
+        # [ordered]@{} yields 7 non-null "properties", exactly as many as a populated one, so
+        # $hasAnyDetail was $true for every server this guard could ever be asked about. The protection
+        # was therefore DEAD for the entire estate: a server with an empty Details and no check
+        # properties rendered NOT READY with ZERO issue rows - the precise "told to act, given nothing
+        # to act on" outcome the guard was written to prevent - while the same fixture built as a
+        # [PSCustomObject] correctly produced the row. The two shapes are supposed to be
+        # interchangeable everywhere else in this file, which is what Get-mdiDetailEntry exists for.
+        $hasAnyDetail = @(Get-mdiDetailEntry -Details $srv.Details | Where-Object { $null -ne $_.Value }).Count -gt 0
         if ($srv.PartialFailure -ne $true -and -not $hasAnyDetail -and @(Get-mdiCheckProperty -Server $srv).Count -eq 0) {
             $silentReason = ([string] $srv.Comment).Trim()
             [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Not measured'
@@ -11837,7 +11940,36 @@ function Get-mdiOverviewHtml {
     # Installed is tri-state and 'N/A' is truthy, so a bare truthiness test counted every server that
     # could not be queried as one with a sensor deployed - and the KPI then read "installed but not
     # running" for a machine nobody had reached.
-    $sensorInstalled = @($sensorServers | Where-Object { [string] $_.Details.SensorHealthDetails.Installed -eq 'True' })
+    $sensorInstalled = @($sensorServers | Where-Object {
+            [string] $_.Details.SensorHealthDetails.Installed -eq 'True' -or
+            # A HALF-INSTALLED sensor - the AATPSensorUpdater service present, the AATPSensor service
+            # absent - is a deployment that went wrong, not an estate that has not been deployed to.
+            # It reports Installed=False, so it fell out of this population; and because False is not
+            # null it was not "unreadable" either, so it left BOTH sides of the ratio and the machine
+            # vanished from the card. Measured on the shipped functions: one healthy server plus one
+            # half-installed server rendered a GREEN "Sensors healthy 1/1 - All sensor services
+            # running", byte-identical to the healthy server on its own - while the SAME PAGE carried a
+            # red row for that machine and the issue "The AATPSensor service is not installed, although
+            # the updater is present". Compare the honest case one step away: the same server with the
+            # service merely STOPPED renders bad, "1/2". A broken install disclosed less than a stopped
+            # service.
+            #
+            # Keyed on the UPDATER, not on the health verdict. isSensorHealthOk is $false for a server
+            # with NO sensor at all too - Get-mdiSensorHealth raises "The AATPSensor service is not
+            # installed" whenever the sensor service is missing - so admitting every failed verdict
+            # would drag every not-yet-deployed server in and paint a red "0/N not running" over an
+            # estate that is simply awaiting rollout. That is the false alarm this card must not raise,
+            # and UnmeasuredInRollups.Tests.ps1 pins it. The updater is what distinguishes "deployed
+            # wrong" from "not deployed", which is the line the producer itself draws in that message.
+            #
+            # Installed must be explicitly False - a definite reading - so a server whose sensor state
+            # could not be determined stays in the unreadable population below rather than being
+            # counted as a broken install.
+            ([string] $_.Details.SensorHealthDetails.Installed -eq 'False' -and
+                -not [string]::IsNullOrWhiteSpace([string] $_.Details.SensorHealthDetails.UpdaterService) -and
+                [string] $_.Details.SensorHealthDetails.UpdaterService -ne 'Not installed' -and
+                [string] $_.Details.SensorHealthDetails.UpdaterService -notmatch 'Not determined')
+        })
     # The third state. Installed is tri-state, and "no sensor is installed" and "we could not read
     # whether a sensor is installed" are opposite claims: the card asserted "No v2.x sensor installed
     # yet" - a definite statement of fact about the estate - over servers whose WMI never answered,
@@ -11963,9 +12095,22 @@ function Get-mdiOverviewHtml {
                 # reader nothing is wrong. The class is stated so this is never confused with the
                 # required-probe branch above.
                 elseif ($stats.PortsUntested -gt 0) { 'No required port blocked; {0} optional or recommended probe(s) could not be tested{1}' -f $stats.PortsUntested, $portSample }
+                # A run that STOPPED PART WAY cannot make a clean statement about the estate's ports.
+                # The abandoned server contributes no port records at all, so it does not appear as a
+                # blocked port or as an untested probe - it simply vanishes from the population, and
+                # every branch above is then satisfied by the servers that did finish. Measured on the
+                # shipped renderer, the same machine with the same three broken prerequisites produced
+                # this ladder:
+                #     port measured BLOCKED (complete)      bad   1/2  "1 required port(s) blocked"
+                #     probe recorded NOT TESTED (complete)  warn  1/1  "1 required probe(s) could not be tested"
+                #     server ABANDONED part way             ok    1/1  "No required port blocked among those probed"
+                # Giving up scored better than measuring, which is the exact defect class this campaign
+                # exists to remove. The count is honest - those probes really did pass - so the number
+                # is kept and the card refuses the clean bill of health instead.
+                elseif ($stats.PartialScanCount -gt 0) { 'No required port blocked among those probed, but testing stopped part way on {0} server(s), so their ports were never probed{1}' -f $stats.PartialScanCount, $portSample }
                 elseif ($portSample) { 'No required port blocked among those probed{0}' -f $portSample }
                 else { 'No required port blocked' })
-            Tone = $(if ($stats.PortsTotal -eq 0) { 'na' } elseif ($stats.PortsRequiredFail -gt 0) { 'bad' } elseif ($stats.PortsUntested -gt 0) { 'warn' } elseif ($stats.PortsBlocked -gt 0) { 'warn' } elseif ($stats.PortsRequiredTested -eq 0) { 'na' } else { 'ok' })
+            Tone = $(if ($stats.PortsTotal -eq 0) { 'na' } elseif ($stats.PortsRequiredFail -gt 0) { 'bad' } elseif ($stats.PortsUntested -gt 0) { 'warn' } elseif ($stats.PortsBlocked -gt 0) { 'warn' } elseif ($stats.PortsRequiredTested -eq 0) { 'na' } elseif ($stats.PartialScanCount -gt 0) { 'warn' } else { 'ok' })
         }
         @{ Label = 'NNR resolvable targets'; Value = ('{0}/{1}' -f $stats.NnrResolvable, $stats.NnrTargetCount)
             # Three outcomes. A target nobody managed to probe is a gap to re-measure, not a firewall to
@@ -11992,6 +12137,11 @@ function Get-mdiOverviewHtml {
                 elseif ($nnrFailed -gt 0 -and $nnrUnmeasured -gt 0) { '{0} target(s) unresolvable, {1} could not be tested{2}' -f $nnrFailed, $nnrUnmeasured, $nnrSample }
                 elseif ($nnrFailed -gt 0) { 'Lowers the name resolution rate{0}' -f $nnrSample }
                 elseif ($nnrUnmeasured -gt 0) { '{0} target(s) could not be tested{1}' -f $nnrUnmeasured, $nnrSample }
+                # Same abandoned-server hole as the ports card above: a server whose scan stopped part
+                # way is never asked to resolve anything, so it leaves the target population entirely
+                # rather than appearing as an unresolvable or untested target, and the card went GREEN
+                # reading "Every PROBED target resolvable" for a run that gave up.
+                elseif ($stats.PartialScanCount -gt 0) { 'Every PROBED target resolvable, but testing stopped part way on {0} server(s), so their name resolution was never probed{1}' -f $stats.PartialScanCount, $nnrSample }
                 elseif ($nnrSampled) { 'Every PROBED target resolvable{0}' -f $nnrSample }
                 else { 'Every target resolvable' })
             Tone = $(
@@ -12000,6 +12150,7 @@ function Get-mdiOverviewHtml {
                 if ($stats.NnrTargetCount -eq 0) { 'na' }
                 elseif ($nnrFailed2 -gt 0) { 'bad' }
                 elseif ($nnrUnmeasured2 -gt 0) { 'warn' }
+                elseif ($stats.PartialScanCount -gt 0) { 'warn' }
                 else { 'ok' })
         }
         @{ Label = 'Sensors healthy'
@@ -12012,8 +12163,14 @@ function Get-mdiOverviewHtml {
                     '{0} server(s) could not be read' -f $sensorUnreadable.Count
                 } elseif ($sensorInstalled.Count -eq 0) { 'No v2.x sensor installed yet' }
                 elseif ($sensorHealthy.Count -lt $sensorInstalled.Count -and $sensorUnreadable.Count -gt 0) {
-                    '{0} installed but not running, {1} could not be read' -f ($sensorInstalled.Count - $sensorHealthy.Count), $sensorUnreadable.Count
-                } elseif ($sensorHealthy.Count -lt $sensorInstalled.Count) { '{0} installed but not running' -f ($sensorInstalled.Count - $sensorHealthy.Count) }
+                    '{0} not running, {1} could not be read' -f ($sensorInstalled.Count - $sensorHealthy.Count), $sensorUnreadable.Count
+                # "installed but not running" was accurate while this population was strictly the
+                # servers reporting Installed=True. It now also carries a HALF-INSTALLED server - the
+                # updater present, the sensor service absent - for which "installed" is exactly the
+                # wrong word, and the issue list on the same page says so explicitly. The wording is
+                # widened to the fact both cases share: the sensor service is not running. The precise
+                # cause stays where it belongs, in the issue list and the Sensor health table.
+                } elseif ($sensorHealthy.Count -lt $sensorInstalled.Count) { '{0} not running' -f ($sensorInstalled.Count - $sensorHealthy.Count) }
                 elseif ($sensorUnreadable.Count -gt 0) { 'All read sensor services running, {0} could not be read' -f $sensorUnreadable.Count }
                 else { 'All sensor services running' })
             Tone = $(if ($sensorInstalled.Count -eq 0 -and $sensorUnreadable.Count -gt 0) { 'warn' }
@@ -13810,8 +13967,16 @@ function Set-MdiReadinessReport {
         # -RemediationScript is retained only for compatibility and does nothing; generation is
         # controlled by the ABSENCE of -SkipRemediationScript. Telling the reader to re-run with a
         # no-op switch sent them round the same loop with the same result.
+        # The SANITISED name, because that is the file the writer actually produces:
+        # New-mdiRemediationScript builds its path with ConvertTo-mdiSafeFileName $report.Domain. Using
+        # the raw domain here told the reader to look for a file that is never written - a domain
+        # carrying any character illegal in a file name (an apostrophe, a quote, an angle bracket, or
+        # any of the characters an internationalised or hand-created domain can hold) is rewritten to
+        # underscores on disk, so the page named Fix-MdiReadiness-hostile<domain.local.ps1 while the
+        # scan wrote Fix-MdiReadiness-hostile_domain.local.ps1. Escaped for HTML after sanitising, not
+        # instead of it: the two do different jobs and the sanitiser is not an escaper.
         '<p class="muted">No remediation script was generated because this run used <code>-SkipRemediationScript</code>. Re-run without it to produce a ready-to-run <code>Fix-MdiReadiness-' +
-        (ConvertTo-mdiHtmlEncoded $Domain) + '.ps1</code> containing the commands that fix the findings above (advanced audit policy, NTLM auditing, power scheme, Network Name Resolution firewall rules, stopped sensor services and clock resynchronisation).</p>'
+        (ConvertTo-mdiHtmlEncoded (ConvertTo-mdiSafeFileName $Domain)) + '.ps1</code> containing the commands that fix the findings above (advanced audit policy, NTLM auditing, power scheme, Network Name Resolution firewall rules, stopped sensor services and clock resynchronisation).</p>'
     }
 
     $htmlOverview = Get-mdiOverviewHtml -Statistics $stats -ReportData $ReportData
@@ -13821,7 +13986,7 @@ function Set-MdiReadinessReport {
     $trendPath = if ($SkipTrend) { $null } elseif ($BaselinePath) { $BaselinePath } else { $Path }
 
     $htmlTrend = if ($trendPath) {
-        $baseline = Get-mdiBaselineHistory -BaselinePath $trendPath -Domain $Domain -Statistics $stats
+        $baseline = Get-mdiBaselineHistory -BaselinePath $trendPath -Domain $Domain -Forest $ReportData.Forest -Statistics $stats
         Write-mdiVerbose ('Baseline history: {0} ({1} run(s))' -f $baseline.Path, @($baseline.History).Count)
         New-mdiTrendChart -History $baseline.History
     } else {
