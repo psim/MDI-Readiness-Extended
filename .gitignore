@@ -348,3 +348,7 @@ MigrationBackup/
 
 # Ionide (cross platform F# VS Code tools) working folder
 .ionide/
+
+# Bug-hunt scratch and local backups
+Test-MdiReadiness/_bughunt/
+*.bak-*

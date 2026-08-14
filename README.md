@@ -1,18 +1,30 @@
-# Microsoft-Defender-for-Identity
+# MDI-Readiness-Extended
 
-This repository contains scripts, code examples and additional resources to improve customer experience with Microsoft Defender for Identity.
-If you have an issue with Microsoft Defender for Identity, please open a support ticket.
-For questions and feedback, please contact <mdifeedback@microsoft.com>
+> ### Unofficial fork — not a Microsoft product
+>
+> This is a personal, **unofficial** fork of the Microsoft Defender for Identity repository. It is
+> **not** an official Microsoft product, is **not** endorsed or supported by Microsoft, and is not
+> covered by any Microsoft support agreement or SLA.
+>
+> **Do not open Microsoft support cases about this fork**, and do not contact the Microsoft feedback
+> alias about it. For the official, supported tool use the upstream repository:
+> <https://github.com/microsoft/Microsoft-Defender-for-Identity>
+>
+> Provided **"as is"**, without warranty of any kind. You use it entirely at your own risk. It reads
+> configuration from domain controllers and opens network connections to them; review the code and
+> test it in a non-production environment first.
 
-## Contributing
+This fork extends `Test-MdiReadiness.ps1` with additional checks, hardening and a behavioural
+regression test suite.
 
-This project welcomes contributions and suggestions.  All contributions require you to agree to a
-Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
-the rights to use your contribution. For details, visit https://cla.opensource.microsoft.com.
+---
 
-This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
-For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or
-contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
+## Upstream project
+
+This repository is derived from Microsoft's Defender for Identity repository, which contains scripts,
+code examples and additional resources for the product. Issues with the **product itself**, and
+questions about the official tooling, belong upstream:
+<https://github.com/microsoft/Microsoft-Defender-for-Identity>
 
 ## Trademarks
 
@@ -21,7 +33,3 @@ trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
-
-## Questions and feedback
-
-For questions and feedback, please start a new discussion in the [Microsoft Defender for Identity Tech Community](https://techcommunity.microsoft.com/t5/microsoft-defender-for-identity/bd-p/AzureAdvancedThreatProtection)
