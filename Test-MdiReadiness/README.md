@@ -87,6 +87,10 @@ never executed by this script.
 
 ### Requirements on the machine you run it from
 
+- **Windows PowerShell 5.1.** The script uses WMI cmdlets that were removed in PowerShell 7, so if you
+  start it with `pwsh` it re-launches itself under Windows PowerShell automatically and reports the
+  result back — you do not have to change how you invoke it, and nothing has to be uninstalled, since
+  PowerShell 7 installs side by side with Windows PowerShell rather than replacing it.
 - Domain-joined workstation or member server, with the **RSAT Active Directory PowerShell module** installed
 - An account with read permissions in the domains being scanned (Enterprise Admin for `-Forest`)
 - **WMI access to each target server**: TCP 135 plus the RPC dynamic port range (49152-65535 on modern Windows).

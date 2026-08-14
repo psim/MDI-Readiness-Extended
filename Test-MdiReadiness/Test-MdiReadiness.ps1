@@ -6690,10 +6690,20 @@ function Get-mdiBusyPacketsPerSecond {
         $best
     }
 
+    # [long], not [int]. A packets/sec reading above 2,147,483,647 threw "Cannot convert value ... to
+    # type System.Int32", and because the whole scan runs under a trap that turns any unhandled
+    # exception into "Test-MdiReadiness did not complete" + exit 255, ONE domain controller reporting
+    # a large finite rate aborted the entire run - every other server's results lost with it. A rate
+    # that large is almost certainly a counter artefact rather than real traffic, but the sizing layer
+    # already has an honest answer for traffic it cannot size ("not supported at this rate"), and
+    # reaching that answer requires the number to survive being read at all.
+    #
+    # Counted in packets per second, a long cannot realistically overflow: 2^63 packets/sec is many
+    # orders of magnitude beyond any network interface.
     [PSCustomObject]@{
-        BusyPacketsPerSec = [int] [math]::Round($busy)
-        AveragePacketsPerSec = [int] [math]::Round($average)
-        PeakPacketsPerSec = [int] [math]::Round($peak)
+        BusyPacketsPerSec = [long] [math]::Round($busy)
+        AveragePacketsPerSec = [long] [math]::Round($average)
+        PeakPacketsPerSec = [long] [math]::Round($peak)
         SampleCount = $Sample.Count
         SampleSeconds = [int] [math]::Round($span)
         FullWindow = $span -ge $windowSeconds
@@ -8927,10 +8937,31 @@ function Get-mdiEntraConnectReadiness {
                     # That defect is almost certainly why the original code parsed by character offset.
                     # The optional 'n' covers both spellings; the tenant clause is never matched, so a
                     # tenant name cannot be mistaken for a server name.
-                    foreach ($pattern in 'running on? ?([A-Za-z0-9\-_]{1,63})\s+configured', 'running on? ?([A-Za-z0-9\-_]{1,63})\s',
-                        'on computer ([A-Za-z0-9\-_]{1,63})', 'installed on ([A-Za-z0-9\-_]{1,63})') {
+                    # ORDER MATTERS, and it was wrong. The specific wordings run FIRST and the generic
+                    # "running on <token>" catch-alls run LAST, because the generic ones happily
+                    # capture the NOUN out of Microsoft's own English description: on
+                    # "... running on computer AADC01 configured ..." the generic pattern matched and
+                    # returned the literal string "computer", the loop broke, and the specific
+                    # 'on computer (...)' pattern - written for exactly this string - was never
+                    # reached. The script then asked the directory for a computer named "computer",
+                    # found nothing, verified ZERO Entra Connect servers, and told the operator this
+                    # "can happen when the account description is in a non-English locale" - about an
+                    # English description on an English directory. Measured on the shipped producer
+                    # with the server present and reachable; the same string through the
+                    # 'on computer' pattern alone yields AADC01.
+                    #
+                    # The noun guard below is belt and braces: even if the order is changed again, a
+                    # capture that is one of the words the description uses to introduce the name is
+                    # not a name. It is deliberately a tiny, closed list of English nouns that appear
+                    # in these descriptions - not a general heuristic - so a real server called, say,
+                    # "SERVER01" is unaffected.
+                    $descriptionNoun = @('computer', 'server', 'machine', 'host')
+                    foreach ($pattern in 'on computer ([A-Za-z0-9\-_]{1,63})', 'installed on ([A-Za-z0-9\-_]{1,63})',
+                        'running on? ?([A-Za-z0-9\-_]{1,63})\s+configured', 'running on? ?([A-Za-z0-9\-_]{1,63})\s') {
                         $m = [regex]::Match($desc, $pattern)
-                        if ($m.Success) { $candidate = $m.Groups[1].Value; break }
+                        if ($m.Success -and $m.Groups[1].Value -and $m.Groups[1].Value -notin $descriptionNoun) {
+                            $candidate = $m.Groups[1].Value; break
+                        }
                     }
                     if (-not $candidate) {
                         # A WARNING, not verbose. This is one of the two ways a named Entra Connect
@@ -9899,6 +9930,30 @@ function Merge-mdiServerByFqdn {
         # host as each other, and an empty key would merge every one of them into a single row, so a
         # name that trims away is kept separate rather than being given a shared key.
         if ($key -eq '') { [void] $merged.Add($srv); continue }
+
+        # A DOTLESS name is the NetBIOS/short spelling of a host, and the record already carries the
+        # domain it was discovered in - so "MEM03" with Domain "mdilab.local" IS "mem03.mdilab.local",
+        # DERIVED rather than guessed. Without this, one controller discovered once by short name (an
+        # operator-supplied -NnrTargetComputer, a name split out of a comma-separated list, a directory
+        # attribute that returns the sAMAccountName-style spelling) and once by FQDN keyed differently
+        # and became TWO servers. Measured on the shipped functions: one host spelled both ways
+        # rendered "2 server(s)", a denominator of 4, one PASSING check contributed by the healthy
+        # half, an overall score of 25%, a duplicate issue row, exit code 3 under -FailOnIssues, and a
+        # remediation script naming the same machine twice - where the identical host spelled
+        # consistently rendered 1 server, a denominator of 2, 0%, and exit code 2. Discovering a server
+        # a second time made the estate look BETTER, which is the exact failure this merge exists to
+        # prevent and the one its trailing-dot and whitespace rules above already close.
+        #
+        # Qualification is conditional on BOTH the name being dotless AND a domain being present, so it
+        # can never invent an identity. A bare short name with no domain on the record cannot be proven
+        # to belong to any domain - "dc1" may be dc1.fabrikam.com - so it is left exactly as it was and
+        # still keys separately, which is what ServerMergeKeyNormalisation.Tests.ps1 pins. Qualifying
+        # with the record's OWN domain is also what keeps genuinely different hosts apart: "MEM03" in
+        # mdilab.local becomes mem03.mdilab.local and still does not collide with mem03.fabrikam.com.
+        if ($key -notmatch '\.') {
+            $domainKey = ([string] $srv.Domain).Trim().TrimEnd('.').Trim().ToLowerInvariant()
+            if ($domainKey -ne '') { $key = $key + '.' + $domainKey }
+        }
 
         # Recorded HERE, before the first-role branch below, which continues out of the loop and so
         # never reaches the Unreachable/PartialFailure merge at the bottom. Recording it only there
@@ -11531,6 +11586,34 @@ function Get-mdiIssueList {
                     Issue = 'Testing stopped early on this server, so the remaining prerequisites were never checked: ' + [string] $srv.Comment
                 })
         }
+        # A server that was REACHED but produced no readiness checks at all. Every rule below iterates
+        # the checks the server carries, so a server carrying none contributes nothing to this list -
+        # yet the verdict correctly refuses to call it ready, because a server nobody measured is not
+        # a server that passed. Measured on the shipped functions: one reachable domain controller
+        # with no check properties and four passing domain checks gave verdict NOT READY, hero
+        # "Action required", exit code 1 under -FailOnIssues - and an issue table with ZERO rows,
+        # under a console line reading "0 issue(s) found: 4/4 checks passed across 1 server(s)".
+        # The operator is told to act, told nothing failed, and given nothing to act on.
+        #
+        # Filed as 'Not measured' rather than as a failure: nothing was observed to fail here, the
+        # server simply produced no evidence. Placeholders and unreachable servers are reported above
+        # and never reach this point; a partial failure already has its own row and is not duplicated.
+        # "No evidence at all" means no boolean checks AND no detail collections either. A server can
+        # legitimately carry no boolean check properties while still having been measured - the port
+        # probe results and the sensor v3 blockers are detail records, and rules further down report
+        # them - so keying only on the check properties would raise a "nothing was measured" row for a
+        # server whose measurements are sitting in the very same object.
+        $hasAnyDetail = @($srv.Details.PSObject.Properties | Where-Object { $null -ne $_.Value }).Count -gt 0
+        if ($srv.PartialFailure -ne $true -and -not $hasAnyDetail -and @(Get-mdiCheckProperty -Server $srv).Count -eq 0) {
+            $silentReason = ([string] $srv.Comment).Trim()
+            [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Not measured'
+                    Issue = $(if ($silentReason) {
+                            'This server was reached but returned no readiness checks, so nothing about it was measured: ' + $silentReason
+                        } else {
+                            'This server was reached but returned no readiness checks, so nothing about it was measured. Re-run against it directly to find out why.'
+                        })
+                })
+        }
         $portDetails = $srv.Details.RequiredPortsDetails
         $v3Details = $srv.Details.SensorV3ReadyDetails
         # Specific findings are far more actionable than a generic "<check> failed" line, so the summary row is only
@@ -11779,6 +11862,11 @@ function Get-mdiOverviewHtml {
         @($stats.UnreachableList | Where-Object { -not (Test-mdiServerIsPlaceholder -Server $_) }))
     $sensorHealthy = @($sensorInstalled | Where-Object { $_.SensorHealth -eq $true })
 
+    # Read from the SAME SkippedAreas list the hero banner's "(not examined: ...)" suffix and the
+    # console line are built from, so the tile cannot drift from the four other surfaces that already
+    # describe this correctly.
+    $v3AreaSkipped = @($ReportData.SkippedAreas | Where-Object { [string] $_ -eq 'Sensor v3.x readiness' }).Count -gt 0
+
     # --- KPI cards ---------------------------------------------------------------------------------------------
     $kpis = @(
         @{ Label = 'Servers scanned'; Value = $stats.TotalServers; Sub = ('{0} domain(s) in scope' -f $stats.DomainCount); Tone = 'info' }
@@ -11938,23 +12026,53 @@ function Get-mdiOverviewHtml {
             # Servers whose v3 readiness could not be determined are named. They were excluded from
             # the ratio entirely, so a green "1/1" sat above a v3 tab reading "Not determined" three
             # times - the reader takes the KPI, not the tab.
-            Sub = $(if ($stats.V3Evaluated -eq 0 -and $stats.V3Unevaluated -gt 0) { '{0} server(s) could not be evaluated' -f $stats.V3Unevaluated }
+            #
+            # "Could not be evaluated" is a REPORT OF FAILURE, and it must not be made about an area
+            # the operator deliberately switched off. With -SkipSensorV3Readiness every reachable
+            # server legitimately carries no v3 detail, so all of them landed in V3Unevaluated and the
+            # tile rendered an amber "1 server(s) could not be evaluated" - while the hero banner, the
+            # console line, the JSON SkippedAreas and the v3 tab itself all correctly said the area was
+            # not examined by request. Five surfaces describing one fact, and the only one that called
+            # it a problem was the tile.
+            #
+            # Routed to the neutral branch that already exists for "nothing to say here": an area that
+            # was skipped is not an area that failed. Keyed off the SAME SkippedAreas list the verdict
+            # and the console suffix are built from, so the tile cannot drift from them.
+            Sub = $(if ($v3AreaSkipped) { 'Not evaluated - skipped for this run' }
+                elseif ($stats.V3Evaluated -eq 0 -and $stats.V3Unevaluated -gt 0) { '{0} server(s) could not be evaluated' -f $stats.V3Unevaluated }
                 elseif ($stats.V3Evaluated -eq 0) { 'Not evaluated' }
                 elseif ($stats.V3Unevaluated -gt 0) { '{0} eligible for in-place migration, {1} could not be evaluated' -f $stats.V3MigrationReady, $stats.V3Unevaluated }
                 else { '{0} eligible for in-place migration' -f $stats.V3MigrationReady })
-            Tone = $(if ($stats.V3Evaluated -eq 0 -and $stats.V3Unevaluated -gt 0) { 'warn' }
+            Tone = $(if ($v3AreaSkipped) { 'na' }
+                elseif ($stats.V3Evaluated -eq 0 -and $stats.V3Unevaluated -gt 0) { 'warn' }
                 elseif ($stats.V3Evaluated -eq 0) { 'na' }
                 elseif ($stats.V3Ready -lt $stats.V3Evaluated) { 'warn' }
                 elseif ($stats.V3Unevaluated -gt 0) { 'warn' }
                 else { 'ok' })
         }
-        @{ Label = 'Overall check score'; Value = ('{0}%' -f $scorePct)
-            Sub  = $(if ($stats.ChecksUnread -gt 0) {
+        @{ Label = 'Overall check score'
+            # A run that enumerated NO server is declared SCAN INCOMPLETE by Main, which exits 255
+            # precisely so that no readiness conclusion is drawn from it. This card did not consult
+            # TotalServers at all - it reads its verdict off the DENOMINATOR alone, and the four
+            # domain-level checks (object auditing, Exchange, ADFS, deleted objects) are measured
+            # BEFORE any server is reached, so they survive an estate that enumerated nothing. Four
+            # passing domain checks over zero servers therefore rendered a green "100%, 4 of 4 checks
+            # passed" beside a red hero banner, a console reading SCAN INCOMPLETE, and an exit code
+            # that says the scan never ran. Measured on the shipped functions.
+            # The neighbouring "Servers fully ready" tile was already special-cased for exactly this
+            # reason; this is the same defect one card to the right, and it is the more dangerous of
+            # the two because the score is the number a reader screenshots.
+            # 'n/a' rather than 0%: nothing FAILED here, it was never looked at - the same distinction
+            # the "Required ports open" card above already draws when it probed nothing.
+            Value = $(if ($stats.TotalServers -eq 0) { 'n/a' } else { '{0}%' -f $scorePct })
+            Sub  = $(if ($stats.TotalServers -eq 0) {
+                    'No server was examined'
+                } elseif ($stats.ChecksUnread -gt 0) {
                     '{0} of {1} checks passed, {2} not measured' -f $stats.ChecksPassed, $scoreDenominator, $stats.ChecksUnread
                 } else {
                     '{0} of {1} checks passed' -f $stats.ChecksPassed, $scoreDenominator
                 })
-            Tone = $(if ($allChecksPassed) { 'ok' } elseif ($scorePct -ge 80) { 'warn' } else { 'bad' })
+            Tone = $(if ($stats.TotalServers -eq 0) { 'bad' } elseif ($allChecksPassed) { 'ok' } elseif ($scorePct -ge 80) { 'warn' } else { 'bad' })
         }
     )
 
@@ -11974,11 +12092,23 @@ function Get-mdiOverviewHtml {
     # were never read drew a completely green ring - captioned with a centre value of "20%". A reader
     # takes the picture, not the caption, and the picture said the estate was clean. The grey arc is
     # the share of checks nobody could measure, so the ring and the number now describe the same fact.
-    $readinessDonut = New-mdiDonutChart -Segment @(
-        [PSCustomObject]@{ Label = 'Passed'; Value = $stats.ChecksPassed; Color = 'var(--ok)' }
-        [PSCustomObject]@{ Label = 'Failed'; Value = ($stats.ChecksTotal - $stats.ChecksPassed); Color = 'var(--bad)' }
-        [PSCustomObject]@{ Label = 'Not read'; Value = $stats.ChecksUnread; Color = 'var(--na)' }
-    ) -CenterValue ('{0}%' -f $scorePct) -CenterLabel 'ready'
+    # The chart has to move with the score card above it, or the two surfaces start disagreeing - which
+    # is the defect class this report keeps producing. On an estate where nothing was enumerated the
+    # domain-level checks are the ONLY checks, and they passed, so Failed and Not-read were both zero
+    # and this ring rendered SOLID GREEN captioned "100% ready" for a run that exits 255. That is the
+    # "a reader takes the picture, not the caption" failure this chart was already rewritten once to
+    # avoid, in its strongest form: here even the caption agreed with the wrong picture. With no
+    # segments the shipped function draws the bare track, which is the honest image for a scan that
+    # never looked at anything.
+    $readinessDonut = if ($stats.TotalServers -eq 0) {
+        New-mdiDonutChart -Segment @() -CenterValue 'n/a' -CenterLabel 'not evaluated'
+    } else {
+        New-mdiDonutChart -Segment @(
+            [PSCustomObject]@{ Label = 'Passed'; Value = $stats.ChecksPassed; Color = 'var(--ok)' }
+            [PSCustomObject]@{ Label = 'Failed'; Value = ($stats.ChecksTotal - $stats.ChecksPassed); Color = 'var(--bad)' }
+            [PSCustomObject]@{ Label = 'Not read'; Value = $stats.ChecksUnread; Color = 'var(--na)' }
+        ) -CenterValue ('{0}%' -f $scorePct) -CenterLabel 'ready'
+    }
     [void] $lines.Add('<section class="card chart-card"><h3>Overall readiness</h3>' + $readinessDonut + '</section>')
 
     if ($stats.PortsTotal -gt 0) {
@@ -12367,12 +12497,12 @@ function Get-mdiCapacityHtml {
 
         # On a short sample the automatic spike test is inert, so the ratio is surfaced instead.
         $peakClass = 'mono'
-        $peakText = [string][int] $c.PeakPacketsPerSec
-        if ([int] $c.AveragePacketsPerSec -gt 0) {
+        $peakText = [string][long] $c.PeakPacketsPerSec
+        if ([long] $c.AveragePacketsPerSec -gt 0) {
             $ratio = [double] $c.PeakPacketsPerSec / [double] $c.AveragePacketsPerSec
             if ($ratio -ge $capacity.SpikeRatio) {
                 $peakClass = 'mono amber'
-                $peakText = '{0} ({1}x avg)' -f [int] $c.PeakPacketsPerSec, (ConvertTo-mdiSvgNumber ([math]::Round($ratio, 1)))
+                $peakText = '{0} ({1}x avg)' -f [long] $c.PeakPacketsPerSec, (ConvertTo-mdiSvgNumber ([math]::Round($ratio, 1)))
             }
         }
 
@@ -12382,7 +12512,7 @@ function Get-mdiCapacityHtml {
         [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="{1}">{2}</td><td class="{3}">{4}</td><td class="mono">{5}</td><td class="mono">{6}</td><td class="{7}">{8}</td><td class="mono">{9}</td><td class="mono">{10} core / {11} GB</td><td class="mono">{12} / {13} GB</td><td class="mono">{14}</td><td class="mono">{15}</td><td class="left">{16}</td></tr>' -f
                 (ConvertTo-mdiHtmlEncoded ([string] $srv.FQDN)), $class, (ConvertTo-mdiHtmlEncoded $status),
                 $sampleClass, (ConvertTo-mdiHtmlEncoded $sampleText),
-                [int] $c.BusyPacketsPerSec, [int] $c.AveragePacketsPerSec,
+                [long] $c.BusyPacketsPerSec, [long] $c.AveragePacketsPerSec,
                 $peakClass, (ConvertTo-mdiHtmlEncoded $peakText),
                 (ConvertTo-mdiHtmlEncoded ([string] $c.Band)),
                 (ConvertTo-mdiSvgNumber ([double] $c.RequiredCpu)), (ConvertTo-mdiSvgNumber ([double] $c.RequiredRamGb)),
@@ -14989,6 +15119,30 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
         Write-mdiConsole -AsJson:$AsJson '  SCAN INCOMPLETE  No server could be enumerated, so nothing was checked.' -ForegroundColor Red
         Write-mdiConsole -AsJson:$AsJson '  This is not a readiness result. Check that this computer can reach a domain controller,' -ForegroundColor Red
         Write-mdiConsole -AsJson:$AsJson '  that the account running the script may read the directory, and re-run.' -ForegroundColor Red
+    } elseif ($stats.PartialScanCount -gt 0) {
+        # The other half of the 255 contract, on the surface a human actually reads. The exit block
+        # below calls a part-way scan "not a readiness result" and exits 255 precisely so that no
+        # conclusion is drawn from it - but the console printed the ordinary measured headline and
+        # then sent the reader straight into the findings. Measured on the shipped script, one run
+        # printed both of these, seconds apart:
+        #
+        #     1 issue(s) found: 6/7 checks passed across 1 server(s).
+        #     Open the report and start with the Issues found table on the Overview tab.
+        #   WARNING: Testing stopped part way on 1 server(s), so the scan did not complete: exiting
+        #            with code 255 (scan incomplete). Re-run it rather than reading the result.
+        #
+        # "Open the report" and "rather than reading the result" are opposite instructions about the
+        # same run, and the operator reads the reassuring one while their pipeline reads the other.
+        # The checks that never ran are ABSENT, not passed, so "6/7 checks passed" is a measurement
+        # of a scan that gave up - exactly what the empty-estate branch above refuses to print. The
+        # issue count is kept, because the findings that WERE made are real, but it is framed as an
+        # incomplete list rather than as a verdict over the estate.
+        Write-mdiConsole -AsJson:$AsJson ''
+        Write-mdiConsole -AsJson:$AsJson ('  SCAN INCOMPLETE  Testing stopped part way on {0} of {1} server(s), so their remaining checks never ran.' -f
+            $stats.PartialScanCount, $stats.TotalServers) -ForegroundColor Red
+        Write-mdiConsole -AsJson:$AsJson '  This is not a readiness result. Re-run it rather than reading it as one.' -ForegroundColor Red
+        Write-mdiConsole -AsJson:$AsJson ('  {0} issue(s) found on the part of the estate that was reached - the list is incomplete.' -f
+            $issueCount) -ForegroundColor Yellow
     } elseif ($result) {
         Write-mdiConsole -AsJson:$AsJson ''
         Write-mdiConsole -AsJson:$AsJson ('  READY  {0}/{1} checks passed across {2} server(s).{3}' -f

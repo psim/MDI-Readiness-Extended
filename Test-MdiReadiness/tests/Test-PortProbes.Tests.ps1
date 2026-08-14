@@ -360,8 +360,19 @@ Assert-That 'no unguarded else branch emits the result' ($scriptText -notmatch '
 # behind Write-mdiConsole so that -AsJson can keep human text off stdout, and asserting on the old
 # cmdlet name failed a behaviour-preserving change while still passing if the lines were deleted.
 $consoleWriter = 'Write-(Host|mdiConsole)(?: -AsJson:\$AsJson)?'
-$summaryLines = @([regex]::Matches($scriptText, "$consoleWriter \('  (READY|\{0\} issue\(s\) found)"))
-Assert-That 'both outcomes are printed for a human' ($summaryLines.Count -eq 2) "(found $($summaryLines.Count))"
+# There are THREE terminal outcomes, not two: a run that completed and is ready, a run that completed
+# with findings, and a scan that stopped part way and is explicitly not a readiness result.
+#
+# Each is asserted on its own text rather than by counting matches of a shared pattern. The count was
+# wrong in both directions: adding the incomplete-scan outcome failed this test even though the new
+# branch is exactly the human-readable line the test exists to require, and a count of two would have
+# been satisfied just as well by the same outcome printed twice with the other one deleted.
+$readyLine = @([regex]::Matches($scriptText, "$consoleWriter \('  READY "))
+$issuesLine = @([regex]::Matches($scriptText, "$consoleWriter \('  \{0\} issue\(s\) found: "))
+$partialLine = @([regex]::Matches($scriptText, "$consoleWriter \('  \{0\} issue\(s\) found on the part of the estate"))
+Assert-That 'the ready outcome is printed for a human' ($readyLine.Count -eq 1) "(found $($readyLine.Count))"
+Assert-That 'the issues-found outcome is printed for a human' ($issuesLine.Count -eq 1) "(found $($issuesLine.Count))"
+Assert-That 'the incomplete-scan outcome is printed for a human' ($partialLine.Count -eq 1) "(found $($partialLine.Count))"
 Assert-That 'the failing outcome is not labelled NOT READY' ($scriptText -notmatch "$consoleWriter \('  NOT READY")
 Assert-That 'the report path is printed' ($scriptText -match "$consoleWriter \('  Report: \{0\}'")
 
