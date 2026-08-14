@@ -13,6 +13,7 @@
     would gain two free "passed checks" it never earned.
 #>
 $scriptPath = Join-Path $PSScriptRoot 'Test-MdiReadiness.ps1'
+if (-not (Test-Path $scriptPath)) { $scriptPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'Test-MdiReadiness.ps1' }
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
 if ($errors) { throw "Parse errors: $($errors -join '; ')" }
@@ -145,7 +146,37 @@ Write-Host "`n[7] The remediation script keeps partially-failed servers" -Foregr
 $remediationAst = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
         $n.Name -eq 'New-mdiRemediationScript' }, $true)[0]
 $remediationText = $remediationAst.Extent.Text
-Assert-That 'the server filter uses the Unreachable flag' ($remediationText -match '-not \$_\.Unreachable')
+# Asserted BEHAVIOURALLY. This used to match the source text "-not $_.Unreachable", so it broke when
+# the flag started going through Test-mdiServerIsUnreachable - a change that only made the filter
+# stricter (the raw form treated the string 'False' as unreachable). A test that fails when the code
+# improves is testing the wrong thing; what matters is which servers reach the generated script.
+$filterReport = [PSCustomObject]@{
+    Domain = 'contoso.com'; Forest = 'contoso.com'; DomainsInScope = @('contoso.com')
+    DomainControllers = @(
+        [PSCustomObject]@{ FQDN = 'dc-partial.contoso.com'; Domain = 'contoso.com'; Unreachable = $false
+            PartialFailure = $true; OperatingSystem = 'Windows Server 2022'; NtlmAuditing = $false
+            Details = [ordered]@{} }
+        [PSCustomObject]@{ FQDN = 'dc-down.contoso.com'; Domain = 'contoso.com'; Unreachable = $true
+            PartialFailure = $false; OperatingSystem = 'Windows Server 2022'; NtlmAuditing = $false
+            Details = [ordered]@{} }
+    )
+    CAServers = @(); EntraConnectServers = @()
+}
+$filterPath = Join-Path $env:TEMP ('mdi-partial-{0}.ps1' -f [guid]::NewGuid().ToString('N').Substring(0, 8))
+[void] (New-mdiRemediationScript -ReportData $filterReport -FilePath $filterPath)
+$filterText = if (Test-Path $filterPath) { [IO.File]::ReadAllText($filterPath) } else { '' }
+Remove-Item $filterPath -Force -ErrorAction SilentlyContinue
+Assert-That 'a partially-failed server still reaches the remediation script' ($filterText -match 'dc-partial\.contoso\.com')
+# The unreachable server must not be RECONFIGURED - it is absent from every scripted section that
+# changes a server. It may still be named in the manual-attention advisory, and should be: the
+# operator needs to know it was missed. So the assertion is on the scripted regions, not on the whole
+# file, which is the distinction the old source-text match could not make.
+$scriptedRegions = ([regex]::Matches($filterText, '(?s)#region (?!Findings that need manual attention).*?#endregion') |
+        ForEach-Object { $_.Value }) -join "`n"
+Assert-That 'an unreachable server is never reconfigured by the generated script' `
+    ($scriptedRegions -notmatch 'dc-down\.contoso\.com') `
+    (([regex]::Matches($filterText, '#region (.+)') | ForEach-Object { $_.Groups[1].Value }) -join ' | ')
+Assert-That 'and the partially-failed server IS reconfigured' ($scriptedRegions -match 'dc-partial\.contoso\.com')
 Assert-That 'the server filter does not use Comment'      ($remediationText -notmatch '-not \$_\.Comment')
 
 Write-Host "`n[8] The verdict still fails on an unreachable server" -ForegroundColor Yellow

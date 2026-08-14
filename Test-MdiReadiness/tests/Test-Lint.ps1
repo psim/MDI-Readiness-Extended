@@ -1,4 +1,5 @@
 $sp = Join-Path $PSScriptRoot 'Test-MdiReadiness.ps1'
+if (-not (Test-Path $sp)) { $sp = Join-Path (Split-Path $PSScriptRoot -Parent) 'Test-MdiReadiness.ps1' }
 $t=$null;$e=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile($sp,[ref]$t,[ref]$e)
 if($e){ "PARSE ERRORS:"; $e | ForEach-Object { "  L$($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
@@ -48,8 +49,14 @@ if ($castConcat) {
 # @(... | ConvertFrom-Json) nests the result: Windows PowerShell emits a JSON array as a SINGLE pipeline object,
 # so the array subexpression wraps the whole array into one element. Assign first, then wrap.
 $jsonNest = $ast.FindAll({ param($n)
+    # Matched on an actual COMMAND named ConvertFrom-Json inside the array expression, not on the
+    # extent text. Text matching also fired on any comment that merely mentioned the cmdlet by name,
+    # which made the rule impossible to explain in a comment without tripping it.
     $n -is [System.Management.Automation.Language.ArrayExpressionAst] -and
-    $n.Extent.Text -match 'ConvertFrom-Json'
+    @($n.FindAll({ param($c)
+        $c -is [System.Management.Automation.Language.CommandAst] -and
+        $c.GetCommandName() -eq 'ConvertFrom-Json'
+      }, $true)).Count -gt 0
   }, $true)
 if ($jsonNest) {
   "FOUND $(@($jsonNest).Count) @(...) wrapping a ConvertFrom-Json pipeline:"

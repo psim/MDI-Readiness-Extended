@@ -16,6 +16,7 @@
     that is written into the JSON.
 #>
 $scriptPath = Join-Path $PSScriptRoot 'Test-MdiReadiness.ps1'
+if (-not (Test-Path $scriptPath)) { $scriptPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'Test-MdiReadiness.ps1' }
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
 if ($errors) { throw "Parse errors: $($errors -join '; ')" }
@@ -108,10 +109,27 @@ $report = [PSCustomObject]@{
 }
 $stats = Get-mdiReportStatistics -ReportData $report
 Assert-That 'one server is reported, not three' ($stats.TotalServers -eq 1) "(got $($stats.TotalServers))"
-# Six distinct checks: PowerSettings, TimeSync, AdvancedAuditing, CAAuditing, RootCertificates,
+# Six distinct server checks: PowerSettings, TimeSync, AdvancedAuditing, CAAuditing, RootCertificates,
 # AdvancedAuditingEntraConnect. Counted per role it was ten.
-Assert-That 'each check counted once' ($stats.ChecksTotal -eq 6) "(got $($stats.ChecksTotal))"
-Assert-That 'passes counted once' ($stats.ChecksPassed -eq 4) "(got $($stats.ChecksPassed))"
+#
+# Asserted as a DELTA against the same estate with the roles NOT co-located, rather than against
+# absolute totals. The absolute numbers also carry the domain-level directory checks, which have
+# nothing to do with role merging - pinning them here made this break when those were folded into the
+# score, even though role merging itself was unchanged. The property is that a host holding three
+# roles contributes its checks ONCE, and that is what is measured.
+$singleRoleReport = $report.PSObject.Copy()
+$singleRoleReport.CAServers = @()
+$singleRoleReport.EntraConnectServers = @()
+$singleRoleReport.DomainControllers = @(
+    [PSCustomObject]@{ FQDN = 'dc1.contoso.com'; Domain = 'contoso.com'; Unreachable = $false
+        PowerSettings = $true; TimeSync = $true; AdvancedAuditing = $false
+        CAAuditing = $false; RootCertificates = $true; AdvancedAuditingEntraConnect = $true }
+)
+$singleStats = Get-mdiReportStatistics -ReportData $singleRoleReport
+Assert-That 'each check counted once' ($stats.ChecksTotal -eq $singleStats.ChecksTotal) `
+    "(merged $($stats.ChecksTotal) vs single-role $($singleStats.ChecksTotal))"
+Assert-That 'passes counted once' ($stats.ChecksPassed -eq $singleStats.ChecksPassed) `
+    "(merged $($stats.ChecksPassed) vs single-role $($singleStats.ChecksPassed))"
 
 Write-Host "`n[6] Findings are not listed three times" -ForegroundColor Yellow
 $issues = @(Get-mdiIssueList -Statistics $stats -ReportData $report)

@@ -14,6 +14,7 @@
     The result was a green report next to a lit portal alert, with nothing connecting the two.
 #>
 $scriptPath = Join-Path $PSScriptRoot 'Test-MdiReadiness.ps1'
+if (-not (Test-Path $scriptPath)) { $scriptPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'Test-MdiReadiness.ps1' }
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
 if ($errors) { throw "Parse errors: $($errors -join '; ')" }
@@ -107,8 +108,27 @@ Write-Host "`n[4] The report keeps the two addresses apart" -ForegroundColor Yel
 # one working NIC and one blocked NIC read as fully resolvable - re-hiding the exact failure.
 Assert-That 'the NNR matrix groups by address as well as name' (
     $source -match 'Group-Object -Property Target, TargetIP')
-Assert-That 'the NNR statistics group by address too' (
-    $source -match 'Group-Object -Property Server, Target, TargetIP')
+# Asserted by BEHAVIOUR rather than by matching the source text. The statistics now build their
+# grouping key explicitly - Group-Object collapses every null or empty key into one shared group, so a
+# record with a missing Target could be covered by an unrelated success - and a test that matched the
+# old literal string failed on a change that kept the very behaviour it was written to protect. What
+# matters is the outcome: a multi-homed host with one working NIC and one blocked NIC must NOT read
+# as fully resolvable.
+$multiHomed = [PSCustomObject]@{ FQDN = 'dc1.contoso.com'; Unreachable = $false; OSVersion = $true
+    RequiredPorts = $true
+    Details = [PSCustomObject]@{ RequiredPortsDetails = [PSCustomObject]@{
+            FailedRequired = @(); NnrFailedTargets = @()
+            Results = @(
+                [PSCustomObject]@{ Group = 'NNR'; Protocol = 'UDP'; Port = 137; Target = 'host.contoso.com'
+                    TargetIP = '10.0.0.1'; Requirement = 'AtLeastOne'; Success = $true; Detail = 'Resolved'; Applicable = $true }
+                [PSCustomObject]@{ Group = 'NNR'; Protocol = 'UDP'; Port = 137; Target = 'host.contoso.com'
+                    TargetIP = '10.0.0.2'; Requirement = 'AtLeastOne'; Success = $false; Detail = 'Blocked'; Applicable = $true }
+            ) } } }
+$mhStats = Get-mdiReportStatistics -ReportData ([PSCustomObject]@{ DomainControllers = @($multiHomed)
+        CAServers = @(); EntraConnectServers = @(); DomainsInScope = @('contoso.com') })
+Assert-That 'the NNR statistics keep a multi-homed host''s addresses apart' (
+    $mhStats.NnrTargetCount -eq 2 -and $mhStats.NnrResolvable -eq 1) `
+    "(resolvable=$($mhStats.NnrResolvable) of $($mhStats.NnrTargetCount))"
 Assert-That 'no NNR grouping is left keyed on the name alone' (
     $source -notmatch 'Group-Object -Property Target\s*\|')
 

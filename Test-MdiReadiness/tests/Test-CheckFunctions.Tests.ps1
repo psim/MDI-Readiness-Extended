@@ -12,6 +12,7 @@
     not been seen to fail is not a test.
 #>
 $scriptPath = Join-Path $PSScriptRoot 'Test-MdiReadiness.ps1'
+if (-not (Test-Path $scriptPath)) { $scriptPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'Test-MdiReadiness.ps1' }
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
 if ($errors) { throw "Parse errors: $($errors -join '; ')" }
@@ -169,7 +170,7 @@ Write-Host "`n[C5] Get-mdiObjectAuditing: coverage is checked per EXPECTED entry
 # First, the real Get-mdiDsSacl null-SACL branch: a descriptor whose SACL was stripped (no S: section)
 # must report N/A, never a measured pass or fail.
 $expectedAuditing = @($settings.ObjectAuditing | ConvertFrom-Csv |
-        Select-Object SecurityIdentifier, AccessMask, AuditFlagsValue, InheritedObjectAceType |
+        Select-Object SecurityIdentifier, AccessMask, AuditFlagsValue, AceFlagsValue, InheritedObjectAceType |
         Where-Object { $_.InheritedObjectAceType -ne '0feb936f-47b3-49f2-9386-1dedc2c23765' })
 $script:fakeDescriptorBytes = $null
 function New-Object {
@@ -203,8 +204,12 @@ Remove-Item Function:\New-Object
 # Now the coverage loop itself, via Get-mdiObjectAuditing with Get-mdiDsSacl shadowed to return applied ACEs.
 function New-mdiAce {
     param($e)
+    # AceFlagsValue is carried through from the expected row. These entries audit DESCENDANT objects,
+    # which only happens when the ACE on the domain root carries ContainerInherit, so the matcher
+    # requires that bit - a fixture built without it is not a correctly configured domain.
     [PSCustomObject]@{ SecurityIdentifier = $e.SecurityIdentifier; AccessMask = $e.AccessMask
-        AuditFlagsValue = $e.AuditFlagsValue; InheritedObjectAceType = $e.InheritedObjectAceType }
+        AuditFlagsValue = $e.AuditFlagsValue; AceFlagsValue = $e.AceFlagsValue
+        InheritedObjectAceType = $e.InheritedObjectAceType }
 }
 $script:fakeApplied = @()
 function Get-mdiDsSacl {

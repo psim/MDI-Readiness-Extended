@@ -11,6 +11,7 @@
     function is too coupled to WMI or to a live directory to invoke in a harness.
 #>
 $scriptPath = Join-Path $PSScriptRoot 'Test-MdiReadiness.ps1'
+if (-not (Test-Path $scriptPath)) { $scriptPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'Test-MdiReadiness.ps1' }
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
 if ($errors) { throw "Parse errors: $($errors -join '; ')" }
@@ -137,10 +138,49 @@ Assert-That 'no finding claims a port is blocked' (
     "($(($fbIssues | ForEach-Object { $_.Area }) -join ', '))"
 Assert-That 'the reverse-direction result is reported as not measured' (
     @($fbIssues | Where-Object { [string] $_.Area -eq 'Not measured' }).Count -ge 1)
-# The source contract: the fallback must never produce a firewall rule.
-$remediationText = ($functions | Where-Object { $_.Name -eq 'New-mdiRemediationScript' }).Extent.Text
+# The contract: an untested probe must never produce a firewall rule. Asserted by RUNNING the
+# generator, not by grepping its source. This assertion used to read
+#   $remediationText -match 'Detail -notmatch \$script:mdiPortNotTestedPattern'
+# which pinned one literal spelling of the filter rather than its effect, so it broke the moment the
+# clause was routed through the shared Test-mdiProbeWasMeasured predicate - a change that STRENGTHENED
+# the guard, because the predicate additionally requires Success to be a real boolean and so also
+# excludes a probe whose result normalised to $null. A grep cannot tell those two apart; the
+# generated file can.
+$nnrUntestedRecord = [PSCustomObject]@{
+    Id = 'nnr-UDP-137'; Group = 'NNR'; Scope = 'NetworkDevice'; Requirement = 'AtLeastOne'
+    Protocol = 'UDP'; Port = 137; Target = 'dc1.contoso.com'; TargetIP = '10.0.0.1'
+    Applicable = $true; Success = $null
+    Detail = 'Not tested in the required direction - measured inbound from this computer instead'
+}
+# The untested probe must share a target with a GENUINELY MEASURED failure. On its own the target is
+# classified NnrUntested, never enters $unresolvableKey, and no filter downstream can emit it - so an
+# assertion built on it alone passes whatever the guard does. Proven: the first version of this
+# assertion used the untested record by itself and SURVIVED having the guard deleted outright.
+# With a measured failure beside it the target becomes NnrMeasured, and the only thing standing
+# between the untested probe and a New-NetFirewallRule is the guard under test.
+$nnrMeasuredFailure = [PSCustomObject]@{
+    Id = 'nnr-TCP-135'; Group = 'NNR'; Scope = 'NetworkDevice'; Requirement = 'AtLeastOne'
+    Protocol = 'TCP'; Port = 135; Target = 'dc1.contoso.com'; TargetIP = '10.0.0.1'
+    Applicable = $true; Success = $false; Detail = 'Connection refused'
+}
+$nnrServer = [PSCustomObject]@{
+    FQDN = 'dc-nnr.contoso.com'; Domain = 'contoso.com'; Unreachable = $false; Comment = $null
+    SensorVersion = '2.240.0.0'; Addresses = @('10.0.0.10'); IP = '10.0.0.10'
+    RequiredPorts = $false
+    Details = [PSCustomObject]@{
+        RequiredPortsDetails = [PSCustomObject]@{ Results = @($nnrMeasuredFailure, $nnrUntestedRecord) }
+    }
+}
+$nnrOut = Join-Path ([IO.Path]::GetTempPath()) ('mdi-m12-{0}.ps1' -f [guid]::NewGuid().ToString('N'))
+try {
+    $null = New-mdiRemediationScript -ReportData (New-Report @($nnrServer)) -FilePath $nnrOut
+    $nnrScript = if (Test-Path $nnrOut) { [IO.File]::ReadAllText($nnrOut) } else { '' }
+} finally { Remove-Item $nnrOut -Force -ErrorAction SilentlyContinue }
+$nnrRules = @([regex]::Matches($nnrScript, 'MDI-NNR-[A-Za-z]+-In') | ForEach-Object { $_.Value } | Sort-Object -Unique)
+Assert-That 'the measured NNR failure still produces its rule' (
+    $nnrRules -contains 'MDI-NNR-RPC-In') "(emitted: $($nnrRules -join ', '))"
 Assert-That 'the NNR remediation excludes untested probes' (
-    $remediationText -match 'Detail -notmatch \$script:mdiPortNotTestedPattern')
+    $nnrRules -notcontains 'MDI-NNR-NetBIOS-In') "(emitted: $($nnrRules -join ', '))"
 
 Write-Host "`n[M15] The probe plan survives serialisation" -ForegroundColor Yellow
 # The plan is shipped to the sensor as JSON. At too shallow a depth its nested targets collapse to
@@ -161,9 +201,18 @@ Assert-That 'the domain controller targets keep their address' (
     [string] @($roundTrip.DomainControllers)[0].IP -eq '10.0.0.1')
 Assert-That 'nothing collapsed to a type name' (
     ($plan | ConvertTo-Json -Depth 6 -Compress) -notmatch 'System\.(Object|Collections|Management)')
-# The depth actually used by the shipping code, not just by this test.
-$commandText = ($functions | Where-Object { $_.Name -eq 'Get-mdiPortProbeCommandLine' }).Extent.Text
-Assert-That 'the shipped plan is serialised deep enough' ($commandText -match 'ConvertTo-Json -Depth [6-9]')
+# The depth actually used by the shipping code, proven by decoding the plan it really ships rather
+# than by matching source text. The previous form searched Get-mdiPortProbeCommandLine for a literal
+# "ConvertTo-Json -Depth 6" and broke the moment that line moved to a helper, while the behaviour it
+# guards was intact - a test that fails on a refactor but would pass on a real depth regression.
+$shippedText = Get-mdiPortProbeScriptText -Plan $plan -OutputFile 'C:\Windows\Temp\mdi-depth.json'
+$shippedB64 = [regex]::Match($shippedText, "ConvertFrom-Json \(\[text\.encoding\]::UTF8\.GetString\(\[convert\]::FromBase64String\('([A-Za-z0-9+/=]+)'\)").Groups[1].Value
+$shippedPlan = [text.encoding]::UTF8.GetString([convert]::FromBase64String($shippedB64)) | ConvertFrom-Json
+Assert-That 'the shipped plan is serialised deep enough' (
+    ([string] @($shippedPlan.DomainControllers)[0].IP -eq '10.0.0.1') -and
+    ([string] @($shippedPlan.NnrTargets)[0].IP -eq '10.0.0.50') -and
+    (-not [string]::IsNullOrWhiteSpace([string] @($shippedPlan.Probes)[0].Id))
+) "(dc '$(@($shippedPlan.DomainControllers)[0].IP)', nnr '$(@($shippedPlan.NnrTargets)[0].IP)')"
 
 Write-Host "`n[M16] The trend refuses to invent a delta" -ForegroundColor Yellow
 # Removing the comparability guard left the suite green while the chart drew a confident

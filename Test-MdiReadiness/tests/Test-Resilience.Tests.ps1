@@ -1,4 +1,4 @@
-<#
+﻿<#
     Resilience regression suite.
 
     Every assertion here corresponds to a bug found by running the script against the live lab, where a
@@ -9,6 +9,7 @@
 
 $ErrorActionPreference = 'Stop'
 $scriptPath = Join-Path $PSScriptRoot 'Test-MdiReadiness.ps1'
+if (-not (Test-Path $scriptPath)) { $scriptPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'Test-MdiReadiness.ps1' }
 
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref] $tokens, [ref] $errors)
@@ -111,7 +112,12 @@ Assert-That 'an unreachable registry returns rather than throwing' ($regResult -
 
 $source = Get-Content $scriptPath -Raw
 Assert-That 'OpenRemoteBaseKey is inside a try' ($source -match '(?s)try \{\s*\$hklm = \[Microsoft\.Win32\.RegistryKey\]::OpenRemoteBaseKey')
-Assert-That 'the subkey handle is null-tested' ($source -match 'if \(\$regKey\) \{ \$value = \$regKey\.GetValue')
+# Format-tolerant, but still requires the GUARD: the GetValue call must sit INSIDE 'if ($regKey) {'.
+# The previous pattern demanded the whole thing on ONE line, so it broke the moment the block gained
+# a second statement (reading the value KIND) even though the null test was untouched. A test that
+# fails on layout rather than on behaviour trains people to edit the test, which is how a real guard
+# eventually gets deleted unnoticed.
+Assert-That 'the subkey handle is null-tested' ($source -match 'if \(\$regKey\) \{[\s\S]{0,300}?\$regKey\.GetValue\(')
 Assert-That 'the base key is closed in a finally' ($source -match 'finally \{[\s\S]{0,200}\$hklm\.Close\(\)')
 
 Write-Host "`n[6] One bad server does not end the scan" -ForegroundColor Yellow
@@ -158,7 +164,18 @@ Assert-That 'a partially unmeasured server is not ready' ((Test-mdiReadinessResu
 Assert-That 'one unmeasurable server fails the run' ((Test-mdiReadinessResult -ReportData (New-Report @($healthy, $allNa) @() @())) -eq $false)
 
 $naStats = Get-mdiReportStatistics -ReportData (New-Report @($mixed) @() @())
-Assert-That 'N/A is counted as neither a pass nor a total' ($naStats.ChecksTotal -eq 2 -and $naStats.ChecksPassed -eq 2) "($($naStats.ChecksPassed)/$($naStats.ChecksTotal))"
+# Asserted as a DELTA against the same report with no unreadable check, rather than against absolute
+# totals. The absolute numbers also carry the domain-level directory checks, which are nothing to do
+# with what this assertion is about - it broke the moment those were folded into the score, even
+# though the behaviour it tests had not changed at all. The property is that an 'N/A' check counts
+# towards neither the passes nor the measured total, and that is what is measured here.
+$mixedMeasured = [PSCustomObject]@{ FQDN = 'dc-mix.contoso.com'; NtlmAuditing = $true; AdvancedAuditing = $true }
+$measuredStats = Get-mdiReportStatistics -ReportData (New-Report @($mixedMeasured) @() @())
+Assert-That 'N/A is counted as neither a pass nor a total' (
+    ($naStats.ChecksTotal -eq $measuredStats.ChecksTotal) -and ($naStats.ChecksPassed -eq $measuredStats.ChecksPassed)) `
+    "(with N/A $($naStats.ChecksPassed)/$($naStats.ChecksTotal) vs without $($measuredStats.ChecksPassed)/$($measuredStats.ChecksTotal))"
+Assert-That 'and it is counted as unread instead' ($naStats.ChecksUnread -eq ($measuredStats.ChecksUnread + 1)) `
+    "(with N/A $($naStats.ChecksUnread) vs without $($measuredStats.ChecksUnread))"
 
 # Every check that reads a remote server must be able to say "unknown". A boolean-only result forces a
 # read failure to be reported as a configuration failure.
@@ -204,7 +221,31 @@ Assert-That 'the unreachable reason is carried in the tooltip' ($rendered -match
 $reportSource = Get-Content $scriptPath -Raw
 Assert-That 'an untested port is not reported as Blocked' ($reportSource -match 'muted-cell.{0,30}Not tested</td>')
 Assert-That 'untested ports get their own section' ($reportSource -match 'Ports that could not be tested')
-Assert-That 'untested ports are excluded from the action list' ($reportSource -match '\$failures = @\(\$records \| Where-Object \{[\s\S]{0,200}notmatch')
+# Asserted BEHAVIOURALLY. This used to match the shape of the $failures expression in the source, so
+# it broke when that filter started going through Test-mdiProbeWasMeasured - a change that only made
+# it stricter (a probe whose Success carried no real result was being painted red). What matters is
+# which table an unmeasured probe lands in, so that is what is checked.
+$untestedPortServer = [PSCustomObject]@{
+    FQDN = 'dc1.contoso.com'
+    Details = [PSCustomObject]@{ RequiredPortsDetails = [PSCustomObject]@{
+            ProbedFrom = 'dc1.contoso.com'; FailedRequired = @(); NnrFailedTargets = @()
+            Results = @(
+                [PSCustomObject]@{ Id = 'LdapTcp'; Name = 'LDAP'; Protocol = 'TCP'; Port = 389
+                    Scope = 'DomainController'; Group = ''; Requirement = 'Required'
+                    Target = 'dc2.contoso.com'; TargetIP = '10.0.0.2'
+                    Applicable = $true; Success = $null; Detail = 'Not tested - access is denied' }
+                [PSCustomObject]@{ Id = 'RpcTcp'; Name = 'RPC'; Protocol = 'TCP'; Port = 135
+                    Scope = 'DomainController'; Group = ''; Requirement = 'Required'
+                    Target = 'dc3.contoso.com'; TargetIP = '10.0.0.3'
+                    Applicable = $true; Success = $false; Detail = 'Connection refused' }
+            ) } }
+}
+$untestedHtml = Get-mdiRequiredPortsHtml -Server @($untestedPortServer)
+$attentionBlock = [regex]::Match($untestedHtml, '(?s)Ports that need attention.*?</table>').Value
+$couldNotBlock = [regex]::Match($untestedHtml, '(?s)Ports that could not be tested.*?</table>').Value
+Assert-That 'untested ports are excluded from the action list' ($attentionBlock -notmatch 'dc2\.contoso\.com') $attentionBlock
+Assert-That 'a measured failure is still in the action list' ($attentionBlock -match 'dc3\.contoso\.com')
+Assert-That 'the untested port is listed as untested instead' ($couldNotBlock -match 'dc2\.contoso\.com')
 Assert-That 'a report with nothing measured is not called clean' ($reportSource -match 'returned no readable results at all')
 Assert-That 'the styles define the not-tested cell' ($reportSource -match 'td\.muted-cell')
 Assert-That 'the styles define the unreachable row' ($reportSource -match 'tr\.unreachable td')
@@ -216,8 +257,16 @@ Write-Host "`n[11] Sensor v3.x prerequisites are not invented when the server ca
 function New-V3Stub {
     param([int] $ProductType, [string] $Build, [bool] $Readable = $true, [bool] $WmiOk = $true)
     if ($WmiOk) {
-        Set-Item -Path function:script:Get-WmiObject -Value ([scriptblock]::Create(
-                "[PSCustomObject]@{ Caption='Windows Server test'; ProductType=$ProductType; BuildNumber='$Build'; Version='10.0.$Build' }"))
+        # Win32_Service is answered as a real service record (the Sense check reads .State/.StartMode
+        # through Get-mdiServiceStateResult -> Get-WmiObject now that the plain Get-mdiServiceState
+        # wrapper has been removed); every other class returns the operating-system shape.
+        Set-Item -Path function:script:Get-WmiObject -Value ([scriptblock]::Create(@"
+param(`$ComputerName, `$Namespace, `$Class, `$Property, `$Filter, `$Query, `$ErrorAction)
+if (`$Class -eq 'Win32_Service' -and `$Filter -match "= 'Sense'") {
+    return [PSCustomObject]@{ Name = 'Sense'; State = 'Running'; StartMode = 'Auto'; PathName = 'C:\Program Files\Windows Defender Advanced Threat Protection\MsSense.exe' }
+}
+[PSCustomObject]@{ Caption = 'Windows Server test'; ProductType = $ProductType; BuildNumber = '$Build'; Version = '10.0.$Build' }
+"@))
     } else {
         Set-Item -Path function:script:Get-WmiObject -Value { throw 'Access is denied. (Exception from HRESULT: 0x80070005)' }
     }
@@ -226,12 +275,21 @@ function New-V3Stub {
             "param(`$ComputerName,`$Key,`$Value) [PSCustomObject]@{ Readable=$readableText; Value=`$(if(`$Value -eq 'UBR'){99999}else{1}); Error='denied' }"))
     Set-Item -Path function:script:Get-mdiCaptureComponent -Value { param($ComputerName) 'N/A' }
     if ($WmiOk) {
-        Set-Item -Path function:script:Get-mdiServiceState -Value {
+        # Stubbed at Get-mdiServiceStateResult, which is now the only service-query seam. The
+        # readability-discarding wrapper it used to stub was deleted after an access-denied reply
+        # reached the v3.x checks as "the service is not installed".
+        Set-Item -Path function:script:Get-mdiServiceStateResult -Value {
             param($ComputerName, $ServiceName)
-            if ($ServiceName -eq 'Sense') { [PSCustomObject]@{ State = 'Running'; StartMode = 'Auto' } } else { $null }
+            $svc = if ($ServiceName -eq 'Sense') { [PSCustomObject]@{ State = 'Running'; StartMode = 'Auto' } } else { $null }
+            [PSCustomObject]@{ Service = $svc; Readable = $true; Error = $null }
         }
     } else {
-        Set-Item -Path function:script:Get-mdiServiceState -Value { param($ComputerName, $ServiceName) $null }
+        # WMI is unreachable, so the service list cannot be READ - which is not the same as the
+        # services being absent, and the checks must report N/A rather than a measured failure.
+        Set-Item -Path function:script:Get-mdiServiceStateResult -Value {
+            param($ComputerName, $ServiceName)
+            [PSCustomObject]@{ Service = $null; Readable = $false; Error = 'Access is denied.' }
+        }
     }
 }
 
@@ -262,8 +320,37 @@ Remove-Item function:script:Get-WmiObject, function:script:Get-mdiRemoteRegistry
 function:script:Get-mdiCaptureComponent, function:script:Get-mdiServiceState -ErrorAction SilentlyContinue
 
 # 'N/A' is truthy, so a bare if() rendered an unknown server as meeting every prerequisite.
-Assert-That 'the ready column compares against $true explicitly' ($reportSource -match '\$_\.SensorV3Ready -eq \$true')
-Assert-That 'an unknown ready state renders as Not tested' ($reportSource -match "\[string\] \`$_\.SensorV3Ready -eq 'N/A'")
+#
+# Asserted BEHAVIOURALLY. These two checks used to match the source text for
+# "$_.SensorV3Ready -eq $true" and "[string] $_.SensorV3Ready -eq 'N/A'", and they broke when the
+# comparison was replaced by ConvertTo-mdiBoolean - which is STRICTER, because it normalises $null
+# and '' as well as 'N/A'. A test that fails when the code is improved is testing the wrong thing;
+# what matters is that an unmeasured server is never counted as ready.
+$v3Report = [PSCustomObject]@{
+    DomainControllers = @(
+        [PSCustomObject]@{ FQDN = 'ready.contoso.com'; Domain = 'c.com'; Unreachable = $false
+            SensorV3Ready = $true; Details = [PSCustomObject]@{ SensorV3ReadyDetails = [PSCustomObject]@{ Checks = @(); SensorState = 'Running' } } }
+        [PSCustomObject]@{ FQDN = 'unknown.contoso.com'; Domain = 'c.com'; Unreachable = $false
+            SensorV3Ready = 'N/A'; Details = [PSCustomObject]@{ SensorV3ReadyDetails = [PSCustomObject]@{ Checks = @(); SensorState = 'Not determined' } } }
+    )
+    CAServers = @(); EntraConnectServers = @(); DomainsInScope = @('c.com'); Domain = 'c.com'; Forest = 'c.com'
+}
+$v3Stats = Get-mdiReportStatistics -ReportData $v3Report
+Assert-That 'an N/A v3 state is not counted as ready' ($v3Stats.V3Ready -eq 1) "(V3Ready=$($v3Stats.V3Ready) of 2 servers)"
+Assert-That 'an N/A v3 state is not counted as evaluated' ($v3Stats.V3Evaluated -eq 1) "(V3Evaluated=$($v3Stats.V3Evaluated))"
+# The same must hold for the other falsy-but-truthy shapes, which is why the literal comparison was
+# replaced: $null and '' are equally "not measured".
+foreach ($unknown in @($null, '', 'N/A', 'Unknown')) {
+    $one = [PSCustomObject]@{
+        DomainControllers = @([PSCustomObject]@{ FQDN = 'x.c.com'; Domain = 'c.com'; Unreachable = $false
+                SensorV3Ready = $unknown; Details = [PSCustomObject]@{ SensorV3ReadyDetails = [PSCustomObject]@{ Checks = @(); SensorState = 'Not determined' } } })
+        CAServers = @(); EntraConnectServers = @(); DomainsInScope = @('c.com'); Domain = 'c.com'; Forest = 'c.com'
+    }
+    Assert-That ("a v3 state of '{0}' counts as neither ready nor evaluated" -f $(if ($null -eq $unknown) { 'null' } else { $unknown })) (
+        (Get-mdiReportStatistics -ReportData $one).V3Ready -eq 0)
+}
+# An unmeasured check must render as "Not tested" rather than as a pass.
+Assert-That 'an unmeasured v3 check renders as Not tested' ($reportSource -match 'muted-cell[^>]*>Not tested</td>')
 Assert-That 'the registry reader reports readability separately from value' ($reportSource -match 'function Get-mdiRemoteRegistryResult')
 Assert-That 'checks carry a Measured flag' ($reportSource -match 'Measured\s*=\s*-not \(\$Detail -like')
 
