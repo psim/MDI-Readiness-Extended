@@ -1,4 +1,4 @@
-<#
+﻿<#
     .NOTES
         NON-ENGLISH WINDOWS AND NON-ENGLISH LOCALES
 
@@ -7634,9 +7634,24 @@ function Get-mdiAdvancedAuditing {
         # system target is itself unusual is left readable rather than filtered to nothing.
         # A backup with no Policy Target column at all (an older or trimmed export) is left as-is.
         $rows = $allRows
+        $noSystemPolicyInExport = $false
         if ($columnCount -ge 4) {
             $withGuid = @($allRows | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_.'Subcategory GUID') })
             $notPerUser = @($withGuid | Where-Object { [string] $_.'Policy Target' -notmatch '\\|@|^S-1-' })
+            # EVERY row is per-user, so the export carries no system policy at all. The fallback below
+            # kept those rows as the measurement, and a backup containing nothing but per-user policy
+            # for one principal was read as the machine's system policy: 'CONTOSO\alice' configured
+            # across all eight required subcategories reported the domain controller as correctly
+            # audited while its actual system policy was never in the file. The multi-target guard at
+            # 7644 does not catch it, because with a single per-user target there is only ONE distinct
+            # Policy Target and the filter never engages.
+            #
+            # This is NOT the "unusual system target" case the fallback exists for: a system target is
+            # a single translated word carrying none of the user-principal markers, so an unusual one
+            # still lands in $notPerUser and is still read. Rows reaching here are user-shaped by
+            # construction, and a system policy that is absent was not measured - it is not a system
+            # policy that passed.
+            if ($withGuid.Count -gt 0 -and $notPerUser.Count -eq 0) { $noSystemPolicyInExport = $true }
             $candidates = if ($notPerUser.Count -gt 0) { $notPerUser } else { $withGuid }
             $byTarget = @($candidates | Group-Object -Property 'Policy Target' |
                     Sort-Object -Property @{ Expression = { @($_.Group.'Subcategory GUID' | Select-Object -Unique).Count } ; Descending = $true },
@@ -7646,6 +7661,15 @@ function Get-mdiAdvancedAuditing {
                 Write-mdiVerbose ('The audit policy backup from {0} carries more than one policy target; reading the system policy ({1}) and ignoring per-user rows' -f
                     $ComputerName, $systemTarget)
                 $rows = @($allRows | Where-Object { [string] $_.'Policy Target' -eq [string] $systemTarget })
+            }
+        }
+
+        if ($noSystemPolicyInExport) {
+            $perUserTargets = @($withGuid.'Policy Target' | Select-Object -Unique | Where-Object { $_ })
+            return [PSCustomObject]@{
+                isAdvancedAuditingOk = 'N/A'
+                details              = ('Not tested - every row in the audit policy backup from {0} describes PER-USER audit policy ({1}), so the machine''s own system audit policy was never in the export and could not be read. Per-user policy applies only to the named principal and cannot show whether the domain controller itself audits the subcategories MDI requires.' -f
+                    $ComputerName, (($perUserTargets | Select-Object -First 3) -join ', '))
             }
         }
 
@@ -11794,7 +11818,14 @@ function Get-mdiOverviewHtml {
                     # closed the instance where the estate is entirely unexamined and left the ones
                     # where it is only partly unexamined, which are the harder ones to spot precisely
                     # because the rest of the page looks healthy.
-                    '{0} not measured' -f $stats.ChecksUnread
+                    # The unit is stated. This is a count of CHECKS on a card whose headline counts
+                    # SERVERS, and a bare "1 not measured" under "Servers fully ready 2/2" reads as a
+                    # third server that does not exist - which is what UnmeasuredInRollups.Tests.ps1
+                    # was pinning when it required this sub-label to carry no "not measured" phrase at
+                    # all. Naming the unit satisfies both requirements at once: the tile still refuses
+                    # to claim "All checks passed" over an estate-level gap, and it no longer describes
+                    # a server that was never in the estate.
+                    '{0} check(s) not measured' -f $stats.ChecksUnread
                 } else { 'All checks passed' })
             # 'warn' rather than 'bad': nothing here FAILED, it was not looked at - the same
             # distinction the score card already draws. Never 'ok' while a check is unread, because
@@ -13463,25 +13494,45 @@ function Set-MdiReadinessReport {
             # A row for a server that never answered is marked once, so the reader can tell an unreachable
             # server from one that was tested and failed. A partial failure gets its own badge: those
             # results were measured and are worth acting on.
-            foreach ($row in ($rows | Where-Object { $_.Unreachable -or $_.Partial })) {
-                $fqdn = [string] $row.Row.FQDN
-                # Two DIFFERENT encoders, deliberately. The match key has to reproduce what
-                # ConvertTo-Html already emitted into $table (numeric entities for the apostrophe and
-                # for anything non-ASCII); the text being INSERTED is built by hand here and only
-                # needs the four markup characters escaped.
-                $encoded = ConvertTo-mdiTableCellEncoded $fqdn
-                $displayName = ConvertTo-mdiHtmlEncoded $fqdn
-                $reasonText = ConvertTo-mdiHtmlEncoded $row.Reason
-                $rowClass = if ($row.Unreachable) { 'unreachable' } else { 'partial' }
-                $badgeText = if ($row.Unreachable) { 'not reachable' } else { 'partial results' }
-                # The replacement side of -replace is a regex SUBSTITUTION string, where $&, $_, $1 and
-                # ${name} are all meaningful. The reason is an operating system error message and can
-                # legitimately contain them - "C:\$Recycle.Bin" or "see $_ for details" - which silently
-                # corrupted the row. Escaping every $ as $$ makes the substitution literal. The pattern
-                # side is already regex-escaped.
-                $replacement = ('<tr class="{0}" title="{1}"><td class="mono">{2} <span class="badge-warn">{3}</span></td>' -f
-                    $rowClass, $reasonText, $displayName, $badgeText).Replace('$', '$$')
-                $table = $table -replace ('<tr><td class="mono">{0}</td>' -f [regex]::Escape($encoded)), $replacement
+            # Matched POSITIONALLY, one occurrence per row, because the FQDN alone does not identify a
+            # row: a multi-homed domain controller appears in the inventory once per address, so two
+            # rows can legitimately carry the same name. -replace rewrites EVERY match, so a single
+            # unreachable address painted BOTH rows "not reachable" - including the row holding real
+            # measured findings, whose red False cells were then presented as data from a server
+            # nobody had reached, with the dead address's error as the row tooltip. Measured on the
+            # shipped renderer: 2 rows, 1 unreachable entry, 2 badged. The control - two DIFFERENT
+            # domain controllers, one unreachable - badged exactly one, which is why this went unseen.
+            #
+            # A MatchEvaluator also removes the $-escaping hazard the previous code had to work around
+            # by hand: the string it returns is used LITERALLY, so an operating system error message
+            # containing "$_" or "C:\$Recycle.Bin" can no longer be read as a substitution pattern.
+            $rowsByName = @{}
+            foreach ($row in $rows) {
+                # The match key has to reproduce what ConvertTo-Html already emitted into $table
+                # (numeric entities for the apostrophe and for anything non-ASCII).
+                $key = ConvertTo-mdiTableCellEncoded ([string] $row.Row.FQDN)
+                if (-not $rowsByName.ContainsKey($key)) { $rowsByName[$key] = New-Object System.Collections.Queue }
+                $rowsByName[$key].Enqueue($row)
+            }
+            foreach ($key in @($rowsByName.Keys)) {
+                $queue = $rowsByName[$key]
+                if (@($queue.ToArray() | Where-Object { $_.Unreachable -or $_.Partial }).Count -eq 0) { continue }
+                $rx = [regex] ('<tr><td class="mono">{0}</td>' -f [regex]::Escape($key))
+                # Rows were built from the same list, in the same sorted order, that ConvertTo-Html
+                # rendered, so the Nth occurrence of a name in the table is the Nth row carrying it.
+                $evaluator = [System.Text.RegularExpressions.MatchEvaluator] {
+                    param($match)
+                    if ($queue.Count -eq 0) { return $match.Value }
+                    $row = $queue.Dequeue()
+                    if (-not ($row.Unreachable -or $row.Partial)) { return $match.Value }
+                    $displayName = ConvertTo-mdiHtmlEncoded ([string] $row.Row.FQDN)
+                    $reasonText = ConvertTo-mdiHtmlEncoded $row.Reason
+                    $rowClass = if ($row.Unreachable) { 'unreachable' } else { 'partial' }
+                    $badgeText = if ($row.Unreachable) { 'not reachable' } else { 'partial results' }
+                    '<tr class="{0}" title="{1}"><td class="mono">{2} <span class="badge-warn">{3}</span></td>' -f
+                        $rowClass, $reasonText, $displayName, $badgeText
+                }
+                $table = $rx.Replace($table, $evaluator)
             }
 
             '<div class="table-scroll">' + $table + '</div>'
@@ -13595,6 +13646,20 @@ function Set-MdiReadinessReport {
         Get-mdiSensorV3Html -Server $allServers
     }
 
+    $stats = Get-mdiReportStatistics -ReportData $ReportData
+
+    # Built AFTER the statistics, because the "nothing to remediate" branch is a claim ABOUT the
+    # checks and may only be made once we know some were actually read. An estate whose domain
+    # controllers were all unreachable generates no remediation sections for exactly the reason it
+    # produces no results - nothing was measured - and the panel then told the reader "every check
+    # that this script can fix already passes" on a page whose verdict banner said "Action required",
+    # whose issues card listed five findings, and whose tables said "could not be read" fourteen
+    # times. It is the same false green as the readiness tile: a lost measurement must never read as
+    # a pass. Guarded exactly as the score is at 11727 - a positive claim needs a non-zero
+    # denominator - and, one step further, an unread check is not something that "already passes",
+    # so the unqualified sentence also requires nothing to be outstanding.
+    $remediationDenominator = Get-mdiCoverageDenominator -Measured $stats.ChecksTotal -Unread $stats.ChecksUnread
+    $remediationUnread = Get-mdiCoverageCount -Value $stats.ChecksUnread
     $htmlRemediation = if ($Remediation -and $Remediation.SectionCount -gt 0) {
         $scriptName = Split-Path -Leaf $Remediation.Path
         '<p>A remediation script was generated for the findings that can be fixed automatically. It covers <b>' +
@@ -13604,6 +13669,11 @@ function Set-MdiReadinessReport {
         '<pre class="code-block">.\' + (ConvertTo-mdiHtmlEncoded $scriptName) + ' -WhatIf   # preview' + [environment]::NewLine +
         '.\' + (ConvertTo-mdiHtmlEncoded $scriptName) + '           # apply</pre>' +
         '<p class="muted">Re-run Test-MdiReadiness.ps1 afterwards to confirm the findings are resolved.</p>'
+    } elseif ($Remediation -and $remediationDenominator -eq 0) {
+        '<p class="empty-state">No remediation script was generated because this run read no readiness check at all. Nothing here says the estate is healthy: resolve the access or connectivity problems reported above and re-run.</p>'
+    } elseif ($Remediation -and $remediationUnread -gt 0) {
+        '<p class="empty-state">Nothing to remediate automatically among the checks that could be read. ' +
+        [int] $remediationUnread + ' check(s) could not be read, so this run cannot say whether they need fixing.</p>'
     } elseif ($Remediation) {
         '<p class="empty-state">Nothing to remediate automatically: every check that this script can fix already passes.</p>'
     } else {
@@ -13614,7 +13684,6 @@ function Set-MdiReadinessReport {
         (ConvertTo-mdiHtmlEncoded $Domain) + '.ps1</code> containing the commands that fix the findings above (advanced audit policy, NTLM auditing, power scheme, Network Name Resolution firewall rules, stopped sensor services and clock resynchronisation).</p>'
     }
 
-    $stats = Get-mdiReportStatistics -ReportData $ReportData
     $htmlOverview = Get-mdiOverviewHtml -Statistics $stats -ReportData $ReportData
 
     # History is recorded by default, next to the reports, so a second run always has something to

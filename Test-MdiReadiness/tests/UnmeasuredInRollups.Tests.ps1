@@ -140,7 +140,14 @@ Assert-That '  ...and the score card discloses it' (
 Assert-That 'the servers card counts 2 of 2 reachable servers' (
     $readyB.Value -eq '2/2') "(rendered '$($readyB.Value)')"
 Assert-That '  ...and does not describe a third server that does not exist' (
-    $readyB.Sub -notmatch 'not measured') "(sub '$($readyB.Sub)')"
+    $readyB.Sub -notmatch '(?<!check\(s\) )\bnot measured\b') "(sub '$($readyB.Sub)')"
+# The invariant is about the UNIT, not about the phrase. An estate-level gap - an unexamined domain,
+# a discovery placeholder, an unreadable directory check - is charged to the score and must keep this
+# tile from claiming "All checks passed", so the tile is allowed to disclose it; what it must never do
+# is state it in SERVERS, because there is no third server. "1 check(s) not measured" is the
+# disclosure; "1 not measured" under a headline of 2/2 servers is the phantom.
+Assert-That '  ...and any disclosure it does make names checks, not servers' (
+    ($readyB.Sub -notmatch 'not measured') -or ($readyB.Sub -match 'check')) "(sub '$($readyB.Sub)')"
 # The placeholder rows must be distinguishable from real servers by construction.
 $placeholders = @($stB.ServerScores | Where-Object { $_.Kind -eq 'Unmeasured' })
 $realRows = @($stB.ServerScores | Where-Object { $_.Kind -ne 'Unmeasured' })
