@@ -1,5 +1,51 @@
 <#
     .NOTES
+        NON-ENGLISH WINDOWS AND NON-ENGLISH LOCALES
+
+        This script is designed to run correctly on a non-English installation and under an operator
+        culture that is not en-US. The measures below are deliberate; if you are modifying this script,
+        keep them.
+
+        WHAT IS PROTECTED, AND HOW
+
+        * Localised command output is never matched as TEXT. The checks that shell out are parsed
+          structurally instead:
+            - auditpol /backup   parsed by SUBCATEGORY GUID and by fixed COLUMN POSITION, never by the
+                                 header text, which is translated. The header row is skipped and
+                                 language-neutral names are re-applied.
+            - powercfg           parsed by the scheme GUID, not by the scheme name.
+            - Service state, OS caption and similar WMI strings are compared by numeric code or by
+              GUID wherever a code exists.
+
+        * Numbers that reach CSS or SVG go through ConvertTo-mdiSvgNumber, which formats invariantly.
+          This matters more than it looks: in de-DE or fr-FR a naive format produces "width:12,5%",
+          which is INVALID CSS - the browser drops the declaration and the bar silently renders at
+          zero width. A silently wrong chart is worse than a broken one.
+
+        * Numbers read back from a report, a JSON round-trip or a baseline history are parsed with
+          InvariantCulture, because those files are WRITTEN invariantly. Parsing them under the
+          operator's culture would read "12.5" as 125 on a German host.
+
+        * String comparisons that decide an outcome use Ordinal or OrdinalIgnoreCase, never the
+          culture-sensitive default. The tr-TR culture is the reason: it maps 'i' to 'İ', so
+          'INFO'.ToLower() is not 'info' there and a culture-sensitive comparison silently fails.
+
+        * Dates are written and parsed round-trip ('s' format) with InvariantCulture, so a history
+          written on one host is readable on another whatever the regional settings.
+
+        * All four report artefacts are written as UTF-8 with a BOM. Windows PowerShell 5.1's
+          Get-Content sniffs the BOM and would otherwise decode a BOM-less UTF-8 file as ANSI,
+          corrupting any non-ASCII server or account name on the round trip.
+
+        WHAT IS NOT PROVEN
+
+        The above is verified by running the script's own test suite under de-DE, fr-FR, tr-TR, ja-JP
+        and ru-RU cultures. It has NOT been run end to end on a genuinely non-English Windows
+        installation - a German or Japanese Windows Server - where the OS itself, not just the .NET
+        culture, returns translated text. If you run it in such an environment, the checks most worth
+        verifying first are advanced audit policy, the power scheme, and any check whose Detail text
+        quotes a Windows message.
+
         Copyright (c) Microsoft Corporation.  All rights reserved.
         Use of this sample source code is subject to the terms of the Microsoft
         license agreement under which you licensed this sample source code. If
@@ -73,6 +119,24 @@
         Verifies Microsoft Defender for Identity prerequisites are in place
     .DESCRIPTION
         This script will query your domain and report if the different Microsoft Defender for Identity prerequisites are in place. It creates an html report and a detailed json file with all the collected data.
+
+        REQUIREMENTS AND KNOWN LIMITS
+
+        * An account that can read the directory in every domain in scope. -Forest additionally needs
+          read permission across the forest (typically Enterprise Admin).
+        * Remote access to each scanned server over WMI and the admin share, plus the Remote Registry
+          service, for the checks that read a registry value or a service state. Where a read fails,
+          the check is reported as "Not tested" rather than as a pass or a failure.
+        * Windows PowerShell 5.1. The script does not run on PowerShell 7.
+
+        NON-ENGLISH WINDOWS: the script is written to be locale-safe - localised command output is
+        parsed by GUID and column position rather than by translated text, numbers that reach the
+        report are formatted invariantly, and all artefacts are UTF-8 with a BOM. This is verified
+        under de-DE, fr-FR, tr-TR, ja-JP and ru-RU cultures. It has NOT been run end to end on a
+        genuinely non-English Windows installation, where the operating system itself returns
+        translated strings. On such a host, treat the advanced audit policy, power scheme and time
+        synchronisation results as needing a manual second look, and report anything that disagrees
+        with the machine's actual configuration.
     .PARAMETER Path
         Path to a folder where the reports are be saved. Defaults to the current folder.
     .PARAMETER Domain
@@ -149,7 +213,15 @@
         an error. Use -FailOnIssues instead when the caller only needs an exit code.
     .PARAMETER FailOnIssues
         Exit with a non-zero exit code when any prerequisite fails, so the script can be used as a build or compliance
-        gate. The exit code is the number of failed checks, capped at 254.
+        gate. The exit code is the number of ISSUES in the report's issue list, capped at 254 - the same count the
+        console prints and the Issues found table shows. That is not the same as the number of failed checks: one
+        unreachable server, or one domain whose auditing could not be read, raises an issue without failing a
+        per-server check, and one blocked port raises one issue per probe.
+
+        The full contract is:
+            0        the scan ran and found nothing to fix
+            1..254   that many readiness issues were found (only with -FailOnIssues)
+            255      the scan did not run, or did not complete - re-run it, do not read the result
     .PARAMETER WorkspaceName
         The Defender for Identity workspace name, used to test outbound HTTPS connectivity to the sensor API URL
         (https://<WorkspaceName>sensorapi.atp.azure.com). If not specified, the cloud service connectivity test is
@@ -218,7 +290,13 @@
 #>
 
 #Requires -Version 4.0
-#requires -Module ActiveDirectory
+# The ActiveDirectory module is NOT declared with #requires. PowerShell refuses to run the file at all
+# when a #requires module is absent, which happens before the trap in the main region is ever
+# established, so the process exited 1 - and 1 is the -FailOnIssues code for "the scan ran and found
+# exactly one readiness issue". A scheduled compliance job could not tell a broken environment from a
+# nearly-clean estate, which is precisely the confusion the exit-code contract below exists to remove.
+# The module is checked at the start of the main region instead, where a throw is caught by the trap
+# and reported as 255.
 
 # Positional binding is off deliberately. With this many parameters a single missing switch name
 # silently lands the value in whatever parameter happens to sit at that position: passing two DC
@@ -295,6 +373,126 @@ param (
     [switch] $OpenHtmlReport
 )
 
+#region Windows PowerShell 5.1 re-launch
+
+<#
+    This script must run on Windows PowerShell 5.1, and re-launches itself there when it is started
+    on PowerShell 7. Nobody has to uninstall anything: PowerShell 7 installs SIDE BY SIDE with
+    Windows PowerShell rather than replacing it - different executable (pwsh.exe vs powershell.exe)
+    and different directory - and Windows PowerShell 5.1 is a built-in component of every supported
+    Windows release. Measured on this estate: a Windows 11 client had 5.1.26100.9168 and 7.6.4 at
+    once, and a Windows Server 2022 member had 5.1.20348.5499 with no PowerShell 7 at all. A host
+    with PowerShell 7 therefore always has both, and a customer who has standardised on 7 does not
+    have to downgrade anything to run this.
+
+    WHY IT CANNOT SIMPLY RUN ON 7
+
+    Get-WmiObject and Invoke-WmiMethod were REMOVED in PowerShell 7, and this script uses them 32
+    times. They still appear to work there, which is the dangerous part: PowerShell silently starts a
+    hidden Windows PowerShell compatibility session and proxies the calls to it, so every result comes
+    back as a DESERIALIZED property bag. Measured on PowerShell 7.6.4:
+
+        returned type   : System.Management.Automation.PSObject
+        is deserialized : Deserialized.System.Management.ManagementObject#root\cimv2\Win32_...
+        Get-PSSession   : WinPSCompatSession  localhost  Opened
+
+    Deserialized objects have lost their methods and their type fidelity, and this script does things
+    like slice a byte array out of a WMI result and run it through [BitConverter]::ToUInt32 to read a
+    file from a remote server. That does not fail loudly - it yields wrong values or nulls, and the
+    affected checks then report 'Not tested', or worse, PASS. A readiness tool that silently reports a
+    prerequisite as met when it was never measured is worse than one that refuses to start.
+
+    The compatibility proxy also drops parameters the script relies on: -DcomAuthentication does not
+    exist on it.
+
+    WHY NOT #Requires -PSEdition Desktop
+
+    For the same reason the ActiveDirectory module is not declared with #requires, explained above:
+    an unsatisfied #requires makes PowerShell refuse the file with exit code 1, and 1 is the
+    -FailOnIssues code for 'the scan ran and found exactly one readiness issue'. A scheduled
+    compliance job could not tell 'wrong PowerShell edition' from 'nearly clean estate'. Re-launching
+    is also strictly better than refusing: the run just works, wherever it was started from.
+#>
+
+if ($PSVersionTable.PSEdition -eq 'Core') {
+
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+
+    # A 32-bit PowerShell 7 on 64-bit Windows sees the 64-bit System32 through Sysnative; System32
+    # would silently give it the 32-bit engine, which cannot load the 64-bit ActiveDirectory module.
+    if (-not [Environment]::Is64BitProcess -and [Environment]::Is64BitOperatingSystem) {
+        $sysnative = Join-Path $env:SystemRoot 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
+        if (Test-Path -LiteralPath $sysnative) { $windowsPowerShell = $sysnative }
+    }
+
+    if (-not (Test-Path -LiteralPath $windowsPowerShell)) {
+        Write-Error ("This script requires Windows PowerShell 5.1 and cannot run on PowerShell $($PSVersionTable.PSVersion). " +
+            "Windows PowerShell was not found at $windowsPowerShell. Start the scan with powershell.exe instead of pwsh.exe.")
+        exit 255
+    }
+
+    # $PSCommandPath is empty when the script is piped or dot-sourced from memory, in which case there
+    # is no file to re-launch and the caller has to be told rather than left with a silent no-op.
+    if ([string]::IsNullOrEmpty($PSCommandPath)) {
+        Write-Error ('This script requires Windows PowerShell 5.1. It cannot re-launch itself automatically because ' +
+            'it was not invoked from a file. Run it as: powershell.exe -File .\Test-MdiReadiness.ps1')
+        exit 255
+    }
+
+    # The bound parameters are handed over as a SERIALISED FILE, not as a command line.
+    #
+    # Measured, because the obvious approaches are silently wrong. With -File, PowerShell passes each
+    # argument as a literal string and never re-parses it:
+    #
+    #     -Path 'C:\Program Files\MDI'   quoted by hand  ->  Path=['C:\Program Files\MDI']  quotes kept
+    #     -SkipCA:$false                                 ->  binding error, '$false' is not expanded
+    #     -DomainController 'dc1,dc2'                    ->  ONE element, "dc1,dc2"
+    #     -DomainController 'dc1' 'dc2'                  ->  ONE element, 'dc2' lost to a positional
+    #
+    # Five of the script's parameters are string arrays that name servers to scan, so an array that
+    # silently arrives as a single element would scan a server called "dc1,dc2" - find nothing, and
+    # report the real ones as unmeasured. Export-Clixml round-trips types exactly and puts the values
+    # nowhere near a command-line parser, so nothing the caller typed is ever re-interpreted.
+    $argFile = Join-Path ([IO.Path]::GetTempPath()) ("mdi-relaunch-{0}.xml" -f [guid]::NewGuid().ToString('N'))
+    try {
+        $PSBoundParameters | Export-Clixml -LiteralPath $argFile -Depth 5 -ErrorAction Stop
+    } catch {
+        Write-Error ("This script requires Windows PowerShell 5.1 and could not stage its parameters for the re-launch: {0}" -f $_.Exception.Message)
+        exit 255
+    }
+
+    Write-Verbose ("Re-launching under Windows PowerShell 5.1: {0}" -f $windowsPowerShell)
+    Write-Host "PowerShell $($PSVersionTable.PSVersion) detected. Re-launching under Windows PowerShell 5.1, which this script requires." -ForegroundColor Yellow
+
+    # Only two values are interpolated into this command - the script's own path and a temp file name
+    # this code generated - and both are single-quote escaped. Every caller-supplied value travels
+    # inside the CliXml file and is splatted, so none of it is ever parsed as code.
+    #
+    # The scriptblock wrapper and the explicit trailing exit are NOT decoration. Measured:
+    #     powershell -File    script.ps1                              ->  7   correct
+    #     powershell -Command "& script.ps1"                          ->  1   EXIT CODE LOST
+    #     powershell -Command "& { & script.ps1; exit $LASTEXITCODE }" ->  7   correct
+    # -Command reports only whether the command errored, so without the wrapper every -FailOnIssues
+    # result would collapse to 1 - which is itself a valid issue count, so a compliance gate would
+    # silently read "exactly one issue" for a clean estate, a 200-issue estate and a failed scan alike.
+    $escapedScript = $PSCommandPath -replace "'", "''"
+    $escapedArgs = $argFile -replace "'", "''"
+    $command = "& { `$p = Import-Clixml -LiteralPath '$escapedArgs'; & '$escapedScript' @p; exit `$LASTEXITCODE }"
+
+    try {
+        & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -Command $command
+
+        # The child's exit code IS the result - the whole -FailOnIssues contract (0 clean, 1..254
+        # issue count, 255 did not complete) has to survive the hand-off, or a compliance gate reads
+        # the re-launcher's success instead of the scan's verdict.
+        exit $LASTEXITCODE
+    } finally {
+        Remove-Item -LiteralPath $argFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+#endregion Windows PowerShell 5.1 re-launch
+
 
 
 #region General settings
@@ -329,13 +527,13 @@ System,Logon,{0cce9215-69ae-11d9-bed3-505054503030},Success and Failure,3
 '@
 
     ObjectAuditing                  = @'
-SecurityIdentifier,AccessMask,AuditFlagsValue,InheritedObjectAceType,Description
-S-1-1-0,852331,1,bf967aba-0de6-11d0-a285-00aa003049e2,Descendant User Objects
-S-1-1-0,852331,1,bf967a9c-0de6-11d0-a285-00aa003049e2,Descendant Group Objects
-S-1-1-0,852331,1,bf967a86-0de6-11d0-a285-00aa003049e2,Descendant Computer Objects
-S-1-1-0,852331,1,ce206244-5827-4a86-ba1c-1c0c386c1b64,Descendant msDS-ManagedServiceAccount Objects
-S-1-1-0,852075,1,7b8b558a-93a5-4af7-adca-c017e67f1057,Descendant msDS-GroupManagedServiceAccount Objects
-S-1-1-0,852075,1,0feb936f-47b3-49f2-9386-1dedc2c23765,Descendant msDS-DelegatedManagedServiceAccount Objects
+SecurityIdentifier,AccessMask,AuditFlagsValue,AceFlagsValue,InheritedObjectAceType,Description
+S-1-1-0,852331,1,2,bf967aba-0de6-11d0-a285-00aa003049e2,Descendant User Objects
+S-1-1-0,852331,1,2,bf967a9c-0de6-11d0-a285-00aa003049e2,Descendant Group Objects
+S-1-1-0,852331,1,2,bf967a86-0de6-11d0-a285-00aa003049e2,Descendant Computer Objects
+S-1-1-0,852331,1,2,ce206244-5827-4a86-ba1c-1c0c386c1b64,Descendant msDS-ManagedServiceAccount Objects
+S-1-1-0,852075,1,2,7b8b558a-93a5-4af7-adca-c017e67f1057,Descendant msDS-GroupManagedServiceAccount Objects
+S-1-1-0,852075,1,2,0feb936f-47b3-49f2-9386-1dedc2c23765,Descendant msDS-DelegatedManagedServiceAccount Objects
 '@
 
     ExchangeAuditing                = @'
@@ -526,6 +724,17 @@ function Get-mdiRemoteTempFolder {
     if ([string]::IsNullOrWhiteSpace($envTempPath)) {
         $envTempPath = 'C:\Windows\Temp'
     }
+    # The result must be a ROOTED path with a drive letter, because every caller turns it into a UNC
+    # path to the remote admin share by replacing the colon. A PARTIAL WMI answer breaks that: if
+    # Win32_OperatingSystem answers but carries no SystemDrive, "-replace '%SystemDrive%', $null"
+    # substitutes an EMPTY string and '%SystemDrive%\Windows\Temp' becomes '\Windows\Temp'. That is
+    # still a rooted path - on the CURRENT DRIVE OF THIS COMPUTER - so the script went on to write,
+    # read and delete its temporary probe files on itself while believing it was operating on the
+    # remote server. Nothing in the result looks wrong, which is why it was never noticed.
+    if ($envTempPath -notmatch '^[A-Za-z]:\\') {
+        Write-mdiVerbose ('The temp folder reported by {0} is not a rooted local path ("{1}"), so the default is used instead' -f $ComputerName, $envTempPath)
+        $envTempPath = 'C:\Windows\Temp'
+    }
     $envTempPath
 }
 
@@ -561,7 +770,13 @@ function Invoke-mdiRemoteCommand {
         }
 
         $result = Invoke-WmiMethod @wmiParams
-        $maxWait = [datetime]::Now.AddSeconds($TimeoutSeconds)
+        # A STOPWATCH, not a wall-clock deadline. [datetime]::Now moves when the clock does - an NTP
+    # correction, a DST transition, or an administrator fixing the very skew this tool reports - and a
+    # deadline computed from it then either expires instantly (clock jumps forward) or never expires
+    # at all (clock jumps back), turning a bounded wait into an unbounded one in the middle of a scan.
+    # Stopwatch measures elapsed time from a monotonic source and cannot be affected.
+    $waitTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    $maxWaitSeconds = $TimeoutSeconds
 
         $waitForProcessParams = @{
             ComputerName = $ComputerName
@@ -573,7 +788,7 @@ function Invoke-mdiRemoteCommand {
         $timedOut = $false
         if ($result.ReturnValue -eq 0) {
             do { Start-Sleep -Milliseconds 200 }
-            while (([datetime]::Now -lt $maxWait) -and (Get-WmiObject @waitForProcessParams).CommandLine -eq $wmiParams.ArgumentList)
+            while (($waitTimer.Elapsed.TotalSeconds -lt $maxWaitSeconds) -and (Get-WmiObject @waitForProcessParams).CommandLine -eq $wmiParams.ArgumentList)
 
             # A process that outlived the wait is terminated rather than abandoned. Without this the
             # remote powershell.exe kept running on the domain controller long after this script had
@@ -583,14 +798,25 @@ function Invoke-mdiRemoteCommand {
         $stillRunning = Get-WmiObject @waitForProcessParams -ErrorAction SilentlyContinue
             if ($stillRunning -and $stillRunning.CommandLine -eq $wmiParams.ArgumentList) {
                 $timedOut = $true
-                Write-Warning ('The remote command on {0} did not finish within {1}s and was terminated.' -f $ComputerName, $TimeoutSeconds)
+                Write-mdiWarning ('The remote command on {0} did not finish within {1}s and was terminated.' -f $ComputerName, $TimeoutSeconds)
                 try { [void] $stillRunning.Terminate() } catch {
                     Write-Verbose ('Could not terminate process {0} on {1}: {2}' -f $result.ProcessId, $ComputerName, $_.Exception.Message)
                 }
             }
         }
 
-        $remoteFile = $LocalFile -replace '^([A-Za-z]):', ('\\{0}\$1$' -f $ComputerName)
+        # Built explicitly rather than by regex substitution. The computer name was interpolated into
+        # the REPLACEMENT string of a -replace, where .NET treats $1, $&, $$, $` and $' as substitution
+        # tokens - so a name carrying any of those rewrote the UNC path into something other than the
+        # intended admin share. The name reaches here from -DomainController, -CAServer,
+        # -EntraConnectServer and -NnrTargetComputer, all operator-supplied, so it is not this
+        # function's business to assume what characters it contains.
+        $driveMatch = [regex]::Match([string] $LocalFile, '^([A-Za-z]):(.*)$')
+        $remoteFile = if ($driveMatch.Success) {
+            '\\' + $ComputerName + '\' + $driveMatch.Groups[1].Value + '$' + $driveMatch.Groups[2].Value
+        } else {
+            $LocalFile
+        }
         try {
             # A terminated process wrote nothing useful, so its partial output is not read back at all:
             # a truncated JSON file parsed into a handful of probe results would look like a completed
@@ -614,7 +840,13 @@ function Invoke-mdiRemoteCommand {
                     ComputerName = $ComputerName
                 }
                 $cimParams = @{
-                    CimClass   = Get-CimClass @psmClassParams
+                    # -ErrorAction Stop so the failure is thrown into the surrounding catch instead of being
+                    # written to the error stream as well. This call is part of a HANDLED fallback path - SMB is
+                    # tried first and CIM only when it fails - so on any server where the CIM class is unavailable
+                    # it painted a full red CimException on the console for every server and every check, while
+                    # the scan carried on perfectly happily. Operators learn to ignore a console full of red that
+                    # does not mean anything, which is exactly when a real error goes unnoticed.
+                    CimClass   = Get-CimClass @psmClassParams -ErrorAction Stop
                     Property   = @{ InstanceID = $LocalFile }
                     ClientOnly = $true
                 }
@@ -627,14 +859,14 @@ function Invoke-mdiRemoteCommand {
                 [array]::Reverse($fileLengthBytes)
                 $fileLength = [BitConverter]::ToUInt32($fileLengthBytes, 0)
                 $fileBytes = $fileContents.FileData[4..($fileLength - 1)]
-                $localTempFile = [System.IO.Path]::GetTempFileName()
+                $localTempFile = [IO.Path]::GetTempFileName()
                 try {
                     # WriteAllBytes rather than "Set-Content -Encoding Byte". The parameter value Byte
                     # was removed in PowerShell 7 (replaced by -AsByteStream), and although the script
                     # refuses to run there today, this path would fail with a parameter binding error
                     # that -ErrorAction cannot catch if that guard is ever relaxed. The .NET call is
                     # correct on every version and is what the surrounding code already uses.
-                    [System.IO.File]::WriteAllBytes($localTempFile, $fileBytes)
+                    [IO.File]::WriteAllBytes($localTempFile, $fileBytes)
                     $return = Get-Content -Path $localTempFile
                 } finally {
                     Remove-Item -Path $localTempFile -Force -ErrorAction SilentlyContinue
@@ -690,24 +922,54 @@ function Test-mdiIsNotRunError {
         and a Win32Exception is read by its NativeErrorCode because its HResult is the generic E_FAIL.
         PowerShell wraps .NET method exceptions in a MethodInvocationException whose InnerException is the
         real one, so the chain is walked, bounded so a self-referencing chain cannot spin here for ever.
+
+        The socket codes fall into two groups, and both mean the port was never measured.
+
+        No route: WSAENETUNREACH (10051) / WSAEHOSTUNREACH (10065), plus WSAEACCES (10013) for the
+        socket's own access being forbidden. Without the two unreachable codes they fell through to
+        the connection-refused branch in Test-mdiTcpPort and produced the self-contradictory
+        "Closed - connection refused (A socket operation was attempted to an unreachable network)",
+        which carries no "Not tested" marker - so a missing route was reported as a measured closed
+        required port, sending the operator to change a firewall for a routing problem.
+
+        LOCAL failures, where the call failed here before a packet could be sent: WSAEMFILE (10024),
+        WSAEAFNOSUPPORT (10047), WSAEADDRNOTAVAIL (10049), WSAENETDOWN (10050), WSAENOBUFS (10055)
+        and WSAENOTCONN (10057). Each was reported as a measured blocked required port. A dual-stack
+        domain controller reaches this the ordinary way: Windows puts ::1 in DNSServerSearchOrder, an
+        IPv4 probe socket cannot use it, and a healthy estate is told TCP/53 is shut. The same
+        mismatch can also arrive with no error code at all (a NotSupportedException or a bare
+        ArgumentException); the port probers catch that themselves by treating the ABSENCE of any
+        SocketException as "never reached the wire", so it needs no entry here.
+
+        Deliberately NOT included: WSAETIMEDOUT (10060) and WSAECONNREFUSED (10061). Those ARE
+        measurements of the far end and must keep failing the verdict.
+        See UnrunProbeIsNotMeasured.Tests.ps1 for the full evidence.
     #>
     param ([Parameter(Mandatory = $true)] [AllowNull()] $ErrorObject)
     if ($null -eq $ErrorObject) { return $false }
-    $ex = if ($ErrorObject -is [System.Management.Automation.ErrorRecord]) { $ErrorObject.Exception }
-    elseif ($ErrorObject -is [System.Exception]) { $ErrorObject } else { $null }
+    $ex = if ($ErrorObject -is [Management.Automation.ErrorRecord]) { $ErrorObject.Exception }
+    elseif ($ErrorObject -is [Exception]) { $ErrorObject } else { $null }
     $depth = 0
     while ($ex -and $depth -lt 16) {
         $hr = 0
         try { $hr = [int] $ex.HResult } catch { $hr = 0 }
         if ($hr -eq -2147024891 -or $hr -eq -2147023174) { return $true }
-        if ($ex -is [System.UnauthorizedAccessException] -or $ex -is [System.Security.SecurityException]) { return $true }
-        if ($ex -is [System.ComponentModel.Win32Exception]) {
-            $code = [int] $ex.NativeErrorCode
-            if ($code -eq 5 -or $code -eq 1722) { return $true }
-        }
-        if ($ex -is [System.Net.Sockets.SocketException]) {
-            if ([int] $ex.SocketErrorCode -eq 10013) { return $true }
-        }
+        if ($ex -is [UnauthorizedAccessException] -or $ex -is [Security.SecurityException]) { return $true }
+        # SocketException derives from Win32Exception and its NativeErrorCode IS the WSA code, so one
+        # numeric test covers both: 5 access denied, 1722 RPC server unavailable, then the socket
+        # codes documented above.
+        if ($ex -is [ComponentModel.Win32Exception] -and
+            [int] $ex.NativeErrorCode -in 5,1722,10013,10024,10047,10049,10050,10051,10055,10057,10065) { return $true }
+        # NOT handled here: a WMI refusal (ManagementException with ErrorCode AccessDenied or
+        # PrivilegeNotHeld). Its HResult is the generic COM 0x80020009, so neither test above sees it,
+        # and classifying it would be correct in principle - but this function is SHIPPED INSIDE the
+        # remote probe payload, which has a hard 32,000-character command-line budget, and the extra
+        # test measured 92 characters that the budget does not have (RemotePayloadBudget.Tests.ps1
+        # fails at 25 DCs with it, passes without). Every caller of this function - lines 1028, 1102,
+        # 1258, 1768, 1800 - is in the TCP/UDP socket path, where a ManagementException cannot arise,
+        # so the gap is unreachable rather than merely unlikely. WMI refusals are classified where WMI
+        # is actually called: Get-mdiServiceStateResult reports a refused query as unreadable rather
+        # than as "not installed", which is the outcome that matters.
         $ex = $ex.InnerException
         $depth++
     }
@@ -746,13 +1008,11 @@ function Test-mdiTcpPort {
                 $candidate = $_.Exception
                 $depth = 0
                 while ($candidate -and $null -eq $socketError -and $depth -lt 16) {
-                    if ($candidate -is [System.Net.Sockets.SocketException]) { $socketError = $candidate.SocketErrorCode }
+                    if ($candidate -is [Net.Sockets.SocketException]) { $socketError = $candidate.SocketErrorCode }
                     $candidate = $candidate.InnerException
                     $depth++
                 }
-                if ($socketError -in @([System.Net.Sockets.SocketError]::HostNotFound,
-                        [System.Net.Sockets.SocketError]::TryAgain,
-                        [System.Net.Sockets.SocketError]::NoData)) {
+                if ([int] $socketError -in 11001, 11002, 11004) {
                     [PSCustomObject]@{ Success = $false
                         Detail = ('Not tested - the name {0} could not be resolved ({1}): {2}' -f
                             $ComputerName, $socketError, ($_.Exception.Message -replace '[\r\n]+', ' '))
@@ -828,19 +1088,24 @@ function Test-mdiTcpPort {
         $candidate = $_.Exception
         $depth = 0
         while ($candidate -and $null -eq $socketError -and $depth -lt 16) {
-            if ($candidate -is [System.Net.Sockets.SocketException]) { $socketError = $candidate.SocketErrorCode }
+            if ($candidate -is [Net.Sockets.SocketException]) { $socketError = $candidate.SocketErrorCode }
             $candidate = $candidate.InnerException
             $depth++
         }
-        $unresolved = $socketError -in @([System.Net.Sockets.SocketError]::HostNotFound,
-            [System.Net.Sockets.SocketError]::TryAgain,
-            [System.Net.Sockets.SocketError]::NoData)
+        # Numeric, matching the rest of this file's error handling: HostNotFound 11001, TryAgain
+        # 11002, NoData 11004. Spelled-out enum names cost ~130 characters of a command line that has
+        # a hard limit, and the codes are identical on every localisation.
+        $unresolved = [int] $socketError -in 11001, 11002, 11004
         $detail = if ($unresolved) {
             'Not tested - the name {0} could not be resolved ({1}): {2}' -f $ComputerName, $socketError, $message
-        } elseif (Test-mdiIsNotRunError $_) {
-            # Access was denied or the endpoint was unreachable, so the probe never measured the port.
-            # Stamped with the script's own English "Not tested" marker at creation, by numeric error
-            # code, so the classifiers key on the marker and not on the localised Windows message.
+        } elseif ($null -eq $socketError -or (Test-mdiIsNotRunError $_)) {
+            # Two ways the port was never measured, one wording: access denied / no route, and NO
+            # SocketException anywhere in the chain. To MEASURE a port you have to get a socket answer
+            # (refusal, reset, timeout) or a successful connect; anything else failed before the wire.
+            # An IPv6 address handed to an IPv4 probe socket lands there as a bare ArgumentException
+            # with no error code, and was reported as a measured blocked required port. Keyed on the
+            # ABSENCE of a socket error, so an ordinary bad argument is not excused and no localised
+            # message is matched.
             'Not tested - {0}' -f $message
         } else {
             $message
@@ -868,6 +1133,12 @@ function Test-mdiUdpPort {
         # NBSTAT, DNS and CLDAP all carry a caller-chosen identifier that the answer must echo. Passing it
         # in lets a reply be checked against the request rather than accepting any datagram that arrives.
         [Parameter(Mandatory = $false)] [int] $ExpectedTransactionId = -1,
+        # Checking the length and the identifier is not enough to prove a service answered: a middlebox,
+        # captive portal or load-balancer health responder that reflects the datagram satisfies both,
+        # because the identifier it echoes is the one we just sent. Callers pass the parser for their own
+        # protocol so the reply is confirmed to be a genuine RESPONSE rather than our own request coming
+        # back. The parser returns an object with Valid, Reason and Detail.
+        [Parameter(Mandatory = $false)] [scriptblock] $ResponseValidator,
         [Parameter(Mandatory = $false)] [switch] $IsRetry
     )
 
@@ -883,10 +1154,10 @@ function Test-mdiUdpPort {
         # time budget for the whole scan. An address literal is passed through untouched.
         $target = $ComputerName
         $parsed = $null
-        if (-not [System.Net.IPAddress]::TryParse($ComputerName, [ref] $parsed)) {
+        if (-not [Net.IPAddress]::TryParse($ComputerName, [ref] $parsed)) {
             try {
-                $addresses = @([System.Net.Dns]::GetHostAddresses($ComputerName) |
-                        Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork })
+                $addresses = @([Net.Dns]::GetHostAddresses($ComputerName) |
+                        Where-Object { $_.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork })
                 if ($addresses.Count -eq 0) { throw 'no IPv4 address' }
                 $target = [string] $addresses[0]
             } catch {
@@ -902,7 +1173,7 @@ function Test-mdiUdpPort {
         }
         $udp.Connect($target, $Port)
         [void] $udp.Send($Payload, $Payload.Length)
-        $remoteEndpoint = New-Object -TypeName System.Net.IPEndPoint -ArgumentList ([System.Net.IPAddress]::Any, 0)
+        $remoteEndpoint = New-Object -TypeName System.Net.IPEndPoint -ArgumentList ([Net.IPAddress]::Any, 0)
         $response = $udp.Receive([ref] $remoteEndpoint)
         $stopwatch.Stop()
         if ($response.Length -eq 0) {
@@ -928,10 +1199,24 @@ function Test-mdiUdpPort {
             }
         }
 
-        [PSCustomObject]@{ Success = $true; Detail = ('Replied with {0} bytes' -f $response.Length)
+        $detail = 'Replied with {0} bytes' -f $response.Length
+        if ($null -ne $ResponseValidator) {
+            $verdict = & $ResponseValidator $response
+            if ($null -ne $verdict -and -not $verdict.Valid) {
+                return [PSCustomObject]@{ Success = $false
+                    Detail = ('Invalid reply - {0}' -f $verdict.Reason)
+                    Response = $response; LatencyMs = [int] $stopwatch.ElapsedMilliseconds
+                }
+            }
+            if ($null -ne $verdict -and -not [string]::IsNullOrWhiteSpace($verdict.Detail)) {
+                $detail = $verdict.Detail
+            }
+        }
+
+        [PSCustomObject]@{ Success = $true; Detail = $detail
             Response = $response; LatencyMs = [int] $stopwatch.ElapsedMilliseconds
         }
-    } catch [System.Net.Sockets.SocketException] {
+    } catch [Net.Sockets.SocketException] {
         $stopwatch.Stop()
         # UDP has no retransmission. A single datagram lost anywhere on the path - and loss is normal,
         # not exceptional - looked exactly like a firewall dropping the traffic, so one unlucky packet
@@ -942,7 +1227,8 @@ function Test-mdiUdpPort {
         if ($_.Exception.SocketErrorCode -eq 'TimedOut' -and -not $IsRetry) {
             $retryMs = [Math]::Max($TimeoutMs * 2, 3000)
             $retry = Test-mdiUdpPort -ComputerName $ComputerName -Port $Port -Payload $Payload `
-                -TimeoutMs $retryMs -ExpectedTransactionId $ExpectedTransactionId -IsRetry
+                -TimeoutMs $retryMs -ExpectedTransactionId $ExpectedTransactionId `
+                -ResponseValidator $ResponseValidator -IsRetry
             if ($retry.Success) {
                 return [PSCustomObject]@{ Success = $true
                     Detail = ('Replied on the second attempt after {0} ms - the first datagram went unanswered within {1} ms' -f $retry.LatencyMs, $TimeoutMs)
@@ -951,24 +1237,39 @@ function Test-mdiUdpPort {
             }
             return $retry
         }
-        $detail = switch ($_.Exception.SocketErrorCode) {
+        # $_ is captured BEFORE the switch. Inside a switch, $_ is rebound to the item being matched -
+        # here the SocketErrorCode enum value - so every reference to $_ in the default branch was
+        # reading the enum, not the error record. Measured: the branch produced the detail string
+        # " - " for a NetworkUnreachable failure, because $_.Exception.SocketErrorCode and
+        # $_.Exception.Message were both $null on an enum.
+        #
+        # The formatting was the visible half; the damaging half was silent. Test-mdiIsNotRunError was
+        # handed the enum instead of the error record, so it could never recognise an access-denied or
+        # unreachable-network failure, and a probe that NEVER RAN was recorded as a measured failure.
+        # Everything downstream - the port matrix, the KPI, the verdict and the remediation generator -
+        # keys off that "Not tested" marker, so the whole report treated an unrun probe as a blocked
+        # port, and the generated script opened a firewall for it.
+        $socketError = $_
+        $detail = switch ($socketError.Exception.SocketErrorCode) {
             'ConnectionReset' { 'Closed - ICMP port unreachable (host reachable, no service listening)' }
             'TimedOut' { 'Blocked - no response within {0} ms, retried and still silent (filtered by a firewall or no service listening)' -f $TimeoutMs }
             default {
-                if (Test-mdiIsNotRunError $_) {
-                    'Not tested - {0} - {1}' -f $_.Exception.SocketErrorCode, ($_.Exception.Message -replace '[\r\n]+', ' ')
+                if (Test-mdiIsNotRunError $socketError) {
+                    'Not tested - {0} - {1}' -f $socketError.Exception.SocketErrorCode, ($socketError.Exception.Message -replace '[\r\n]+', ' ')
                 } else {
-                    '{0} - {1}' -f $_.Exception.SocketErrorCode, $_.Exception.Message
+                    '{0} - {1}' -f $socketError.Exception.SocketErrorCode, ($socketError.Exception.Message -replace '[\r\n]+', ' ')
                 }
             }
         }
         [PSCustomObject]@{ Success = $false; Detail = $detail; Response = $null; LatencyMs = $null }
     } catch {
         $stopwatch.Stop()
-        # A raw Windows message is embedded here, so it is classified by error CODE first: an
-        # access-denied or RPC-unavailable failure means the probe never ran, and it is stamped with the
-        # script's own English "Not tested" marker so the classifiers do not depend on the localised text.
-        $detail = if (Test-mdiIsNotRunError $_) { 'Not tested - {0}' -f $_.Exception.Message } else { $_.Exception.Message }
+        # Every socket answer is taken by the typed catch above, so this one only ever sees failures
+        # that carry no SocketException at all - and none of those reached the wire. An IPv6 endpoint
+        # handed to an IPv4 socket arrives here, and used to be recorded as a measured blocked port.
+        # Stamped with the script's own English "Not tested" marker so the classifiers do not depend
+        # on the localised Windows text.
+        $detail = 'Not tested - {0}' -f $_.Exception.Message
         [PSCustomObject]@{ Success = $false; Detail = $detail; Response = $null; LatencyMs = $null }
     } finally {
         try { $udp.Close() } catch {}
@@ -1016,7 +1317,7 @@ function New-mdiDnsQueryPacket {
     $packet.AddRange([byte[]] @(0x00, 0x00))             # Authority RRs
     $packet.AddRange([byte[]] @(0x00, 0x00))             # Additional RRs
     foreach ($label in ($Name -split '\.' | Where-Object { $_ })) {
-        $labelBytes = [System.Text.Encoding]::ASCII.GetBytes($label)
+        $labelBytes = [Text.Encoding]::ASCII.GetBytes($label)
         $packet.Add([byte] $labelBytes.Length)
         $packet.AddRange($labelBytes)
     }
@@ -1031,7 +1332,7 @@ function New-mdiCldapPingPacket {
     # Connectionless LDAP (CLDAP) rootDSE base search, the same shape of request a sensor issues over UDP 389
     $berString = {
         param([byte] $Tag, [string] $Value)
-        $valueBytes = [System.Text.Encoding]::ASCII.GetBytes($Value)
+        $valueBytes = [Text.Encoding]::ASCII.GetBytes($Value)
         [byte[]] @($Tag, $valueBytes.Length) + $valueBytes
     }
     $attribute = & $berString 0x04 'namingContexts'
@@ -1050,6 +1351,192 @@ function New-mdiCldapPingPacket {
     , ([byte[]] @(0x30, $message.Length) + $message)
 }
 
+function Test-mdiDnsResponseShape {
+    param ([Parameter(Mandatory = $false)] [byte[]] $Response)
+
+    # Only the CODE and the string literals below reach the sensor server: Compress-mdiScriptText strips
+    # comments before the payload is compressed, so explanation here is free but prose in a message is not.
+    $no = { param($why) [PSCustomObject]@{ Valid = $false; Reason = $why; Detail = '' } }
+    $n = if ($null -eq $Response) { 0 } else { $Response.Length }
+    # A DNS header is 12 bytes. Anything shorter cannot be a DNS message, whatever its first bytes say.
+    if ($n -lt 12) { return & $no ('{0} byte(s) - too short for a DNS header (12 bytes)' -f $n) }
+    # QR is the top bit of the flags and is CLEAR in the query we send, so a device that merely reflects
+    # the datagram fails here. That is the point: the identifier it echoes back is the one we just sent,
+    # so the transaction-id check alone cannot tell a reflection from a real answer.
+    if (($Response[2] -band 0x80) -eq 0) { return & $no 'reflected query - the QR bit is clear, so no DNS server answered' }
+
+    $questions = ([int] $Response[4] -shl 8) -bor [int] $Response[5]
+    $answers = ([int] $Response[6] -shl 8) -bor [int] $Response[7]
+    # A response that echoes back NEITHER the question NOR any answer record is not evidence that a
+    # DNS server answered. We always send exactly one question, and RFC 1035 requires a responder to
+    # copy the question section into its reply, so a well-formed reply carries QDCOUNT >= 1 whatever
+    # its response code - including NXDOMAIN, which is a legitimate answer with zero answer records.
+    #
+    # A bare 12-byte header with the QR bit set passed every check below and was reported as
+    # "Answered by a DNS server (0 answer record(s))" on a REQUIRED port. The QR check above only
+    # catches a device that reflects our datagram verbatim; a device that emits a header of its own -
+    # a load balancer, a captive portal, a firewall synthesising replies - sets QR itself and sailed
+    # through. That is the worst possible outcome for this tool: the customer came here from the XDR
+    # alert "low success rate of active name resolution", the report told them DNS was fine, and the
+    # sensor still cannot resolve a name.
+    #
+    # Both counts are tested rather than QDCOUNT alone, so a server that answers without echoing the
+    # question - unusual, but it is the answer records that matter - is still accepted.
+    if ($questions -eq 0 -and $answers -eq 0) {
+        return & $no 'no question or answer records - not a DNS server reply'
+    }
+    # Walk the question section so a message that declares records it does not carry is caught.
+    $offset = 12
+    for ($q = 0; $q -lt $questions; $q++) {
+        while ($true) {
+            if ($offset -ge $n) { return & $no ('truncated question section ({0} bytes)' -f $n) }
+            $label = [int] $Response[$offset]
+            if ($label -eq 0) { $offset++; break }
+            if (($label -band 0xC0) -eq 0xC0) { $offset += 2; break }
+            $offset += $label + 1
+        }
+        $offset += 4
+        if ($offset -gt $n) { return & $no ('truncated question section ({0} bytes)' -f $n) }
+    }
+    if ($answers -gt 0 -and $offset -ge $n) { return & $no ('declares {0} answer record(s) but carries none' -f $answers) }
+
+    # The answer records are WALKED, not merely counted. Checking only that some bytes follow the
+    # question section caught a reply carrying zero answer bytes but accepted one carrying a single
+    # stray byte while declaring ten answers - measured: a 25-byte packet claiming 10 answers was
+    # reported as "Answered by a DNS server (10 answer record(s))". Anything that emits a plausible
+    # header - a captive portal, a load balancer, a firewall that synthesises replies - therefore
+    # passed the probe, and the report told the operator DNS name resolution was working when the
+    # sensor will get nothing usable from that server.
+    #
+    # Each resource record is NAME, TYPE(2), CLASS(2), TTL(4), RDLENGTH(2), RDATA(RDLENGTH). The name
+    # may be a label sequence, a compression pointer, or a sequence ending in one, exactly as in the
+    # question section. Only structure is checked - the contents are not this probe's business.
+    #
+    # The message is built once and reused: this function is shipped to every scanned server inside a
+    # WMI command line that has a hard 32,000-character limit, so a string repeated three times costs
+    # three times its length in a budget that a scan of a large forest genuinely exhausts.
+    $cut = 'declares {0} answer record(s) but the record data is truncated' -f $answers
+    for ($a = 0; $a -lt $answers; $a++) {
+        while ($true) {
+            if ($offset -ge $n) { return & $no $cut }
+            $label = [int] $Response[$offset]
+            if ($label -eq 0) { $offset++; break }
+            if (($label -band 0xC0) -eq 0xC0) { $offset += 2; break }
+            $offset += $label + 1
+        }
+        # TYPE, CLASS, TTL and RDLENGTH are a fixed 10 bytes before the record data begins.
+        if (($offset + 10) -gt $n) { return & $no $cut }
+        $offset += 10 + ((([int] $Response[$offset + 8]) -shl 8) -bor [int] $Response[$offset + 9])
+        if ($offset -gt $n) { return & $no $cut }
+    }
+
+    # A server that answered proves the port is open, so every response code is a success for this probe.
+    # The code is still named: a server answering REFUSED to everything breaks name resolution, and the
+    # operator cannot see that from "replied with N bytes".
+    $rcode = [int] ($Response[3] -band 0x0F)
+    $detail = if ($rcode -eq 0) { 'Answered by a DNS server ({0} answer record(s))' -f $answers }
+    elseif ($rcode -eq 3) { 'Answered by a DNS server (NXDOMAIN - the probe name does not exist, as expected)' }
+    else {
+        $names = 'NOERROR', 'FORMERR', 'SERVFAIL', 'NXDOMAIN', 'NOTIMP', 'REFUSED'
+        $name = if ($rcode -lt $names.Count) { $names[$rcode] } else { 'code {0}' -f $rcode }
+        'Reachable - the DNS server answered {0}, so the port is open but the query was not resolved' -f $name
+    }
+    [PSCustomObject]@{ Valid = $true; Reason = ''; Detail = $detail }
+}
+
+function Get-mdiBerLength {
+    param (
+        [Parameter(Mandatory = $true)] [byte[]] $Buffer,
+        [Parameter(Mandatory = $true)] [int] $Offset
+    )
+
+    # Long form is required: a rootDSE entry from a real domain controller is far larger than the 127
+    # bytes the short form can express, so a short-form-only reader would reject every genuine reply.
+    if ($Offset -ge $Buffer.Length) { return [PSCustomObject]@{ Valid = $false } }
+    $first = [int] $Buffer[$Offset]
+    if (($first -band 0x80) -eq 0) { return [PSCustomObject]@{ Valid = $true; Length = $first; ContentOffset = $Offset + 1 } }
+    $count = $first -band 0x7F
+    if ($count -eq 0 -or $count -gt 4 -or ($Offset + $count) -ge $Buffer.Length) { return [PSCustomObject]@{ Valid = $false } }
+    # Accumulated as [long]. Four length bytes of 0xFF overflow a 32-bit signed integer to -1, and the
+    # caller's truncation test then compares against a NEGATIVE length, which is smaller than anything
+    # and passes - so a packet declaring four gigabytes while carrying twelve bytes was accepted as a
+    # complete reply from a domain controller. A length that cannot fit the buffer is rejected outright.
+    $length = [long] 0
+    for ($i = 1; $i -le $count; $i++) { $length = ($length -shl 8) -bor [long] $Buffer[$Offset + $i] }
+    if ($length -lt 0 -or $length -gt $Buffer.Length) { return [PSCustomObject]@{ Valid = $false } }
+    [PSCustomObject]@{ Valid = $true; Length = [int] $length; ContentOffset = $Offset + $count + 1 }
+}
+
+function Test-mdiCldapResponseShape {
+    param (
+        [Parameter(Mandatory = $false)] [byte[]] $Response,
+        [Parameter(Mandatory = $false)] [int] $ExpectedMessageId = 1
+    )
+
+    $no = { param($why) [PSCustomObject]@{ Valid = $false; Reason = $why; Detail = '' } }
+    $n = if ($null -eq $Response) { 0 } else { $Response.Length }
+    if ($n -lt 7) { return & $no ('{0} byte(s) - too short for an LDAP message' -f $n) }
+    if ($Response[0] -ne 0x30) { return & $no ('not an LDAP message - first byte 0x{0:X2}, expected a BER SEQUENCE' -f $Response[0]) }
+
+    $envelope = Get-mdiBerLength -Buffer $Response -Offset 1
+    if (-not $envelope.Valid) { return & $no 'malformed BER length' }
+    if (($envelope.ContentOffset + $envelope.Length) -gt $n) {
+        return & $no ('truncated - declares {0} content byte(s), received {1}' -f $envelope.Length, ($n - $envelope.ContentOffset))
+    }
+    $offset = $envelope.ContentOffset
+    if ($offset -ge $n -or $Response[$offset] -ne 0x02) { return & $no 'no LDAP message ID' }
+    $idLength = Get-mdiBerLength -Buffer $Response -Offset ($offset + 1)
+    if (-not $idLength.Valid -or $idLength.Length -lt 1 -or $idLength.Length -gt 4 -or ($idLength.ContentOffset + $idLength.Length) -gt $n) {
+        return & $no 'malformed LDAP message ID'
+    }
+    $messageId = 0
+    for ($i = 0; $i -lt $idLength.Length; $i++) { $messageId = ($messageId -shl 8) -bor [int] $Response[$idLength.ContentOffset + $i] }
+    if ($messageId -ne $ExpectedMessageId) {
+        return & $no ('message ID {0} does not match the request ({1})' -f $messageId, $ExpectedMessageId)
+    }
+    $opOffset = $idLength.ContentOffset + $idLength.Length
+    if ($opOffset -ge $n) { return & $no 'no LDAP protocol operation' }
+
+    # 99 (0x63) is searchRequest, which is what THIS probe sends, so seeing it back means the datagram
+    # was reflected rather than answered. Only the three search responses prove a directory replied.
+    $op = [int] $Response[$opOffset]
+    if ($op -eq 99) { return & $no 'reflected searchRequest - the datagram came back instead of being answered' }
+    $opName = switch ($op) {
+        97 { 'bindResponse' }
+        100 { 'searchResEntry' }
+        101 { 'searchResDone' }
+        115 { 'searchResRef' }
+        120 { 'extendedResponse' }
+        default { '0x{0:X2}' -f $op }
+    }
+    if ($op -notin @(100, 101, 115)) { return & $no ('reply is a {0}, not a search response' -f $opName) }
+
+    # The operation must actually CARRY the body its tag promises. Accepting the tag alone let a
+    # 7-byte datagram - a BER sequence header, a message ID and a bare 0x65 with nothing after it -
+    # through as "Answered by a domain controller (searchResDone)". Any device that emits a few
+    # plausible bytes on UDP 389 therefore passed the probe, and the report told the operator the
+    # domain controller was answering CLDAP when nothing had. Verified against live domain
+    # controllers: real 3,017-byte rootDSE replies still pass.
+    $opLength = Get-mdiBerLength -Buffer $Response -Offset ($opOffset + 1)
+    if (-not $opLength.Valid -or $opLength.Length -le 0 -or ($opLength.ContentOffset + $opLength.Length) -gt $n) {
+        return & $no ('the {0} is empty or truncated' -f $opName)
+    }
+
+    # The port is open and a directory answered, so a non-zero result code is reported rather than failed:
+    # this probe asks whether UDP 389 is reachable, and it demonstrably is.
+    $detail = 'Answered by a domain controller ({0})' -f $opName
+    if ($op -eq 101) {
+        # RFC 4511 requires an LDAPResult to open with an ENUMERATED resultCode, so its absence means
+        # this is not a searchResDone whatever the tag claims.
+        if (($opLength.ContentOffset + 2) -ge $n -or $Response[$opLength.ContentOffset] -ne 0x0A -or
+            $Response[$opLength.ContentOffset + 1] -ne 0x01) {
+            return & $no 'the searchResDone carries no LDAP result code'
+        }
+        $code = [int] $Response[$opLength.ContentOffset + 2]
+        if ($code -ne 0) { $detail = 'Reachable - the domain controller answered LDAP result code {0}' -f $code }
+    }
+    [PSCustomObject]@{ Valid = $true; Reason = ''; Detail = $detail }
+}
 function Test-mdiNnrNetBios {
     param (
         [Parameter(Mandatory = $true)] [string] $ComputerName,
@@ -1063,33 +1550,142 @@ function Test-mdiNnrNetBios {
     $payload = New-mdiNetBiosNodeStatusPacket
     $transactionId = ([int] $payload[0] -shl 8) -bor [int] $payload[1]
     $result = Test-mdiUdpPort -ComputerName $ComputerName -Port 137 -Payload $payload -TimeoutMs $TimeoutMs -ExpectedTransactionId $transactionId
-    if ($result.Success -and $result.Response -and $result.Response.Length -gt 56) {
-        # Answer section starts after the 12-byte header, the 34-byte encoded name, 4 bytes of type/class,
-        # 4 bytes TTL and 2 bytes RDLENGTH; the first RDATA byte is the number of names returned
-        $nameCount = $result.Response[56]
-        $names = @(for ($i = 0; $i -lt $nameCount; $i++) {
-                $offset = 57 + ($i * 18)
-                if (($offset + 15) -lt $result.Response.Length) {
-                    ([System.Text.Encoding]::ASCII.GetString($result.Response, $offset, 15)).Trim()
-                }
-            }) | Select-Object -Unique
-        [PSCustomObject]@{ Success = $true
-            Detail = ('Resolved to: {0}' -f (($names | Where-Object { $_ }) -join ', '))
+
+    # A reply that could not be parsed is a FAILED resolution, not a pass-through of the transport's
+    # verdict. Test-mdiUdpPort answers a narrower question - did anything come back that echoed our
+    # transaction id - and returns Success for any datagram of four bytes or more. This function then
+    # only validated when the reply was longer than 56 bytes and let everything shorter fall through to
+    # an else branch that returned the transport's Success unchanged, so a 4, 12 or 56 byte datagram was
+    # reported as a working NetBIOS name resolution. Every guard below - zero names, truncation, blank
+    # names - lived inside that block and was therefore unreachable for exactly the replies most likely
+    # to be junk. NetBIOS is one of the four methods behind the "low success rate of active name
+    # resolution" alert this tool exists to explain, so counting a meaningless datagram as a resolution
+    # is the most misleading answer it can give.
+    if (-not $result.Success) {
+        return [PSCustomObject]@{ Success = $false; Detail = $result.Detail; LatencyMs = $result.LatencyMs }
+    }
+
+    # One failure shape for every rejection below. This function is shipped to every scanned server
+    # inside a WMI command line with a hard 32,000-character limit, and six copies of the same sentence
+    # and the same object literal cost more of that budget than the checks themselves.
+    $reject = {
+        param($why)
+        [PSCustomObject]@{ Success = $false
+            Detail = ('Replied on UDP 137 with {0}, so the address was not resolved' -f $why)
             LatencyMs = $result.LatencyMs
         }
-    } else {
-        [PSCustomObject]@{ Success = $result.Success; Detail = $result.Detail; LatencyMs = $result.LatencyMs }
+    }
+
+    # 57 bytes is the minimum that can carry a name count: 12 header, 34 encoded name, 4 type and class,
+    # 4 TTL, 2 RDLENGTH, then the count itself.
+    if (-not $result.Response -or $result.Response.Length -lt 57) {
+        return & $reject ('{0} byte(s), too short to be a node status response' -f $(if ($result.Response) { $result.Response.Length } else { 0 }))
+    }
+
+    # The HEADER is validated before any offset in the answer section is trusted. The transaction id is
+    # already checked by the transport, but that only proves the datagram is a reply to our request -
+    # and an echo of our own request satisfies it too, because the id it carries is the one we sent.
+    # Everything below reads fixed offsets in an answer section that a reflection or a padded datagram
+    # simply does not have, so a middlebox that padded our own request back to 57 bytes was parsed as
+    # though byte 56 were a name count.
+    #
+    # QR is the top bit of byte 2 and is CLEAR in the request we send, exactly as in the DNS probe, so a
+    # reflection fails here. ANCOUNT must be at least one, and the record type at offset 46 must be
+    # NBSTAT (0x0021). Verified against live domain controllers: real replies still resolve.
+    if (($result.Response[2] -band 0x80) -eq 0) { return & $reject 'our own request reflected back (the response bit is clear)' }
+    if (((([int] $result.Response[6]) -shl 8) -bor [int] $result.Response[7]) -lt 1) { return & $reject 'no answer records' }
+    if (((([int] $result.Response[46]) -shl 8) -bor [int] $result.Response[47]) -ne 0x0021) {
+        return & $reject 'an answer that is not a NetBIOS node status record'
+    }
+
+    # Answer section starts after the 12-byte header, the 34-byte encoded name, 4 bytes of type/class,
+    # 4 bytes TTL and 2 bytes RDLENGTH; the first RDATA byte is the number of names returned.
+    #
+    # The reply is validated before it is called a resolution. A node status response that declares zero
+    # names, or that declares names and then does not carry the 18 bytes each of them needs, has not
+    # resolved the address to anything - but the loop below simply produced no names in that case and
+    # the function still returned Success with the text 'Resolved to: ' and nothing after it.
+    $nameCount = $result.Response[56]
+    if ($nameCount -le 0) { return & $reject 'a node status response containing no NetBIOS names' }
+    if ($result.Response.Length -lt (57 + ($nameCount * 18))) {
+        return & $reject ('a truncated node status response - it declares {0} name(s) but carries only {1} byte(s)' -f $nameCount, $result.Response.Length)
+    }
+
+    $names = @(for ($i = 0; $i -lt $nameCount; $i++) {
+            # NUL is trimmed as well as whitespace. A NetBIOS name field is fixed at 15 bytes and is
+            # padded, and a reply padded with NUL rather than spaces survived Trim() as a string of
+            # unprintable characters - non-empty, so the blank-name guard below passed it and the
+            # function reported "Resolved to: " with nothing after the colon.
+            ([Text.Encoding]::ASCII.GetString($result.Response, (57 + ($i * 18)), 15)).Trim([char]0).Trim()
+        }) | Where-Object { $_ } | Select-Object -Unique
+
+    # A reply whose declared names are all blank padding is the same non-answer as a count of zero.
+    if (@($names).Count -eq 0) { return & $reject 'a node status response whose every NetBIOS name was blank' }
+
+    [PSCustomObject]@{ Success = $true; Detail = ('Resolved to: {0}' -f ($names -join ', ')); LatencyMs = $result.LatencyMs }
+}
+function Get-mdiPtrHostEntry {
+    <#
+        The reverse lookup itself, bounded by a timeout.
+
+        Separated from Test-mdiReverseDns so the classification logic around it can be tested by
+        shadowing this function by name. A test that patched the literal [Net.Dns]::GetHostEntry
+        call by text substitution silently stopped applying the moment the call was rewritten to the
+        asynchronous form, and the tests then passed while exercising nothing.
+
+        GetHostEntry has no timeout parameter and falls back to the resolver's own retry schedule,
+        which measured 4.5 seconds for a single unroutable address. Every other probe in the plan
+        honours a timeout, and on an estate with hundreds of NNR targets an unbounded lookup per target
+        is the difference between a scan and an overnight job. The asynchronous form lets the wait be
+        abandoned; the lookup itself cannot be cancelled, but the scan stops waiting for it.
+    #>
+    param (
+        [Parameter(Mandatory = $true)] [string] $IPAddress,
+        [Parameter(Mandatory = $false)] [int] $TimeoutMs = 3000
+    )
+
+    # The wait handle is disposed on EVERY path, including the timeout. Abandoning the IAsyncResult
+    # after WaitOne returned false left its event handle open: measured with repeated lookups against
+    # an unroutable address, the process handle count climbed steadily and never came back. A scan of
+    # an estate with hundreds of NNR targets performs one of these per target per sensor, and a
+    # scanning host that runs out of handles fails in a way that looks like the target's fault.
+    #
+    # EndGetHostEntry is deliberately NOT called on the timeout path - it blocks until the resolver
+    # finishes, which is the wait this function exists to abandon. The operation is left to complete
+    # on its own; only our handle on it is released.
+    $async = $null
+    try {
+        $async = [Net.Dns]::BeginGetHostEntry($IPAddress, $null, $null)
+        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
+            return [PSCustomObject]@{ TimedOut = $true; HostEntry = $null }
+        }
+        # Still inside the try so a resolver failure surfaces to the caller's classifier, which
+        # distinguishes "no PTR record exists" from "the lookup could not be completed".
+        [PSCustomObject]@{ TimedOut = $false; HostEntry = [Net.Dns]::EndGetHostEntry($async) }
+    } finally {
+        if ($null -ne $async -and $null -ne $async.AsyncWaitHandle) {
+            try { $async.AsyncWaitHandle.Close() } catch { }
+        }
     }
 }
 
 function Test-mdiReverseDns {
     param (
-        [Parameter(Mandatory = $true)] [string] $IPAddress
+        [Parameter(Mandatory = $true)] [string] $IPAddress,
+        [Parameter(Mandatory = $false)] [int] $TimeoutMs = 3000
     )
 
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        $hostEntry = [System.Net.Dns]::GetHostEntry($IPAddress)
+        $lookup = Get-mdiPtrHostEntry -IPAddress $IPAddress -TimeoutMs $TimeoutMs
+        if ($lookup.TimedOut) {
+            $stopwatch.Stop()
+            return [PSCustomObject]@{ Success = $false
+                Detail = ('Not tested - the reverse lookup did not answer within {0} ms, so whether a PTR record exists is unknown' -f $TimeoutMs)
+                LatencyMs = $null
+            }
+        }
+        $hostEntry = $lookup.HostEntry
         $stopwatch.Stop()
         if ($hostEntry.HostName -and $hostEntry.HostName -ne $IPAddress) {
             [PSCustomObject]@{ Success = $true; Detail = ('Resolved to {0}' -f $hostEntry.HostName); LatencyMs = [int] $stopwatch.ElapsedMilliseconds }
@@ -1098,7 +1694,39 @@ function Test-mdiReverseDns {
         }
     } catch {
         $stopwatch.Stop()
-        [PSCustomObject]@{ Success = $false; Detail = ('No PTR record - {0}' -f $_.Exception.Message.Trim()); LatencyMs = $null }
+        # A failed lookup is not the same as a missing record, and the difference decides what the
+        # operator is told to do. Observed on a live scan: a DNS server that did not answer produced
+        # "No PTR record - ... the local server did not receive a response from an authoritative
+        # server", which reads as "create the PTR record" for a record that may well already exist.
+        #
+        # Classified by SocketErrorCode, which is language-neutral - the exception MESSAGE is localised,
+        # and a text match on it is the bug this project has already shipped twice.
+        #   HostNotFound (11001) and NoData (11004): the resolver got an authoritative answer and there
+        #   is no PTR record. That is a real, measured failure.
+        #   TryAgain (11002), NoRecovery (11003), timeouts, network failures: nothing was learned about
+        #   the record, so this is an unmeasured probe. The detail is worded to match
+        #   $script:mdiPortNotTestedPattern so the tri-state logic routes it to "not tested" rather than
+        #   counting it as a name that failed to resolve.
+        $socketError = $null
+        $candidate = $_.Exception
+        $depth = 0
+        while ($candidate -and $depth -lt 8) {
+            if ($candidate -is [Net.Sockets.SocketException]) { $socketError = $candidate.SocketErrorCode; break }
+            $candidate = $candidate.InnerException
+            $depth++
+        }
+        $message = $_.Exception.Message.Trim()
+        if ([int] $socketError -in 11001, 11004) {
+            [PSCustomObject]@{ Success = $false
+                Detail = 'No PTR record - verify the Reverse Lookup Zone exists and is populated'
+                LatencyMs = [int] $stopwatch.ElapsedMilliseconds
+            }
+        } else {
+            [PSCustomObject]@{ Success = $false
+                Detail = ('Not tested - the reverse lookup could not be completed, so whether a PTR record exists is unknown: {0}' -f $message)
+                LatencyMs = $null
+            }
+        }
     }
 }
 
@@ -1111,7 +1739,7 @@ function Test-mdiCloudConnectivity {
     try {
         # TLS 1.2 is required by the Defender for Identity cloud service and is not the default on older platforms
         try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch {}
-        $request = [System.Net.WebRequest]::Create($Url)
+        $request = [Net.WebRequest]::Create($Url)
         $request.Method = 'GET'
         $request.Timeout = $TimeoutMs
         $request.UserAgent = 'Test-MdiReadiness'
@@ -1119,7 +1747,7 @@ function Test-mdiCloudConnectivity {
         $statusCode = [int] $response.StatusCode
         $response.Close()
         [PSCustomObject]@{ Success = $true; Detail = ('HTTPS connection established (HTTP {0})' -f $statusCode) }
-    } catch [System.Net.WebException] {
+    } catch [Net.WebException] {
         $webException = $_.Exception
         if ($webException.Response) {
             # Any HTTP status answer means the TLS session was established end to end, which is what we are testing.
@@ -1147,7 +1775,7 @@ function Test-mdiLocalTcpListener {
     )
 
     try {
-        $listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+        $listeners = [Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
         @($listeners | Where-Object { $_.Port -eq $Port })
     } catch {
         @()
@@ -1160,7 +1788,7 @@ function Test-mdiLocalUdpListener {
     )
 
     try {
-        $listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveUdpListeners()
+        $listeners = [Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveUdpListeners()
         $listening = @($listeners | Where-Object { $_.Port -eq $Port })
         if ($listening.Count -gt 0) {
             [PSCustomObject]@{ Success = $true; Detail = ('Listening on {0}' -f (($listening | ForEach-Object { $_.Address.ToString() }) -join ', ')) }
@@ -1174,13 +1802,28 @@ function Test-mdiLocalUdpListener {
 }
 
 function Get-mdiConfiguredDnsServer {
+    <#
+        The DNS servers this computer is configured to use.
+
+        Returns a tri-state, because "there are none" and "they could not be read" are different facts
+        and the caller has to word them differently. The function used to swallow the exception and
+        return an empty array, so a WMI failure - the RPC server unavailable, access denied, the
+        service stopped - was indistinguishable from a machine with no DNS configured. The caller then
+        marked both REQUIRED DNS probes non-applicable and asserted "No DNS servers are configured on
+        this server", which removed them from the report entirely: neither passed, nor failed, nor
+        counted as untested, and the readiness summary came back clean with two mandatory checks that
+        had never happened.
+    #>
+    $result = [PSCustomObject]@{ Servers = @(); Measured = $true; Detail = $null }
     try {
         $adapters = Get-WmiObject -Namespace 'root\cimv2' -Class 'Win32_NetworkAdapterConfiguration' `
             -Filter 'IPEnabled=True' -ErrorAction Stop
-        @($adapters | ForEach-Object { $_.DNSServerSearchOrder } | Where-Object { $_ } | Select-Object -Unique)
+        $result.Servers = @($adapters | ForEach-Object { $_.DNSServerSearchOrder } | Where-Object { $_ } | Select-Object -Unique)
     } catch {
-        @()
+        $result.Measured = $false
+        $result.Detail = $_.Exception.Message.Trim()
     }
+    $result
 }
 
 function Invoke-mdiPortProbePlan {
@@ -1189,7 +1832,8 @@ function Invoke-mdiPortProbePlan {
     )
 
     $timeoutMs = [int] $Plan.TimeoutMs
-    $dnsServers = @(Get-mdiConfiguredDnsServer)
+    $dnsLookup = Get-mdiConfiguredDnsServer
+    $dnsServers = @($dnsLookup.Servers)
     # ArrayList rather than Generic.List[object]: converting a Generic.List[object] with @() throws
     # "Argument types do not match" on some Windows PowerShell 5.1 builds (for example 5.1.20348.4294).
     $results = New-Object -TypeName System.Collections.ArrayList
@@ -1249,7 +1893,16 @@ function Invoke-mdiPortProbePlan {
             }
 
             'DnsServer' {
-                if ($dnsServers.Count -eq 0) {
+                if ($dnsLookup.Measured -ne $true) {
+                    # The list could not be READ, so the probe never ran. Applicable stays $true and the
+                    # detail carries a "Not tested" marker, which is what routes it to the unmeasured
+                    # path rather than out of the report altogether. Marking it non-applicable would
+                    # drop a REQUIRED probe silently, which is how this was found.
+                    & $addResult $probe 'DNS servers' $null ([PSCustomObject]@{
+                            Success = $false
+                            Detail = ('Not tested - the configured DNS servers could not be read from this computer: {0}' -f $dnsLookup.Detail)
+                        })
+                } elseif ($dnsServers.Count -eq 0) {
                     & $addResult $probe 'DNS servers' $null ([PSCustomObject]@{ Detail = 'No DNS servers are configured on this server' }) $false
                 } else {
                     foreach ($dnsServer in $dnsServers) {
@@ -1258,7 +1911,8 @@ function Invoke-mdiPortProbePlan {
                         } else {
                             $dnsPayload = New-mdiDnsQueryPacket -Name $Plan.DnsProbeName
                             Test-mdiUdpPort -ComputerName $dnsServer -Port $probe.Port -TimeoutMs $timeoutMs `
-                                -Payload $dnsPayload -ExpectedTransactionId ((([int] $dnsPayload[0]) -shl 8) -bor [int] $dnsPayload[1])
+                                -Payload $dnsPayload -ExpectedTransactionId ((([int] $dnsPayload[0]) -shl 8) -bor [int] $dnsPayload[1]) `
+                                -ResponseValidator { param($bytes) Test-mdiDnsResponseShape -Response $bytes }
                         }
                         & $addResult $probe $dnsServer $dnsServer $outcome
                     }
@@ -1269,7 +1923,12 @@ function Invoke-mdiPortProbePlan {
                 foreach ($target in $Plan.NnrTargets) {
                     $outcome = switch ($probe.Id) {
                         'NnrNetBios' { Test-mdiNnrNetBios -ComputerName $target.IP -TimeoutMs $timeoutMs }
-                        'NnrReverseDns' { Test-mdiReverseDns -IPAddress $target.IP }
+                        # -TimeoutMs passed, like its NetBIOS sibling one line above. Without it this
+                        # probe silently kept its own 3000 ms default, so -PortProbeTimeoutMs moved
+                        # every other probe in the plan and left this one alone: an operator raising
+                        # the timeout for a slow WAN link still got "not tested" from reverse DNS, and
+                        # one lowering it to keep a large scan short still paid 3 seconds per target.
+                        'NnrReverseDns' { Test-mdiReverseDns -IPAddress $target.IP -TimeoutMs $timeoutMs }
                         default { Test-mdiTcpPort -ComputerName $target.IP -Port $probe.Port -TimeoutMs $timeoutMs }
                     }
                     & $addResult $probe $target.Name $target.IP $outcome
@@ -1281,18 +1940,14 @@ function Invoke-mdiPortProbePlan {
                     $outcome = if ($probe.Protocol -eq 'TCP') {
                         Test-mdiTcpPort -ComputerName $target.IP -Port $probe.Port -TimeoutMs $timeoutMs
                     } else {
-                        # CLDAP carries its messageID inside BER rather than in the first two bytes, so
-                        # the generic identifier check does not apply. The reply is validated by shape
-                        # below instead: it must be a BER SEQUENCE.
-                        $outcome = Test-mdiUdpPort -ComputerName $target.IP -Port $probe.Port -TimeoutMs $timeoutMs `
-                            -Payload (New-mdiCldapPingPacket)
-                        if ($outcome.Success -and @($outcome.Response).Count -gt 0 -and $outcome.Response[0] -ne 0x30) {
-                            $outcome = [PSCustomObject]@{ Success = $false
-                                Detail = 'Invalid reply - not an LDAP message (the first byte is not a BER SEQUENCE)'
-                                Response = $outcome.Response; LatencyMs = $outcome.LatencyMs
-                            }
-                        }
-                        $outcome
+                        # CLDAP carries its message ID inside BER rather than in the first two bytes, so
+                        # the generic identifier check does not apply. The reply is parsed instead: it
+                        # must be a well-formed LDAP message, carry the message ID this probe sent, and
+                        # hold a search RESPONSE. Checking only for a leading BER SEQUENCE accepted our
+                        # own request reflected back, because the packet we send starts with one.
+                        Test-mdiUdpPort -ComputerName $target.IP -Port $probe.Port -TimeoutMs $timeoutMs `
+                            -Payload (New-mdiCldapPingPacket) `
+                            -ResponseValidator { param($bytes) Test-mdiCldapResponseShape -Response $bytes }
                     }
                     & $addResult $probe $target.Name $target.IP $outcome
                 }
@@ -1323,15 +1978,196 @@ function Compress-mdiScriptText {
     # are never touched. This keeps the generated command line comfortably inside the Win32_Process.Create limit.
     $tokens = $null
     $parseErrors = $null
-    [void] [System.Management.Automation.Language.Parser]::ParseInput($ScriptText, [ref] $tokens, [ref] $parseErrors)
+    [void] [Management.Automation.Language.Parser]::ParseInput($ScriptText, [ref] $tokens, [ref] $parseErrors)
     if ($parseErrors) { return $ScriptText }
 
     $builder = New-Object -TypeName System.Text.StringBuilder -ArgumentList $ScriptText
     foreach ($comment in @($tokens | Where-Object { $_.Kind -eq 'Comment' } | Sort-Object { $_.Extent.StartOffset } -Descending)) {
         [void] $builder.Remove($comment.Extent.StartOffset, $comment.Extent.EndOffset - $comment.Extent.StartOffset)
     }
+    $decommented = $builder.ToString()
 
-    (($builder.ToString() -split "`r?`n" | ForEach-Object { $_.TrimEnd() } | Where-Object { $_ }) -join "`n")
+    # Blank lines, trailing whitespace and leading indentation are all removed as well. PowerShell does
+    # not care about any of them, and the command line this ends up in has a hard length limit that an
+    # ordinary forest was already close to - the indentation of the shipped functions alone is around
+    # 6,800 characters, worth roughly 1,700 of command line after compression. That is the difference
+    # between a plan that fits and one that has to be written to the server as a file.
+    #
+    # NONE of it is applied inside a string that spans lines. There the indentation, the trailing
+    # spaces, the blank lines and the line endings are all CONTENT, and changing any of them silently
+    # rewrites the text of a message an operator reads.
+    #
+    # That boundary is decided ONCE, from the token stream of the de-commented text, and every line is
+    # then rewritten in a single pass over that SAME text - so the line numbers the tokenizer reported
+    # still address the lines being rewritten. Trimming first and tokenizing the result afterwards,
+    # which is what this did, deleted the blank line and the trailing spaces inside a here-string
+    # BEFORE the protection was ever computed: a two-paragraph operator message came out as one
+    # paragraph, and the guard that exists precisely to prevent that only ever saw the damaged text.
+    # Proven by compressing a function whose here-string holds a blank line and executing both copies.
+    $stringTokens = $null
+    $stringErrors = $null
+    [void] [Management.Automation.Language.Parser]::ParseInput($decommented, [ref] $stringTokens, [ref] $stringErrors)
+    if ($stringErrors) { return $decommented }
+    $literalLines = New-Object -TypeName 'System.Collections.Generic.HashSet[int]'
+    foreach ($token in @($stringTokens | Where-Object {
+                $_ -is [Management.Automation.Language.StringToken] -and
+                $_.Extent.EndLineNumber -gt $_.Extent.StartLineNumber
+            })) {
+        # STRING tokens only. Filtering on "spans more than one line" alone matched every NewLine
+        # token - a newline starts on one line and ends on the next - so every line in the file was
+        # treated as string content and nothing was ever trimmed.
+        #
+        # The first line holds the opening quote, so its indentation is code; every later line is content.
+        for ($line = $token.Extent.StartLineNumber + 1; $line -le $token.Extent.EndLineNumber; $line++) {
+            [void] $literalLines.Add($line)
+        }
+    }
+
+    # Split KEEPING the line terminators - a capturing group makes Regex.Split emit the separators as
+    # well - so a protected line can be written back with the exact ending it had. Splitting on
+    # "`r?`n" and re-joining with "`n" rewrote every CRLF inside a here-string to LF, which is the same
+    # class of silent content change as dropping the blank line.
+    $parts = [regex]::Split($decommented, "(`r`n|`n|`r)")
+    $result = New-Object -TypeName System.Text.StringBuilder
+    $lineNumber = 0
+    for ($index = 0; $index -lt $parts.Count; $index += 2) {
+        $lineNumber++
+        $content = $parts[$index]
+        $eol = if (($index + 1) -lt $parts.Count) { $parts[$index + 1] } else { '' }
+        if ($literalLines.Contains($lineNumber)) {
+            [void] $result.Append($content).Append($eol)
+            continue
+        }
+        $trimmed = $content.Trim()
+        # A line outside a literal that holds nothing but whitespace carries no code, so it goes
+        # entirely - its line ending with it, which is what actually saves the characters.
+        if ($trimmed.Length -eq 0) { continue }
+        [void] $result.Append($trimmed)
+        if ($eol.Length -gt 0) { [void] $result.Append("`n") }
+    }
+    $result.ToString()
+}
+
+function Get-mdiMissingShippedFunction {
+    <#
+        The mdi functions the given script text CALLS but does not DEFINE.
+
+        Used to prove the remote probe script is self-contained before it is sent. The command names
+        are taken from the parsed AST rather than by matching text, so a name inside a string or a
+        comment is not mistaken for a call.
+    #>
+    param ([Parameter(Mandatory = $true)] [string] $ScriptText)
+
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput($ScriptText, [ref] $tokens, [ref] $parseErrors)
+    if ($parseErrors) { return @() }
+
+    $defined = New-Object -TypeName 'System.Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($definition in $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+        [void] $defined.Add($definition.Name)
+    }
+    $called = New-Object -TypeName 'System.Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($command in $ast.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] }, $true)) {
+        $name = $command.GetCommandName()
+        # Only this script's own helpers. A cmdlet or an external executable is expected to be absent.
+        if ($name -and $name -match '^(Get|Set|New|Test|Invoke|ConvertTo|ConvertFrom|Merge|Copy|Write|Resolve|Add|Remove)-mdi') {
+            [void] $called.Add($name)
+        }
+    }
+    @(@($called) | Where-Object { -not $defined.Contains($_) } | Sort-Object)
+}
+
+function Get-mdiSlimProbePlan {
+    <#
+        The plan with only the fields the remote probe script actually reads.
+
+        The plan is base64-encoded into the command line, and base64 does not compress, so every
+        character of it costs roughly 3.5 characters of command line - against a Win32_Process.Create
+        limit the generated command is already close to. The probe table carries documentation with
+        each entry (Notes runs to a full sentence per probe, SensorVersion to a version list) which the
+        sensor server never looks at: Invoke-mdiPortProbePlan reads Id, Protocol, Port and Scope, and
+        $addResult copies Id, Name, Protocol, Port, Scope, Group and Requirement onto each result.
+        Shipping the documentation as well cost about 8,000 characters of command line and pushed a
+        perfectly ordinary single-domain-controller scan over the limit.
+
+        Projected rather than pruned in place: $Plan belongs to the caller, is reused for the local
+        probe run and is written into the report, so removing fields from it would lose the very
+        documentation the report shows.
+    #>
+    param ([Parameter(Mandatory = $true)] [object] $Plan)
+
+    $slim = [ordered]@{}
+    foreach ($property in $Plan.PSObject.Properties) {
+        if ($property.Name -eq 'Probes') { continue }
+        $slim[$property.Name] = $property.Value
+    }
+    $slim['Probes'] = @(@($Plan.Probes) | Where-Object { $_ } |
+            Select-Object -Property Id, Name, Protocol, Port, Scope, Group, Requirement)
+    [PSCustomObject] $slim
+}
+
+function Get-mdiPortProbeScriptText {
+    param (
+        [Parameter(Mandatory = $true)] [object] $Plan,
+        [Parameter(Mandatory = $true)] [string] $OutputFile
+    )
+
+    # Split out from Get-mdiPortProbeCommandLine so the same script can either be embedded in the command
+    # line or written to the server as a file when it is too large to embed.
+    $functionNames = @(
+        'Test-mdiIsNotRunError',
+        'Test-mdiTcpPort', 'Test-mdiUdpPort', 'New-mdiNetBiosNodeStatusPacket', 'New-mdiDnsQueryPacket',
+        'New-mdiCldapPingPacket', 'Test-mdiNnrNetBios', 'Test-mdiReverseDns', 'Get-mdiPtrHostEntry',
+        'Test-mdiCloudConnectivity',
+        'Test-mdiDnsResponseShape', 'Get-mdiBerLength', 'Test-mdiCldapResponseShape',
+        'Test-mdiLocalTcpListener', 'Test-mdiLocalUdpListener', 'Get-mdiConfiguredDnsServer', 'Invoke-mdiPortProbePlan'
+    )
+    # Every probe primitive is shipped, including Test-mdiCloudConnectivity even when no workspace was
+    # given. Excluding it saves about 1,400 characters of a command line that is already close to the
+    # Win32_Process.Create limit, and its only call site is guarded by the same "is there a sensor API
+    # URL" condition - so at run time it could never be reached. But the reference is still THERE in
+    # the shipped code, and a static guarantee that the script is self-contained is worth more than the
+    # bytes: with the exclusion in place the completeness check below cannot distinguish "deliberately
+    # left out because it cannot run" from "forgotten", which is exactly the mistake it exists to
+    # catch. Plans too large for a command line are handled by writing the script to the server
+    # instead, which has no length limit at all.
+    # The Function provider does not support -Raw, so the body is taken from the command definition
+    $definitions = ($functionNames | ForEach-Object {
+            'function {0} {{{1}}}' -f $_, (Get-Command -Name $_ -CommandType Function).Definition
+        }) -join [environment]::NewLine
+
+    # Every mdi function the shipped code CALLS has to be shipped with it. A helper added locally but
+    # left out of this list makes the remote probe die on its first call with "The term ... is not
+    # recognized", which the caller reads as a server it could not measure - a silent loss of the whole
+    # port scan for that server, reported as an unmeasurable host rather than as a defect. That is not
+    # hypothetical: three parser helpers were added and the list was very nearly not updated.
+    #
+    # Checked here rather than trusted to review, because the cost of the check is a few milliseconds
+    # and the cost of the mistake is an entire scan quietly measuring nothing. It also makes it safe to
+    # SHRINK the shipped set - the command line has a hard length limit, so dropping a function that
+    # cannot run is worth doing, and this turns "did I break the remote probe?" into a caught error.
+    $missing = Get-mdiMissingShippedFunction -ScriptText $definitions
+    if ($missing.Count -gt 0) {
+        throw ('The remote probe script calls {0} which is not shipped with it. Add it to $functionNames in Get-mdiPortProbeScriptText.' -f ($missing -join ', '))
+    }
+
+    $planJson = (Get-mdiSlimProbePlan -Plan $Plan) | ConvertTo-Json -Depth 6 -Compress
+    $planB64 = [convert]::ToBase64String([text.encoding]::UTF8.GetBytes($planJson))
+
+    Compress-mdiScriptText -ScriptText (@'
+{0}
+$plan = ConvertFrom-Json ([text.encoding]::UTF8.GetString([convert]::FromBase64String('{1}')))
+$result = Invoke-mdiPortProbePlan -Plan $plan
+$json = $result | ConvertTo-Json -Depth 4 -Compress
+# Written WITH a byte order mark. The caller reads this file back with Get-Content, which on Windows
+# PowerShell 5.1 decodes as the ANSI code page unless a BOM tells it otherwise - so a BOM-less UTF-8
+# file came back mojibake: a target named "dc-muenchen" spelled with an umlaut arrived as two ANSI
+# characters, and a Windows error message in Cyrillic or Japanese was destroyed outright. The reader
+# is shared with other producers (auditpol writes its own CSV through the same path), so the BOM is
+# added here at the writer rather than forcing an encoding on the reader.
+[io.file]::WriteAllText('{2}', $json, (New-Object text.utf8encoding $true))
+'@ -f $definitions, $planB64, ($OutputFile -replace "'", "''"))
 }
 
 function Get-mdiPortProbeCommandLine {
@@ -1340,33 +2176,11 @@ function Get-mdiPortProbeCommandLine {
         [Parameter(Mandatory = $true)] [string] $OutputFile
     )
 
-    # The probe primitives are shipped to the sensor server verbatim, so the remote test uses exactly the same logic
-    # as the local one. This tests the true sensor -> target direction, which is what MDI requires.
-    $functionNames = @(
-        'Test-mdiIsNotRunError',
-        'Test-mdiTcpPort', 'Test-mdiUdpPort', 'New-mdiNetBiosNodeStatusPacket', 'New-mdiDnsQueryPacket',
-        'New-mdiCldapPingPacket', 'Test-mdiNnrNetBios', 'Test-mdiReverseDns', 'Test-mdiCloudConnectivity',
-        'Test-mdiLocalTcpListener', 'Test-mdiLocalUdpListener', 'Get-mdiConfiguredDnsServer', 'Invoke-mdiPortProbePlan'
-    )
-    # The Function provider does not support -Raw, so the body is taken from the command definition
-    $definitions = ($functionNames | ForEach-Object {
-            'function {0} {{{1}}}' -f $_, (Get-Command -Name $_ -CommandType Function).Definition
-        }) -join [environment]::NewLine
-
-    $planJson = $Plan | ConvertTo-Json -Depth 6 -Compress
-    $planB64 = [convert]::ToBase64String([text.encoding]::UTF8.GetBytes($planJson))
-
-    $scriptText = Compress-mdiScriptText -ScriptText (@'
-{0}
-$plan = ConvertFrom-Json ([text.encoding]::UTF8.GetString([convert]::FromBase64String('{1}')))
-$result = Invoke-mdiPortProbePlan -Plan $plan
-$json = $result | ConvertTo-Json -Depth 4 -Compress
-[io.file]::WriteAllText('{2}', $json, (New-Object text.utf8encoding $false))
-'@ -f $definitions, $planB64, ($OutputFile -replace "'", "''"))
+    $scriptText = Get-mdiPortProbeScriptText -Plan $Plan -OutputFile $OutputFile
 
     # gzip + base64 keeps the generated command line well inside the Win32_Process.Create limit
     $memoryStream = New-Object -TypeName System.IO.MemoryStream
-    $gzipStream = New-Object -TypeName System.IO.Compression.GzipStream -ArgumentList $memoryStream, ([System.IO.Compression.CompressionMode]::Compress)
+    $gzipStream = New-Object -TypeName System.IO.Compression.GzipStream -ArgumentList $memoryStream, ([IO.Compression.CompressionMode]::Compress)
     $scriptBytes = [text.encoding]::UTF8.GetBytes($scriptText)
     $gzipStream.Write($scriptBytes, 0, $scriptBytes.Length)
     $gzipStream.Close()
@@ -1384,11 +2198,45 @@ Invoke-Expression ($r.ReadToEnd())
     $commandLine = 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {0}' -f
     [convert]::ToBase64String([text.encoding]::Unicode.GetBytes($stub))
 
-    # Win32_Process.Create rejects command lines longer than 32767 characters
+    # Win32_Process.Create rejects command lines longer than 32767 characters. -EncodedCommand costs
+    # 2.67 bytes of command line per byte of stub (UTF-16 doubles it, then base64 adds a third), so a
+    # large forest reaches this ceiling. The caller answers it by writing the script to the server
+    # instead; this stays a hard failure so that nothing silently measures fewer targets than asked.
     if ($commandLine.Length -ge 32000) {
         throw ('The generated port probe command line is too long ({0} characters). Reduce the number of targets with -MaxNnrTargets and -MaxLdapTargetsPerDomain.' -f $commandLine.Length)
     }
     $commandLine
+}
+
+function New-mdiRemoteScriptFile {
+    param (
+        [Parameter(Mandatory = $true)] [string] $ComputerName,
+        [Parameter(Mandatory = $true)] [string] $ScriptText,
+        [Parameter(Mandatory = $true)] [string] $Folder
+    )
+
+    # Used only when the script will not fit in a command line. The results of every remote check are
+    # already read back over the administrative share, so this needs no access the script did not
+    # already require - and when the share is unavailable the caller keeps the original hard failure
+    # rather than quietly measuring less.
+    try {
+        $remotePath = Join-Path -Path $Folder -ChildPath ('mdi-probe-{0}.ps1' -f [guid]::NewGuid().GUID)
+        # Explicit construction, not a regex replacement: see the matching note in
+        # Invoke-mdiRemoteCommand. A computer name containing $1, $&, $$, $` or $' would otherwise be
+        # expanded as a substitution token and rewrite the UNC path.
+        $uncDrive = [regex]::Match([string] $remotePath, '^([A-Za-z]):(.*)$')
+        $uncPath = if ($uncDrive.Success) {
+            '\\' + $ComputerName + '\' + $uncDrive.Groups[1].Value + '$' + $uncDrive.Groups[2].Value
+        } else {
+            $remotePath
+        }
+        # A BOM so the remote powershell.exe does not decode a non-ASCII target name using the ANSI code page.
+        [IO.File]::WriteAllText($uncPath, $ScriptText, (New-Object System.Text.UTF8Encoding $true))
+        [PSCustomObject]@{ RemotePath = $remotePath; UncPath = $uncPath }
+    } catch {
+        Write-mdiVerbose ('Unable to write the port probe script to {0}: {1}' -f $ComputerName, $_.Exception.Message)
+        $null
+    }
 }
 
 function Get-mdiRequiredPorts {
@@ -1422,7 +2270,7 @@ function Get-mdiRequiredPorts {
     # is therefore never sent to open a firewall for a port the cap prevented from being probed.
     $maxBudgetSeconds = 1800
     if ($timeoutSeconds -gt $maxBudgetSeconds) {
-        Write-Warning ('The port-probe budget for {0} is {1}s ({2} probe(s) against {3} target(s)). Capping at {4}s to avoid a scan measured in days; anything not measured in that time is reported as not tested, not as blocked. Reduce the work with -MaxNnrTargets and -MaxLdapTargetsPerDomain.' -f
+        Write-mdiWarning ('The port-probe budget for {0} is {1}s ({2} probe(s) against {3} target(s)). Capping at {4}s to avoid a scan measured in days; anything not measured in that time is reported as not tested, not as blocked. Reduce the work with -MaxNnrTargets and -MaxLdapTargetsPerDomain.' -f
             $ComputerName, $timeoutSeconds, $probeCount, $targetCount, $maxBudgetSeconds)
         $timeoutSeconds = $maxBudgetSeconds
     }
@@ -1430,9 +2278,28 @@ function Get-mdiRequiredPorts {
         $timeoutSeconds, $probeCount, $targetCount, $ComputerName)
 
     $outputFile = Join-Path -Path (Get-mdiRemoteTempFolder -ComputerName $ComputerName) -ChildPath ('mdi-ports-{0}.json' -f [guid]::NewGuid().GUID)
-    $commandLine = Get-mdiPortProbeCommandLine -Plan $Plan -OutputFile $outputFile
+    # A large forest can generate a probe script that will not fit in a command line. Rather than refuse
+    # to measure - which is what this used to do - the script is written to the server and run from
+    # there. The command line stays the delivery mechanism everywhere it fits, so the path that every
+    # environment already exercises is unchanged, and only the case that previously failed outright
+    # takes the new route. If the share is unavailable the original error is raised unchanged.
+    $scriptFile = $null
+    try {
+        $commandLine = Get-mdiPortProbeCommandLine -Plan $Plan -OutputFile $outputFile
+    } catch {
+        $scriptFile = New-mdiRemoteScriptFile -ComputerName $ComputerName `
+            -ScriptText (Get-mdiPortProbeScriptText -Plan $Plan -OutputFile $outputFile) `
+            -Folder (Split-Path -Path $outputFile -Parent)
+        if ($null -eq $scriptFile) { throw }
+        Write-mdiVerbose ('The port probe script for {0} is too large for a command line and was written to {1}' -f $ComputerName, $scriptFile.RemotePath)
+        $commandLine = 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $scriptFile.RemotePath
+    }
 
-    $raw = Invoke-mdiRemoteCommand -ComputerName $ComputerName -CommandLine $commandLine -LocalFile $outputFile -TimeoutSeconds $timeoutSeconds
+    try {
+        $raw = Invoke-mdiRemoteCommand -ComputerName $ComputerName -CommandLine $commandLine -LocalFile $outputFile -TimeoutSeconds $timeoutSeconds
+    } finally {
+        if ($null -ne $scriptFile) { Remove-Item -Path $scriptFile.UncPath -Force -ErrorAction SilentlyContinue }
+    }
     $probeSource = 'Sensor server (outbound)'
     $usedFallback = $false
 
@@ -1642,7 +2509,7 @@ function Resolve-mdiNnrTarget {
                 # fails resolution for half its traffic - which a single-address probe cannot see.
                 $addresses = @(Get-mdiComputerAddress -ComputerName $name -KnownAddress $knownIp)
                 if ($addresses.Count -eq 0) {
-                    Write-Warning ('Unable to resolve the NNR target computer {0}' -f $name)
+                    Write-mdiWarning ('Unable to resolve the NNR target computer {0}' -f $name)
                 } else {
                     foreach ($address in $addresses) {
                         [PSCustomObject]@{ Name = $name; IP = $address; MultiHomed = ($addresses.Count -gt 1) }
@@ -1816,7 +2683,7 @@ function Get-mdiForestDomain {
         }
     }
 
-    Write-Warning ('Unable to enumerate the forest domains over Active Directory Web Services or LDAP, falling back to the single domain {0}: {1}. Any other domain in this forest has NOT been examined.' -f $Domain, $reason)
+    Write-mdiWarning ('Unable to enumerate the forest domains over Active Directory Web Services or LDAP, falling back to the single domain {0}: {1}. Any other domain in this forest has NOT been examined.' -f $Domain, $reason)
     [PSCustomObject]@{
         Name     = $Domain
         Domains  = @($Domain)
@@ -1841,7 +2708,7 @@ function Get-mdiComputerAddress {
         Both of the ways this script previously learned an address return exactly one:
           - Get-ADComputer's IPv4Address property is a single value, and which one it holds depends on
             registration order, not on which interface matters.
-          - [System.Net.Dns]::GetHostAddresses(...)[0] takes an arbitrary entry out of several A
+          - [Net.Dns]::GetHostAddresses(...)[0] takes an arbitrary entry out of several A
             records - and a different one on each call when DNS round-robins, so two runs against an
             unchanged environment disagreed with each other.
 
@@ -1861,8 +2728,8 @@ function Get-mdiComputerAddress {
     if (-not [string]::IsNullOrWhiteSpace($KnownAddress)) { [void] $addresses.Add($KnownAddress.Trim()) }
 
     try {
-        foreach ($address in [System.Net.Dns]::GetHostAddresses($ComputerName)) {
-            if ($address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+        foreach ($address in [Net.Dns]::GetHostAddresses($ComputerName)) {
+            if ($address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
                 [void] $addresses.Add($address.IPAddressToString)
             }
         }
@@ -1955,16 +2822,56 @@ function Resolve-mdiDomainController {
     # told apart from a domain that genuinely has no matching servers.
     $reason = $null
     try {
-        $viaAdws = @(Get-ADDomainController -Server $Domain -Filter * -ErrorAction Stop | ForEach-Object {
+        # Rows whose HostName is blank are discarded HERE, before the count is taken.
+        #
+        # The count used to be of ROWS returned, not of usable names, and a domain controller record
+        # can legitimately arrive without a HostName - a replication gap, an RODC whose dNSHostName
+        # has not populated, a partially-created object. Those rows counted towards "ADWS worked",
+        # so the LDAP fallback was never tried, and every later stage discarded them again for
+        # having no name. Measured with four ADWS rows of which two were blank: two domain
+        # controllers were scanned and no warning was raised. With all rows blank the result was
+        # worse - the domain reported zero servers, LDAP was never called, and nothing anywhere said
+        # discovery had failed, so a domain that HAS domain controllers looked like a domain that
+        # simply has none.
+        #
+        # Name is the fallback for HostName. Get-ADDomainController returns the short name in Name
+        # even when dNSHostName is empty, and a short name still resolves inside the domain, so it
+        # is a better answer than dropping the server. The domain is appended when the short name
+        # carries no dot, which is what every later lookup expects.
+        $adwsRows = @(Get-ADDomainController -Server $Domain -Filter * -ErrorAction Stop)
+        $blankName = 0
+        $viaAdws = @($adwsRows | ForEach-Object {
+                $dnsName = [string] $_.HostName
+                if ([string]::IsNullOrWhiteSpace($dnsName)) {
+                    $shortName = [string] $_.Name
+                    if ([string]::IsNullOrWhiteSpace($shortName)) { $blankName++; return }
+                    $dnsName = if ($shortName -like '*.*') { $shortName } else { '{0}.{1}' -f $shortName, $Domain }
+                }
                 [PSCustomObject]@{
-                    Name = [string] $_.HostName
+                    Name = $dnsName
                     IP   = [string] $_.IPv4Address
                 }
             })
-        if ($viaAdws.Count -gt 0) {
-            return [PSCustomObject]@{ Servers = $viaAdws; Method = 'ADWS'; Error = $null }
+        if ($blankName -gt 0) {
+            Write-mdiWarning ('{0} domain controller record(s) in {1} carry neither a DNS host name nor a name and could not be scanned.' -f $blankName, $Domain)
         }
-        $reason = 'the query succeeded but returned no domain controllers'
+        if ($viaAdws.Count -gt 0) {
+            # The count of records that were LOST travels with the result. It used to exist only as a
+            # console warning, so a PARTIAL loss vanished from the report entirely: four DC records of
+            # which two are nameless produced a report programmatically identical to a genuinely
+            # two-DC domain, and because the lost pair left the denominator as well as the numerator
+            # the score ROSE - 4/8 = 50% became 4/6 = 66% for having discovered less of the estate.
+            # That is the "losing a measurement improves the headline" failure this codebase keeps
+            # producing, on the object the script's own comments call the most damaging one to lose.
+            return [PSCustomObject]@{ Servers = $viaAdws; Method = 'ADWS'; Error = $null; Unnamed = $blankName }
+        }
+        # Rows came back but none of them yielded a usable name. That is a failed enumeration, not an
+        # empty domain, so it must fall through to LDAP exactly as an exception does.
+        $reason = if ($adwsRows.Count -gt 0) {
+            'the query returned {0} record(s) but none carried a usable host name' -f $adwsRows.Count
+        } else {
+            'the query succeeded but returned no domain controllers'
+        }
     } catch {
         $reason = $_.Exception.Message
     }
@@ -1973,10 +2880,10 @@ function Resolve-mdiDomainController {
     $viaLdap = @(Get-mdiDomainControllerFromLdap -Domain $Domain)
     if ($viaLdap.Count -gt 0) {
         Write-mdiVerbose ('Found {0} domain controller(s) in {1} over LDAP' -f $viaLdap.Count, $Domain)
-        return [PSCustomObject]@{ Servers = $viaLdap; Method = 'LDAP'; Error = $null }
+        return [PSCustomObject]@{ Servers = $viaLdap; Method = 'LDAP'; Error = $null; Unnamed = 0 }
     }
 
-    [PSCustomObject]@{ Servers = @(); Method = 'None'; Error = $reason }
+    [PSCustomObject]@{ Servers = @(); Method = 'None'; Error = $reason; Unnamed = 0 }
 }
 
 function Get-mdiDomainControllerInventory {
@@ -1995,7 +2902,7 @@ function Get-mdiDomainControllerInventory {
     @(foreach ($domainName in $Domain) {
             $resolved = Resolve-mdiDomainController -Domain $domainName
             if ($resolved.Servers.Count -eq 0) {
-                Write-Warning ('Unable to enumerate the domain controllers of {0} over Active Directory Web Services or LDAP: {1}' -f $domainName, $resolved.Error)
+                Write-mdiWarning ('Unable to enumerate the domain controllers of {0} over Active Directory Web Services or LDAP: {1}' -f $domainName, $resolved.Error)
                 [PSCustomObject]@{
                     Name        = $null
                     IP          = $null
@@ -2013,6 +2920,28 @@ function Get-mdiDomainControllerInventory {
                 # one likely to sit on a subnet with no reverse lookup zone or a tighter firewall.
                 $addresses = @(Get-mdiComputerAddress -ComputerName $dc.Name -KnownAddress $dc.IP)
                 if ($addresses.Count -eq 0) { $addresses = @($dc.IP) | Where-Object { $_ } }
+                if ($addresses.Count -eq 0) {
+                    # The domain controller was enumerated from the directory but no IPv4 address for it
+                    # could be found: an IPv6-only host, a stale or missing A record, or a DNS server
+                    # that did not answer. The foreach below iterates an empty list, so the server was
+                    # silently dropped - never probed, never counted, and never reported as unreachable.
+                    # A domain controller vanishing from the inventory is the most damaging outcome this
+                    # tool has, because the report still reads as a complete scan of the estate.
+                    #
+                    # Emitted with a null IP so the probe planner skips it (there is nothing to probe)
+                    # while the verdict and the report still see a server that could not be tested.
+                    Write-mdiWarning ('No IPv4 address could be resolved for {0}, so it cannot be probed. It is reported as not tested rather than omitted from the scan.' -f $dc.Name)
+                    [PSCustomObject]@{
+                        Name       = $dc.Name
+                        IP         = $null
+                        Addresses  = @()
+                        MultiHomed = $false
+                        Domain     = $domainName
+                        Enumerated = $true
+                        Error      = ('No IPv4 address could be resolved for {0}' -f $dc.Name)
+                    }
+                    continue
+                }
                 foreach ($address in $addresses) {
                     [PSCustomObject]@{
                         Name       = $dc.Name
@@ -2030,8 +2959,7 @@ function Get-mdiDomainControllerInventory {
 
 #region Sensor v3.x upgrade readiness
 
-function Get-mdiRemoteRegistryResult {
-    param (
+function Get-mdiRemoteRegistryResult {    param (
         [Parameter(Mandatory = $true)] [string] $ComputerName,
         [Parameter(Mandatory = $true)] [string] $Key,
         [Parameter(Mandatory = $true)] [string] $Value
@@ -2064,17 +2992,41 @@ function Get-mdiRemoteRegistryResult {
     }
 }
 
-function Get-mdiRemoteRegistryValue {
-    param (
-        [Parameter(Mandatory = $true)] [string] $ComputerName,
-        [Parameter(Mandatory = $true)] [string] $Key,
-        [Parameter(Mandatory = $true)] [string] $Value
-    )
+# Get-mdiRemoteRegistryValue - a wrapper returning only .Value - was REMOVED for the same reason as
+# Get-mdiServiceState below: it discarded whether the read could be ANSWERED, so any caller using it
+# would collapse "the key could not be opened" into "the value is absent". It had no callers left, and
+# leaving a readability-discarding wrapper lying beside a correct one is how the Sense defect happened
+# in the first place - somebody reaches for the shorter name. Callers wanting only the value can write
+# (Get-mdiRemoteRegistryResult ...).Value and discard the rest visibly.
 
-    (Get-mdiRemoteRegistryResult -ComputerName $ComputerName -Key $Key -Value $Value).Value
-}
+# Get-mdiServiceState - a wrapper returning only .Service - was REMOVED rather than left unused.
+#
+# It discarded whether the query could be answered, so every caller that used it silently collapsed
+# "access denied" into "the service is not installed". That shipped: the v3.x readiness check told
+# administrators to onboard servers to Defender for Endpoint on the strength of a service list it had
+# never been allowed to read, while the check immediately below it - reading the same list through
+# the Result variant - correctly reported N/A. Two checks, one server, one unreadable query, opposite
+# conclusions.
+#
+# Deleting the wrapper is the structural fix rather than the instance fix: with only one way to ask,
+# a future caller cannot pick the one that throws the readability away. Callers that genuinely do not
+# care about readability can still write (Get-mdiServiceStateResult ...).Service, but they have to
+# discard it deliberately and visibly.
 
-function Get-mdiServiceState {
+function Get-mdiServiceStateResult {
+    <#
+        A service query that says whether it could be ANSWERED, not only what it found.
+
+        Get-WmiObject with -ErrorAction SilentlyContinue returns $null both for a service that is not
+        installed and for a query that failed - a WMI provider fault, throttling part way through a
+        scan, a firewall closing between calls. Callers testing "if ($service)" therefore asserted
+        facts they had never measured: that no v2.x sensor was installed and the server could be
+        activated directly, and that no AD FS, AD CS or Entra Connect role was present so the in-place
+        migration was clear. Both are false greens produced from a read that never happened.
+
+        Reachability cannot be inferred from an earlier Win32_OperatingSystem query either: that is a
+        different class answered by a different provider at a different moment.
+    #>
     param (
         [Parameter(Mandatory = $true)] [string] $ComputerName,
         [Parameter(Mandatory = $true)] [string] $ServiceName
@@ -2087,12 +3039,48 @@ function Get-mdiServiceState {
             Class        = 'Win32_Service'
             Property     = 'Name', 'State', 'StartMode', 'PathName'
             Filter       = "Name = '{0}'" -f $ServiceName
-            ErrorAction  = 'SilentlyContinue'
+            ErrorAction  = 'Stop'
         }
-        Get-WmiObject @serviceParams
+        [PSCustomObject]@{ Service = (Get-WmiObject @serviceParams); Readable = $true; Error = $null }
     } catch {
-        $null
+        [PSCustomObject]@{ Service = $null; Readable = $false; Error = ($_.Exception.Message -replace '[\r\n]+', ' ') }
     }
+}
+
+function Get-mdiMeasuredInteger {
+    <#
+        A whole number read from WMI or the registry, or $null when the value is not a measurement.
+
+        WMI answering is not the same as WMI carrying a value. Win32_OperatingSystem exists on every
+        running Windows machine, so the query succeeding was taken as proof that every property in it
+        was populated - and the properties were then converted with a bare [int] cast, which has two
+        failure modes that both destroy the distinction between "read" and "not read":
+
+          * [int] $null and [int] '' are a clean ZERO. A domain controller whose ProductType was not
+            carried therefore compared 0 -eq 2 and was reported, as a MEASURED fact, "Not a domain
+            controller - the v3.x sensor only supports domain controllers". Because that verdict is
+            architectural rather than remediable, it then emptied the server's ActionableBlockers and
+            the generated remediation script closed "No remediation is required: every automatically
+            fixable check passed." The same zero made an unread BuildNumber fail "Windows Server 2019
+            or later" outright.
+          * A non-numeric value THROWS. 'Server 2022' in BuildNumber, or any text in ProductType,
+            aborted Get-mdiSensorV3Readiness entirely, so every remaining v3 check on that domain
+            controller - the CU level, MDE onboarding, the sensor version - was never evaluated at all.
+
+        A value that overflows Int32 is rejected too: a build number of 99999999999999 is not a build
+        number that happens to be large, it is a field that was not read correctly.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $Value
+    )
+
+    if ($null -eq $Value) { return $null }
+    $text = ([string] $Value).Trim()
+    if ([string]::IsNullOrEmpty($text)) { return $null }
+    $parsed = [int] 0
+    if (-not [int]::TryParse($text, [Globalization.NumberStyles]::Integer,
+            [Globalization.CultureInfo]::InvariantCulture, [ref] $parsed)) { return $null }
+    $parsed
 }
 
 function Get-mdiSensorV3Readiness {
@@ -2148,31 +3136,42 @@ function Get-mdiSensorV3Readiness {
     # WMI returns PSObject-wrapped values. They are unwrapped into plain .NET types here because passing a wrapped
     # value to the format operator can break its dynamic binder ("Argument types do not match") in Windows PowerShell.
     $osCaption = if ($osInfo) { [string] $osInfo.Caption } else { 'N/A' }
-    $osProductType = if ($osInfo) { [int] $osInfo.ProductType } else { 0 }
+    # Parsed rather than cast. A bare [int] turns an absent or blank ProductType into 0 - which is not
+    # 2, so the check below stated as a measured fact that a domain controller was not one - and throws
+    # outright on text, aborting every remaining check on the server.
+    $osProductType = if ($osInfo) { Get-mdiMeasuredInteger $osInfo.ProductType } else { $null }
     $osBuildText = if ($osInfo) { [string] $osInfo.BuildNumber } else { '' }
 
-    $isDomainController = if (-not $wmiReadable) { 'N/A' } else { $osProductType -eq 2 }
+    # Three states, not two: the query failed, the query answered without the property, or a real role.
+    # Only the third may say "Not a domain controller".
+    $isDomainController = if (-not $wmiReadable) { 'N/A' } elseif ($null -eq $osProductType) { 'N/A' } else { $osProductType -eq 2 }
     & $addCheck 'Server is a domain controller' $isDomainController $(
         if (-not $wmiReadable) { 'Not tested - {0}' -f $unreadable }
+        elseif ($null -eq $osProductType) { 'Not tested - the server role could not be read: Win32_OperatingSystem answered without a usable ProductType' }
         elseif ($isDomainController) { 'Domain controller' }
         else { 'Not a domain controller - the v3.x sensor only supports domain controllers, keep using the v2.x sensor on this server' }
     ) 'Required' $false
 
     # --- Operating system: Windows Server 2019 or later --------------------------------------------------------
-    $osBuild = 0
-    if ($osBuildText) { [void] [int]::TryParse($osBuildText, [ref] $osBuild) }
-    $isOsOk = if (-not $wmiReadable) { 'N/A' } else { $osBuild -ge $v3.MinOSBuild }
+    # $null, not 0, when the build could not be read. As 0 it compared below MinOSBuild and produced the
+    # measured failure "requires Windows Server 2019 or later, keep using the v2.x sensor" for a server
+    # whose version nobody had established.
+    $osBuild = Get-mdiMeasuredInteger $osBuildText
+    $isOsOk = if (-not $wmiReadable) { 'N/A' } elseif ($null -eq $osBuild) { 'N/A' } else { $osBuild -ge $v3.MinOSBuild }
     & $addCheck 'Windows Server 2019 or later' $isOsOk $(
         if (-not $wmiReadable) { 'Not tested - {0}' -f $unreadable }
-        elseif ($osBuild -eq 0) { 'Unable to determine the operating system version' }
+        elseif ($null -eq $osBuild) { 'Not tested - the operating system build number could not be read from this server' }
         elseif ($isOsOk -eq $true) { '{0} (build {1})' -f $osCaption, $osBuild }
         else { '{0} (build {1}) - the v3.x sensor requires Windows Server 2019 or later, keep using the v2.x sensor on this server' -f $osCaption, $osBuild }
     ) 'Required' $false
 
     # --- Cumulative update: July 2026 or later -----------------------------------------------------------------
     $ubrResult = Get-mdiRemoteRegistryResult -ComputerName $ComputerName -Key $v3.CurrentVersionRegKey -Value 'UBR'
-    $ubr = if ($null -eq $ubrResult.Value) { $null } else { [int] $ubrResult.Value }
-    $expectedUpdate = $v3.JulyCumulativeUpdate[$osBuild]
+    $ubr = Get-mdiMeasuredInteger $ubrResult.Value
+    # The table is keyed by build number, so it can only be consulted once the build is known. Indexing
+    # it with a $null build is meaningless and the answer would be indistinguishable from "this build is
+    # newer than the table".
+    $expectedUpdate = if ($null -eq $osBuild) { $null } else { $v3.JulyCumulativeUpdate[$osBuild] }
     # The operating system state is compared as a string: $isOsOk is tri-state, and a bare
     # `$isOsOk -eq 'N/A'` casts the RIGHT operand to the left's type, where [bool]'N/A' is $true, so the
     # comparison is true even when $isOsOk is $true. Casting the left operand to [string] first is the
@@ -2182,13 +3181,24 @@ function Get-mdiSensorV3Readiness {
     } elseif ($isOsOk -eq $false) {
         $false
     } elseif ($null -eq $expectedUpdate) {
-        # A build newer than the ones known to this script is assumed to be recent enough
+        # A build newer than every entry in the table cannot be checked against a known-good revision,
+        # so the CU level is reported as unmeasured rather than as a pass. It is an INFORMATIONAL N/A,
+        # not a "Not tested" one - see $addCheck - so it deliberately leaves the overall v3 verdict
+        # intact: build numbers only increase, so a build newer than the July 2026 table is almost
+        # certainly patched past it, and turning every brand-new build into an unknown verdict would
+        # be noise. What it must NOT do is render as a green pass, because the detail beside it tells
+        # the operator to verify the update level by hand, and a cell claiming a pass next to that
+        # instruction is the report contradicting itself.
         'N/A'
-    } elseif (-not $ubrResult.Readable) {
+    } elseif ($ubrResult.Readable -ne $true) {
         # The registry could not be read, so the patch level is unknown rather than out of date.
         'N/A'
     } elseif ($null -eq $ubr) {
-        $false
+        # The registry read SUCCEEDED but did not carry a usable revision. That is still an unread
+        # patch level, not evidence of an out-of-date one: as $false the report told the operator to
+        # install a cumulative update on a server that may already have it, and the detail printed
+        # "Unable to read the update revision from the registry" beside a red measured Fail.
+        'N/A'
     } else {
         $ubr -ge [int] $expectedUpdate.Revision
     }
@@ -2196,78 +3206,134 @@ function Get-mdiSensorV3Readiness {
         if ([string] $isOsOk -eq 'N/A') { 'Not tested - {0}' -f $unreadable }
         elseif ($isOsOk -eq $false) { 'Not evaluated - the operating system is not supported by the v3.x sensor' }
         elseif ($null -eq $expectedUpdate) { 'OS build {0}.{1} is newer than the builds known to this script, verify the cumulative update level manually' -f $osBuild, $ubr }
-        elseif (-not $ubrResult.Readable) { 'Not tested - the registry could not be read on this server: {0}' -f [string] $ubrResult.Error }
-        elseif ($null -eq $ubr) { 'Unable to read the update revision from the registry' }
+        elseif ($ubrResult.Readable -ne $true) { 'Not tested - the registry could not be read on this server: {0}' -f [string] $ubrResult.Error }
+        elseif ($null -eq $ubr) { 'Not tested - the update revision (UBR) could not be read from the registry on this server' }
         elseif ($ubr -ge [int] $expectedUpdate.Revision) { '{0} build {1}.{2} meets the July 2026 level ({3}.{4}, {5})' -f [string] $expectedUpdate.OS, $osBuild, $ubr, $osBuild, [int] $expectedUpdate.Revision, [string] $expectedUpdate.KB }
         else { '{0} build {1}.{2} is older than the July 2026 cumulative update ({3}.{4}, {5}) - install it before migrating' -f [string] $expectedUpdate.OS, $osBuild, $ubr, $osBuild, [int] $expectedUpdate.Revision, [string] $expectedUpdate.KB }
     ) 'Required' ($isOsOk -eq $true)
 
     # --- Defender for Endpoint deployed and onboarded ----------------------------------------------------------
     # 'Defender for Endpoint must be onboarded on the server where the sensor runs; endpoint-only deployment isn't sufficient.'
-    $senseService = Get-mdiServiceState -ComputerName $ComputerName -ServiceName $v3.MdeSenseServiceName
+    #
+    # The RESULT variant, not Get-mdiServiceState. The plain variant returns only the service and
+    # discards whether the query succeeded, so an Access Denied on the service list came back as $null
+    # - indistinguishable from "the service is genuinely absent" - and this check reported the
+    # definite failure "The Sense service is not installed - onboard the server", telling an
+    # administrator to onboard a server that may already be onboarded. The v2.x sibling check reads
+    # the same service list through the Result variant and correctly returned N/A, so two checks
+    # disagreed about the same unreadable query on the same server.
+    $senseResult = Get-mdiServiceStateResult -ComputerName $ComputerName -ServiceName $v3.MdeSenseServiceName
+    $senseService = $senseResult.Service
+    $senseReadable = ($senseResult.Readable -eq $true)
     $senseState = if ($senseService) { [string] $senseService.State } else { $null }
     $senseStartMode = if ($senseService) { [string] $senseService.StartMode } else { $null }
-    # A null service means "not installed" only when WMI answered. When WMI is unavailable it means
-    # nothing was learned, so reporting the service as missing would be an invention.
-    $isSenseRunning = if (-not $wmiReadable) { 'N/A' } else { $senseState -eq 'Running' }
+    # A null service means "not installed" only when the query ANSWERED. When WMI is unavailable, or
+    # the service list itself could not be read, it means nothing was learned, so reporting the
+    # service as missing would be an invention.
+    $isSenseRunning = if (-not $wmiReadable -or -not $senseReadable) { 'N/A' } else { $senseState -eq 'Running' }
     & $addCheck 'Defender for Endpoint (Sense) service is running' $isSenseRunning $(
         if (-not $wmiReadable) { 'Not tested - {0}' -f $unreadable }
+        elseif (-not $senseReadable) { 'Not tested - the service list could not be read on this server: {0}' -f [string] $senseResult.Error }
         elseif ($null -eq $senseService) { 'The Sense service is not installed - onboard the server to Microsoft Defender for Endpoint' }
         elseif ($isSenseRunning -eq $true) { 'Sense service is running (start mode: {0})' -f $senseStartMode }
         else { 'Sense service is {0} (start mode: {1}) - it must be running' -f $senseState, $senseStartMode }
     )
 
     $onboardingResult = Get-mdiRemoteRegistryResult -ComputerName $ComputerName -Key $v3.MdeStatusRegKey -Value $v3.MdeOnboardingStateValue
-    $onboardingState = $onboardingResult.Value
-    # An absent value means not onboarded; an unreadable registry means unknown.
-    $isOnboarded = if (-not $onboardingResult.Readable) { 'N/A' } else { $null -ne $onboardingState -and [int] $onboardingState -eq 1 }
+    # Parsed, not cast. A bare [int] on a value the registry surfaced as text - 'N/A', a REG_SZ, a
+    # partially-written value - threw and aborted every remaining check on the domain controller.
+    $onboardingState = Get-mdiMeasuredInteger $onboardingResult.Value
+    # An absent value means not onboarded; an unreadable registry, or a value that is present but not a
+    # number, means unknown.
+    $onboardingUnusable = $null -eq $onboardingState -and $null -ne $onboardingResult.Value
+    $isOnboarded = if ($onboardingResult.Readable -ne $true) { 'N/A' } elseif ($onboardingUnusable) { 'N/A' } else { $null -ne $onboardingState -and $onboardingState -eq 1 }
     & $addCheck 'Defender for Endpoint is onboarded' $isOnboarded $(
-        if (-not $onboardingResult.Readable) { 'Not tested - the registry could not be read on this server: {0}' -f [string] $onboardingResult.Error }
+        if ($onboardingResult.Readable -ne $true) { 'Not tested - the registry could not be read on this server: {0}' -f [string] $onboardingResult.Error }
+        elseif ($onboardingUnusable) { 'Not tested - OnboardingState under HKLM\{0} did not carry a usable value' -f [string] $v3.MdeStatusRegKey }
         elseif ($null -eq $onboardingState) { 'OnboardingState is not present under HKLM\{0} - the server is not onboarded to Defender for Endpoint' -f [string] $v3.MdeStatusRegKey }
         elseif ($isOnboarded -eq $true) { 'OnboardingState = 1' }
-        else { 'OnboardingState = {0} - the server is not onboarded to Defender for Endpoint' -f [int] $onboardingState }
+        else { 'OnboardingState = {0} - the server is not onboarded to Defender for Endpoint' -f $onboardingState }
     )
 
     # --- Existing v2.x sensor ----------------------------------------------------------------------------------
     # 'Doesn't have a Defender for Identity sensor v2.x already deployed' for a fresh activation. For the in-place
     # migration the v2.x sensor must instead be present and recent enough.
-    $v2Service = Get-mdiServiceState -ComputerName $ComputerName -ServiceName 'AATPSensor'
+    $v2Result = Get-mdiServiceStateResult -ComputerName $ComputerName -ServiceName 'AATPSensor'
+    $v2Service = $v2Result.Service
+    # "No v2.x sensor is installed" is only true when the query was ANSWERED. A failed query used to
+    # produce the same null and the check then told the operator the server could be activated
+    # directly with v3.x, on the strength of a read that never happened.
     $hasV2Sensor = $null -ne $v2Service
     $v2ServiceState = if ($v2Service) { [string] $v2Service.State } else { $null }
     $v2Version = if ($SensorVersion -and [string] $SensorVersion -ne 'N/A') { [string] $SensorVersion } else { $null }
 
+    # 'N/A' when the version is present but unparseable, not $false.
+    #
+    # A string that is not a version - 'unknown', a truncated read, a value another tool has mangled -
+    # is not evidence that the sensor is TOO OLD. Returning $false made it a measured blocker and told
+    # the operator to "upgrade the v2.x sensor before migrating" on the strength of a version nobody
+    # had actually read; the honest answer is that the version could not be established. The 'Not
+    # tested' marker routes it to the unmeasured path, which is what keeps it out of MigrationEligible.
     $isV2VersionOk = 'N/A'
+    $v2VersionUnparseable = $false
     if ($hasV2Sensor -and $v2Version) {
         $parsedVersion = $null
-        $isV2VersionOk = if ([version]::TryParse($v2Version, [ref] $parsedVersion)) {
-            $parsedVersion -ge [version] $v3.MinV2VersionForMigration
-        } else { $false }
+        # Trimmed for DISPLAY, not for parsing: [version]::TryParse already tolerates surrounding
+        # whitespace (measured - '  2.254.19112.470  ' parses correctly). Trimming keeps the padding
+        # out of the sentence shown to the operator, which otherwise reads
+        # "v2.x sensor   2.254.19112.470   meets the minimum version".
+        $v2VersionText = ([string] $v2Version).Trim()
+        if ([version]::TryParse($v2VersionText, [ref] $parsedVersion)) {
+            $isV2VersionOk = ($parsedVersion -ge [version] $v3.MinV2VersionForMigration)
+        } else {
+            $isV2VersionOk = 'N/A'
+            $v2VersionUnparseable = $true
+        }
     }
 
     & $addCheck 'Defender for Identity sensor v2.x version supports migration' $isV2VersionOk $(
-        if (-not $hasV2Sensor) { 'No v2.x sensor is installed - the server can be activated directly with the v3.x sensor' }
-        elseif (-not $v2Version) { 'A v2.x sensor is installed but its version could not be determined' }
-        elseif ($isV2VersionOk -eq $true) { 'v2.x sensor {0} meets the minimum version for in-place migration ({1})' -f $v2Version, [string] $v3.MinV2VersionForMigration }
-        else { 'v2.x sensor {0} is older than {1} - upgrade the v2.x sensor before migrating' -f $v2Version, [string] $v3.MinV2VersionForMigration }
+        if ($v2Result.Readable -ne $true) { 'Not tested - the service list could not be read on this server: {0}' -f [string] $v2Result.Error }
+        elseif (-not $hasV2Sensor) { 'No v2.x sensor is installed - the server can be activated directly with the v3.x sensor' }
+        elseif (-not $v2Version) { 'Not tested - a v2.x sensor is installed but its version could not be determined, so whether it can be migrated in place is unknown' }
+        elseif ($v2VersionUnparseable) { 'Not tested - the reported v2.x sensor version "{0}" is not a recognisable version number, so it could not be compared with the minimum ({1})' -f ([string] $v2Version).Trim(), [string] $v3.MinV2VersionForMigration }
+        elseif ($isV2VersionOk -eq $true) { 'v2.x sensor {0} meets the minimum version for in-place migration ({1})' -f ([string] $v2Version).Trim(), [string] $v3.MinV2VersionForMigration }
+        else { 'v2.x sensor {0} is older than {1} - upgrade the v2.x sensor before migrating' -f ([string] $v2Version).Trim(), [string] $v3.MinV2VersionForMigration }
     ) 'Migration'
 
     # --- Identity roles block the in-place migration -----------------------------------------------------------
     # 'Domain controllers with identity roles support v3.x for new deployments, but in-place migration isn't
     #  currently supported for these servers.'
-    $identityRoles = @(foreach ($service in $v3.IdentityRoleServices.Keys) {
-            if ((Get-mdiServiceState -ComputerName $ComputerName -ServiceName $service)) { [string] $v3.IdentityRoleServices[$service] }
+    #
+    # Every role query has to be ANSWERED before "no identity roles were detected" can be stated. With
+    # SilentlyContinue a provider fault made all three look absent, and the check reported the in-place
+    # migration path as clear on a server that might well hold AD FS or AD CS.
+    $roleResults = @(foreach ($service in $v3.IdentityRoleServices.Keys) {
+            $roleResult = Get-mdiServiceStateResult -ComputerName $ComputerName -ServiceName $service
+            [PSCustomObject]@{ Service = $service; Readable = $roleResult.Readable
+                Present = ($null -ne $roleResult.Service); Error = $roleResult.Error
+            }
         })
-    $noIdentityRoles = $identityRoles.Count -eq 0
+    $unreadableRoles = @($roleResults | Where-Object { $_.Readable -ne $true })
+    $identityRoles = @($roleResults | Where-Object { $_.Present } | ForEach-Object { [string] $v3.IdentityRoleServices[$_.Service] })
+    $noIdentityRoles = if ($unreadableRoles.Count -gt 0) { 'N/A' } else { $identityRoles.Count -eq 0 }
     & $addCheck 'No additional identity roles (in-place migration)' $noIdentityRoles $(
-        if ($noIdentityRoles) { 'No AD FS, AD CS or Microsoft Entra Connect role detected' }
+        if ($unreadableRoles.Count -gt 0) { 'Not tested - {0} of {1} identity role service(s) could not be read on this server' -f $unreadableRoles.Count, $roleResults.Count }
+        elseif ($identityRoles.Count -eq 0) { 'No AD FS, AD CS or Microsoft Entra Connect role detected' }
         else { 'Detected: {0}. The v3.x sensor supports these roles on a domain controller for new deployments, but the in-place migration workflow is not available - uninstall the v2.x sensor and activate v3.x instead' -f ($identityRoles -join ', ') }
     ) 'Migration'
 
     # --- Npcap is no longer needed -----------------------------------------------------------------------------
+    # Three-state, because "no driver is installed" and "the registry could not be read" are different
+    # facts with the same shape. Get-mdiCaptureComponent returns the marker 'N/A' when neither registry
+    # view would open - a domain controller with the Remote Registry service stopped, or a firewall in
+    # the way - and collapsing that to "not installed" made it a PASS: measured, green, and absent from
+    # UnknownChecks, so the run could be called ready on the strength of a read that never happened.
     $captureComponent = [string] (Get-mdiCaptureComponent -ComputerName $ComputerName)
-    $hasCaptureComponent = -not [string]::IsNullOrWhiteSpace($captureComponent) -and [string] $captureComponent -ne 'N/A'
-    & $addCheck 'Npcap / WinPcap removed' (-not $hasCaptureComponent) $(
-        if ($hasCaptureComponent) { '{0} is installed. It was used by the v2.x sensor and is not required by v3.x - remove it after the migration completes' -f $captureComponent }
+    $captureReadable = [string] $captureComponent -ne 'N/A'
+    $hasCaptureComponent = $captureReadable -and -not [string]::IsNullOrWhiteSpace($captureComponent)
+    & $addCheck 'Npcap / WinPcap removed' $(if (-not $captureReadable) { 'N/A' } else { -not $hasCaptureComponent }) $(
+        if (-not $captureReadable) { 'Not tested - the registry could not be read on this server, so whether a packet capture driver is installed is unknown' }
+        elseif ($hasCaptureComponent) { '{0} is installed. It was used by the v2.x sensor and is not required by v3.x - remove it after the migration completes' -f $captureComponent }
         else { 'No packet capture driver installed' }
     ) 'Recommended'
 
@@ -2275,13 +3341,36 @@ function Get-mdiSensorV3Readiness {
     # every unread check as a blocker and a server that could not be queried looked comprehensively
     # ineligible. Unknowns are tracked separately: they are gaps in the evidence, not findings.
     $blockers = @($checks | Where-Object { $_.Requirement -eq 'Required' -and $_.Status -eq $false })
-    $unknowns = @($checks | Where-Object { $_.Requirement -eq 'Required' -and -not $_.Measured })
+    $unknowns = @($checks | Where-Object { $_.Requirement -eq 'Required' -and $_.Measured -ne $true })
     $migrationWarnings = @($checks | Where-Object { $_.Requirement -eq 'Migration' -and $_.Status -eq $false })
+    # Migration prerequisites that could not be MEASURED, tracked separately from those that failed.
+    #
+    # MigrationEligible was computed from $migrationWarnings alone, and that filter only catches
+    # Status -eq $false - so a prerequisite nobody could establish was invisible to it. A domain
+    # controller whose v2.x sensor version could not be read reported "eligible for in-place
+    # migration" while its own check on the same page read "Not tested - its version could not be
+    # determined". The whole point of the migration section is to answer one question, and it
+    # answered it from evidence it did not have.
+    #
+    # Not being able to read the version is not the same as the version being too old, so this is
+    # deliberately NOT folded into $migrationWarnings: the report must go on distinguishing "upgrade
+    # the sensor first" from "find out what version this is".
+    $migrationUnknowns = @($checks | Where-Object { $_.Requirement -eq 'Migration' -and $_.Measured -ne $true })
 
     # The state must not advise activating the v3.x sensor on a server that cannot run it. A Windows
     # Server 2016 domain controller with Defender for Endpoint onboarded satisfies the first branch's
     # conditions, yet it fails the operating system requirement, so the blockers are checked as well.
+    #
+    # Readability of the service list is tested separately from $unknowns. $unknowns counts only
+    # Requirement='Required' checks, and the v2.x sensor check is Requirement='Migration', so a failed
+    # service query contributed nothing to it: $hasV2Sensor came back $false - which is what an
+    # ANSWERED query saying "not installed" also produces - and the state then read "No v2.x sensor
+    # (activate v3.x)". That advises a fresh v3.x activation on a server that may well be running a
+    # v2.x sensor, which is the one path the migration guidance exists to prevent, and it was asserted
+    # from a read that never happened.
+    $v2Readable = [bool] $v2Result.Readable
     $sensorState = if ($unknowns.Count -gt 0 -and $blockers.Count -eq 0) { 'Not determined (the server could not be queried)' }
+    elseif (-not $v2Readable) { 'Not determined (the installed services could not be read on this server)' }
     elseif (-not $hasV2Sensor -and $isOnboarded -eq $true -and $isSenseRunning -eq $true -and $blockers.Count -eq 0) { 'No v2.x sensor (activate v3.x)' }
     elseif (-not $hasV2Sensor -and $blockers.Count -gt 0) { 'No sensor installed and not eligible for v3.x (use v2.x)' }
     elseif ($hasV2Sensor -and $v2ServiceState -ne 'Running') { 'v2.x sensor installed but not running' }
@@ -2313,7 +3402,7 @@ function Get-mdiSensorV3Readiness {
         details         = [PSCustomObject]@{
             SensorState        = $sensorState
             SensorV2Version    = $v2Version
-            MigrationEligible  = ($v3Ready -eq $true) -and ($migrationWarnings.Count -eq 0) -and $hasV2Sensor
+            MigrationEligible  = ($v3Ready -eq $true) -and ($migrationWarnings.Count -eq 0) -and ($migrationUnknowns.Count -eq 0) -and $hasV2Sensor
             Blockers           = $blockerMessages
             ActionableBlockers = $actionableBlockers
             UnknownChecks      = @(foreach ($u in $unknowns) { [string] $u.Name })
@@ -2350,8 +3439,25 @@ function Get-mdiSensorHealth {
         }
     }
 
-    $sensor = Get-mdiServiceState -ComputerName $ComputerName -ServiceName 'AATPSensor'
-    $updater = Get-mdiServiceState -ComputerName $ComputerName -ServiceName 'AATPSensorUpdater'
+    $sensorResult = Get-mdiServiceStateResult -ComputerName $ComputerName -ServiceName 'AATPSensor'
+    $updaterResult = Get-mdiServiceStateResult -ComputerName $ComputerName -ServiceName 'AATPSensorUpdater'
+    $sensor = $sensorResult.Service
+    $updater = $updaterResult.Service
+
+    # A service query that could not be ANSWERED is not a service that is absent. The WMI reachability
+    # test above uses Win32_OperatingSystem, which is a different class answered by a different
+    # provider - so it can succeed while the service query fails, and the function would then state
+    # that no sensor is installed on a server whose services it never managed to enumerate.
+    if ($sensorResult.Readable -ne $true -or $updaterResult.Readable -ne $true) {
+        $reason = if ($sensorResult.Error) { $sensorResult.Error } else { $updaterResult.Error }
+        return [PSCustomObject]@{
+            isSensorHealthOk = 'N/A'
+            details          = [PSCustomObject]@{
+                Installed = 'N/A'
+                Detail    = 'Not tested - the service list could not be read on this server: ' + [string] $reason
+            }
+        }
+    }
 
     if ($null -eq $sensor -and $null -eq $updater) {
         return [PSCustomObject]@{
@@ -2366,6 +3472,42 @@ function Get-mdiSensorHealth {
     $sensorState = if ($sensor) { [string] $sensor.State } else { 'Not installed' }
     $updaterState = if ($updater) { [string] $updater.State } else { 'Not installed' }
     $sensorStartMode = if ($sensor) { [string] $sensor.StartMode } else { 'n/a' }
+    $updaterStartMode = if ($updater) { [string] $updater.StartMode } else { 'n/a' }
+
+    # 'Unknown' is a defined Win32_Service token meaning the service control manager COULD NOT
+    # DETERMINE the value. It is the absence of a reading, not a reading of "not running", and the
+    # tests below are written as '-ne Running' / '-ne Auto', which collapse the two. An undetermined
+    # state therefore became isSensorHealthOk = $false: a measured failure, a High finding, a red HTML
+    # row and a place in the readiness score, all built on a query that produced no answer.
+    #
+    # It was then erased from the advisory as well. Test-mdiSensorIssueFixable is a denylist keyed on
+    # 'is not installed', so "The AATPSensor service is Unknown" was classified FIXABLE, marked as
+    # covered by the remediation generator, and dropped from the outstanding list - while the emitted
+    # code is only Set-Service/Start-Service, which cannot resolve a state nobody could read. The
+    # script then closed "Remediation complete."
+    #
+    # Note that Paused, Pause Pending and the other transitional tokens are NOT included here: those
+    # are real, determinate states in which the sensor is genuinely not running, so they remain
+    # measured failures. Only the token that means "no answer" is routed to the unmeasured path, which
+    # is the same path this function already uses when WMI or the service list cannot be read.
+    $undetermined = New-Object -TypeName System.Collections.ArrayList
+    if ($sensor -and $sensorState -eq 'Unknown') { [void] $undetermined.Add('the AATPSensor service state') }
+    if ($sensor -and $sensorStartMode -eq 'Unknown') { [void] $undetermined.Add('the AATPSensor service start mode') }
+    if ($updater -and $updaterState -eq 'Unknown') { [void] $undetermined.Add('the AATPSensorUpdater service state') }
+    if ($updater -and $updaterStartMode -eq 'Unknown') { [void] $undetermined.Add('the AATPSensorUpdater service start mode') }
+    if ($undetermined.Count -gt 0) {
+        return [PSCustomObject]@{
+            isSensorHealthOk = 'N/A'
+            details          = [PSCustomObject]@{
+                Installed        = 'N/A'
+                SensorService    = $sensorState
+                SensorStartMode  = $sensorStartMode
+                UpdaterService   = $updaterState
+                UpdaterStartMode = $updaterStartMode
+                Detail           = 'Not tested - the service control manager reported {0} as Unknown on this server, so the sensor state could not be determined' -f ($undetermined.ToArray() -join ' and ')
+            }
+        }
+    }
 
     $issues = New-Object -TypeName System.Collections.ArrayList
     # A missing service is a finding in its own right. Previously every issue test was guarded by
@@ -2392,7 +3534,6 @@ function Get-mdiSensorHealth {
     } elseif ($sensor -and $sensorStartMode -ne 'Auto') {
         [void] $issues.Add('The AATPSensor service start mode is ' + $sensorStartMode + ', not Auto; it will not start after a reboot')
     }
-    $updaterStartMode = if ($updater) { [string] $updater.StartMode } else { 'n/a' }
     if ($updater -and $updaterStartMode -eq 'Disabled') {
         [void] $issues.Add('The AATPSensorUpdater service start mode is Disabled')
     } elseif ($updater -and $updaterStartMode -ne 'Auto') {
@@ -2428,22 +3569,42 @@ function Get-mdiTimeSync {
             -Property 'LocalDateTime' -ErrorAction Stop
         $localAfter = [datetime]::UtcNow
 
-        $remoteTime = [System.Management.ManagementDateTimeConverter]::ToDateTime([string] $os.LocalDateTime).ToUniversalTime()
+        $remoteTime = [Management.ManagementDateTimeConverter]::ToDateTime([string] $os.LocalDateTime).ToUniversalTime()
         # The WMI round trip is bounded by the two local readings, so its midpoint is the fairest local reference
         $reference = $localBefore.AddTicks(($localAfter - $localBefore).Ticks / 2)
         $skew = ($remoteTime - $reference).TotalMinutes
         $absSkew = [math]::Abs($skew)
 
+        # [long], not [int], for every duration below. A skew is a difference between two DateTime
+        # values and does not fit in 32 bits: [int] overflows past 68 years in seconds and past 4085
+        # years in minutes. The casts sat INSIDE this try, so the overflow was caught by the handler
+        # below and a clock that HAD been read successfully was reported as one that could not be
+        # read - 'N/A', which every consumer treats as unmeasured. A dead CMOS battery reading
+        # 1601-01-01, a reset RTC, and a BIOS year rollover to 2106 are the three commonest ways a
+        # real domain controller's clock goes wrong by more than 68 years, and all three rendered as
+        # a grey "Not tested" with no issue raised and no w32tm /resync in the remediation script,
+        # while leaking a raw System.Int32 conversion message into the operator-facing Detail column.
+        # The worst clock fault MDI can have was the one fault this check could not report.
         [PSCustomObject]@{
             isTimeSyncOk = $absSkew -le $MaxSkewMinutes
             details      = [PSCustomObject]@{
-                RemoteUtc    = $remoteTime.ToString('yyyy-MM-dd HH:mm:ss')
-                ReferenceUtc = $reference.ToString('yyyy-MM-dd HH:mm:ss')
-                SkewSeconds  = [int] [math]::Round($skew * 60)
+                # InvariantCulture, because this is the CLOCK check's own evidence and it is both
+                # displayed and re-read. A bare ToString() formats in the operator's culture, and the
+                # calendar comes with it: under th-TH the same instant renders 2569-08-13, under
+                # ar-SA 1448-02-30, under fa-IR 1405-05-22 - so the check that exists to prove a
+                # domain controller's clock is right printed an impossible date as its proof.
+                # Worse, 22 installed cultures (fi-FI, id-ID and the bn-IN family) use '.' as the
+                # time separator and ':' in a format string is a PLACEHOLDER for it, so the stamp
+                # renders 19.32.26 - which [datetime]::TryParse then REFUSES, and a run whose
+                # timestamp will not parse is dropped from the trend entirely. Measured across every
+                # installed culture: 40 of 915 render this wrongly, 0 of 915 with InvariantCulture.
+                RemoteUtc    = $remoteTime.ToString('yyyy-MM-dd HH:mm:ss', [cultureinfo]::InvariantCulture)
+                ReferenceUtc = $reference.ToString('yyyy-MM-dd HH:mm:ss', [cultureinfo]::InvariantCulture)
+                SkewSeconds  = [long] [math]::Round($skew * 60)
                 Detail       = $(if ($absSkew -le $MaxSkewMinutes) {
-                        'Clock is within {0} second(s) of this computer' -f [int] [math]::Round($absSkew * 60)
+                        'Clock is within {0} second(s) of this computer' -f [long] [math]::Round($absSkew * 60)
                     } else {
-                        'Clock differs by {0} minute(s) - MDI requires all sensor servers to be within {1} minutes of each other' -f [int] [math]::Round($absSkew), $MaxSkewMinutes
+                        'Clock differs by {0} minute(s) - MDI requires all sensor servers to be within {1} minutes of each other' -f [long] [math]::Round($absSkew), $MaxSkewMinutes
                     })
             }
         }
@@ -2456,6 +3617,179 @@ function Get-mdiTimeSync {
             details      = [PSCustomObject]@{ Detail = 'Not tested - the remote clock could not be read: ' + ($_.Exception.Message -replace '[\r\n]+', ' ') }
         }
     }
+}
+
+function Get-mdiMatchingTrustee {
+    <#
+        The trustees on an ACL that refer to the same principal as an operator-supplied account name.
+
+        This used to be a substring wildcard, '*{0}*', and it was wrong in both directions. A request for
+        svc-mdi was satisfied by an ACL that granted only svc-mdi-old - a different, often decommissioned
+        account - so the tool reported a Directory Service Account had access to the Deleted Objects
+        container when it did not. And because the operator's text was interpolated straight into a -like
+        pattern, an account name containing [ ] ? or * was treated as a pattern rather than a literal: a
+        name legally containing brackets failed to match its own identical entry on the ACL, which is a
+        false red telling someone to re-grant a permission that is already in place.
+
+        A SID is the only comparison that is immune to the DOMAIN\name, name and name@domain forms all
+        being written for the same principal. Both sides are resolved and compared when they resolve,
+        and a match found that way is returned with Confidence 'Verified'.
+
+        When translation is NOT possible for one of the sides - an orphaned SID, a principal from a
+        forest that cannot be reached over a one-way trust, a disconnected domain controller - there is
+        no reliable string test in either direction, and the tool used to guess:
+
+          * Comparing only the leaf name reported FABRIKAM\svc-mdi as satisfied by an ACL granting
+            CONTOSO\svc-mdi. Two unrelated accounts in two domains, reported as one. FALSE GREEN.
+          * Comparing the qualifier too looks like the obvious fix and is worse. It assumes a different
+            qualifier means a different principal, which is untrue for the single most common case: the
+            ACL side comes from a SID-to-name translation and is NetBIOS (CONTOSO\svc-mdi) while the
+            operator typed a UPN or DNS form (svc-mdi@contoso.com), and the NetBIOS name frequently is
+            not the DNS label at all (DNS ad.contoso.com, NetBIOS CORP). That turns a rare false green
+            into a routine FALSE RED telling people to re-grant a permission they already have.
+
+        So an unverifiable name match is returned with Confidence 'Ambiguous' and the caller reports the
+        check as unmeasured rather than asserting either outcome. In a healthy connected forest every
+        name resolves and the result is a clean pass or fail; 'Ambiguous' appears only where the tool
+        genuinely cannot tell, which is the one honest answer available.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [string[]] $Trustee,
+        [Parameter(Mandatory = $true)] [string] $Account
+    )
+
+    $accountSid = Resolve-mdiPrincipalSid -Name $Account
+    # The bare account, for the fallback: CONTOSO\svc-mdi and svc-mdi@contoso.com both reduce to svc-mdi.
+    $accountLeaf = ($Account -replace '^.*\\', '') -replace '@.*$', ''
+
+    @(foreach ($item in $Trustee) {
+            $candidate = [string] $item
+            if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+            # Identical text is the same principal whatever the resolver says.
+            if ($candidate -eq $Account) {
+                [PSCustomObject]@{ Trustee = $candidate; Confidence = 'Verified' }
+                continue
+            }
+
+            $candidateSid = Resolve-mdiPrincipalSid -Name $candidate
+            if ($accountSid -and $candidateSid) {
+                # Both sides resolved, so the answer is definitive in BOTH directions: equal SIDs are
+                # the same principal, and unequal SIDs are not - no string fallback, which is what
+                # stops a same-named account in another domain from being accepted here.
+                if ($candidateSid -eq $accountSid) {
+                    [PSCustomObject]@{ Trustee = $candidate; Confidence = 'Verified' }
+                }
+                continue
+            }
+
+            # Ordinal, case-insensitive, and literal - no wildcard interpretation of either side.
+            $candidateLeaf = ($candidate -replace '^.*\\', '') -replace '@.*$', ''
+            if ([string]::Equals($candidateLeaf, $accountLeaf, [StringComparison]::OrdinalIgnoreCase)) {
+                [PSCustomObject]@{ Trustee = $candidate; Confidence = 'Ambiguous' }
+            }
+        })
+}
+
+function Resolve-mdiPrincipalSid {
+    <#
+        The SID of a principal named as DOMAIN\name, name, name@domain or already as a SID string.
+        Returns $null when the name cannot be translated, which is normal for an orphaned SID or a
+        principal in a forest this computer cannot reach - the caller falls back to a literal comparison.
+    #>
+    param (
+        [Parameter(Mandatory = $true)] [string] $Name
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+    $trimmed = $Name.Trim()
+
+    if ($trimmed -match '^S-1-') {
+        try { return (New-Object System.Security.Principal.SecurityIdentifier($trimmed)).Value } catch { return $null }
+    }
+    try {
+        return (New-Object System.Security.Principal.NTAccount($trimmed)).Translate(
+            [Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        Write-mdiVerbose ('Unable to resolve {0} to a security identifier: {1}' -f $trimmed, $_.Exception.Message)
+        return $null
+    }
+}
+
+function Get-mdiEffectiveDaclTrustee {
+    <#
+        The trustees that EFFECTIVELY hold every right in RequiredMask on the object carrying this DACL.
+
+        One evaluator, fed by both DACL readers. It exists because there used to be two inline
+        interpretations of the same DACL - one per reader - and they disagreed with each other, so the
+        answer depended on which reader happened to succeed. Whenever the same question is answered in
+        two places, the two answers drift; the only durable fix is to have one place.
+
+        Three rules, each of which was missing and each of which produced a FALSE GREEN - reporting
+        read access that the account does not actually have, so the operator is told the Directory
+        Service Account is correctly delegated when MDI cannot enumerate deleted objects at all:
+
+        1. INHERIT_ONLY. An ACE flagged INHERIT_ONLY exists to be inherited by children and confers
+           nothing on the object it sits on. It is exactly what "apply to descendant objects only"
+           delegation produces, so it is common - and MDI reads the CONTAINER, not its children.
+
+        2. Deny. Windows evaluates a DACL as allow-minus-deny; an explicit Deny ReadProperty on the
+           account revokes the right however many Allow entries also name it. Deny ACEs were simply
+           discarded, so a deliberately revoked account still reported as holding read access.
+           Effective rights are computed as allow AND NOT deny, which is the conservative reading and
+           correct for any canonically ordered DACL.
+
+        3. Property-set scope. An object ACE whose ObjectType names a single property set grants that
+           set only, not the object, so it does not satisfy a requirement stated over the object.
+
+        Allow rights are still accumulated per trustee, because Windows unions them: granting LC in
+        one operation and RP in another is two ACEs that jointly grant read, and requiring a single
+        ACE to carry both was a false RED in the other direction.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)] [AllowNull()] [AllowEmptyCollection()] $Ace,
+        [Parameter(Mandatory = $true)] [int] $RequiredMask,
+        # Translate SIDs to account names on the way out. The raw descriptor reader yields SIDs; the
+        # directory-module reader already yields names.
+        [switch] $ResolveSid
+    )
+
+    $allow = New-Object -TypeName 'System.Collections.Generic.Dictionary[string,int]'
+    $deny = New-Object -TypeName 'System.Collections.Generic.Dictionary[string,int]'
+
+    foreach ($entry in @($Ace)) {
+        if ($null -eq $entry) { continue }
+        $trustee = [string] $entry.Trustee
+        if ([string]::IsNullOrWhiteSpace($trustee)) { continue }
+        if ($entry.InheritOnly) { continue }
+        if ($entry.PropertySetScoped) { continue }
+
+        $mask = [int] $entry.Mask
+        if ($entry.IsDeny) {
+            $current = 0
+            if ($deny.ContainsKey($trustee)) { $current = $deny[$trustee] }
+            $deny[$trustee] = $current -bor $mask
+        } elseif ($entry.IsAllow) {
+            $current = 0
+            if ($allow.ContainsKey($trustee)) { $current = $allow[$trustee] }
+            $allow[$trustee] = $current -bor $mask
+        }
+    }
+
+    @(foreach ($trustee in $allow.Keys) {
+            $denied = 0
+            if ($deny.ContainsKey($trustee)) { $denied = $deny[$trustee] }
+            $effective = $allow[$trustee] -band (-bnot $denied)
+            if (($effective -band $RequiredMask) -ne $RequiredMask) { continue }
+            if ($ResolveSid) {
+                try {
+                    (New-Object -TypeName System.Security.Principal.SecurityIdentifier -ArgumentList $trustee).Translate(
+                        [Security.Principal.NTAccount]).Value
+                } catch { $trustee }
+            } else {
+                $trustee
+            }
+        })
 }
 
 function Get-mdiDeletedObjectsPermission {
@@ -2500,9 +3834,9 @@ function Get-mdiDeletedObjectsPermission {
             $root = New-Object -TypeName System.DirectoryServices.DirectoryEntry -ArgumentList ('LDAP://{0}/{1}' -f $Domain, $namingContext)
             $searcher = New-Object -TypeName System.DirectoryServices.DirectorySearcher -ArgumentList $root
             $searcher.Filter = '(&(objectClass=container)(name={0}))' -f ($deletedObjectsName -replace '([\\()*\0])', '\$1')
-            $searcher.SearchScope = [System.DirectoryServices.SearchScope]::OneLevel
+            $searcher.SearchScope = [DirectoryServices.SearchScope]::OneLevel
             $searcher.Tombstone = $true
-            $searcher.SecurityMasks = [System.DirectoryServices.SecurityMasks]::Dacl
+            $searcher.SecurityMasks = [DirectoryServices.SecurityMasks]::Dacl
             [void] $searcher.PropertiesToLoad.Add('ntsecuritydescriptor')
             $found = $searcher.FindOne()
             if ($found -and $found.Properties['ntsecuritydescriptor'].Count -gt 0) {
@@ -2513,19 +3847,29 @@ function Get-mdiDeletedObjectsPermission {
                 # reason. Testing with -band against the combined mask and rejecting only when the result
                 # is zero accepted an ACE that granted just one of the two, so a Directory Service Account
                 # with a partial grant was reported as having read access it does not have.
+                #
+                # The two rights are accumulated PER TRUSTEE rather than required of a single ACE. Windows
+                # evaluates a DACL as the union of every matching allow ACE, so granting LCRP in one
+                # operation and RP in another - which is what happens when a delegation is amended, or
+                # when two different tools each add an entry - produces two ACEs that jointly grant read
+                # access. Requiring one ACE to carry both skipped them both and reported an account that
+                # can read the container as having no access, sending someone to re-grant a permission
+                # that is already in place.
                 $readMask = 0x4 -bor 0x10
-                $granted = @(foreach ($ace in $descriptor.DiscretionaryAcl) {
-                        if ($ace.AceType -ne 'AccessAllowed' -and $ace.AceType -ne 'AccessAllowedObject') { continue }
-                        if (($ace.AccessMask -band $readMask) -ne $readMask) { continue }
-                        # An object ACE whose ObjectType names a single property set grants read of that
-                        # set only, not of the container, so it does not satisfy the requirement either.
-                        if ($ace.AceType -eq 'AccessAllowedObject' -and $ace.ObjectAceFlags -band 1) { continue }
-                        $sid = [string] $ace.SecurityIdentifier
-                        try {
-                            (New-Object -TypeName System.Security.Principal.SecurityIdentifier -ArgumentList $sid).Translate(
-                                [System.Security.Principal.NTAccount]).Value
-                        } catch { $sid }
+                $aceRecord = @(foreach ($ace in $descriptor.DiscretionaryAcl) {
+                        [PSCustomObject]@{
+                            Trustee = [string] $ace.SecurityIdentifier
+                            IsAllow = ($ace.AceType -eq 'AccessAllowed' -or $ace.AceType -eq 'AccessAllowedObject')
+                            IsDeny  = ($ace.AceType -eq 'AccessDenied' -or $ace.AceType -eq 'AccessDeniedObject')
+                            Mask    = [int] $ace.AccessMask
+                            # An ACE carrying INHERIT_ONLY (0x8) does not apply to the object it sits on.
+                            InheritOnly = (([int] $ace.AceFlags) -band 0x8) -eq 0x8
+                            # ACE_OBJECT_TYPE_PRESENT: the right is scoped to one property set, not the object.
+                            PropertySetScoped = ($ace.AceType -like 'AccessAllowedObject' -or $ace.AceType -like 'AccessDeniedObject') -and
+                                ((([int] $ace.ObjectAceFlags) -band 1) -eq 1)
+                        }
                     })
+                $granted = Get-mdiEffectiveDaclTrustee -Ace $aceRecord -RequiredMask $readMask -ResolveSid
                 $readMethod = 'directory search'
             }
         } catch {
@@ -2537,17 +3881,68 @@ function Get-mdiDeletedObjectsPermission {
                 $container = Get-ADObject -Identity $deletedObjectsDn -Server $Domain -IncludeDeletedObjects `
                     -Properties nTSecurityDescriptor -ErrorAction Stop
                 if ($container.nTSecurityDescriptor) {
-                    $granted = @(foreach ($ace in $container.nTSecurityDescriptor.Access) {
-                            if ([string] $ace.AccessControlType -ne 'Allow') { continue }
-                            $rights = [string] $ace.ActiveDirectoryRights
-                            # Both halves of the requirement, matching the mask test above: the right to
-                            # list the container's children AND to read properties. GenericRead and
-                            # GenericAll each imply both, so either alone is sufficient.
-                            $hasList = $rights -match 'ListChildren|ListObject|GenericRead|GenericAll'
-                            $hasRead = $rights -match 'ReadProperty|GenericRead|GenericAll'
-                            if (-not ($hasList -and $hasRead)) { continue }
-                            [string] $ace.IdentityReference
+                    # Normalised into the SAME evaluator the descriptor path uses. Previously each path
+                    # had its own inline interpretation of the DACL, and they disagreed: the raw path
+                    # skipped an ACE scoped to a single property set, the fallback did not. The same
+                    # container could therefore be reported as granting read or not granting it purely
+                    # according to which reader happened to succeed first - and the permissive one was
+                    # the fallback, so the disagreement surfaced as a false green.
+                    $aceRecord = @(foreach ($ace in $container.nTSecurityDescriptor.Access) {
+                            # Decided from the numeric MASK, never from the rendered enum name. The names in
+                            # ActiveDirectoryRights are a [Flags] set in which the COMPOSITE names subsume the
+                            # individual bits, so ToString() actively hides rights that are present: a trustee
+                            # holding List Contents + Read Property + Read Control (0x20014) - which is exactly
+                            # what "dsacls /G <DSA>:LCRP" leaves behind, since READ_CONTROL rides along on any
+                            # real ACE - renders as "ReadProperty, GenericExecute", because GenericExecute IS
+                            # ReadControl|ListChildren (0x20004). Matching the text for 'ListChildren' therefore
+                            # found nothing and the 0x4 bit was never set.
+                            #
+                            # The result was the worst kind of false red: a Directory Service Account that
+                            # genuinely held both rights qualified for neither, the check reported "no trustee
+                            # holds both List Contents and Read Property", and the operator was told to run
+                            # dsacls /G "<DSA>":LCRP - re-granting permissions that were already in place, on a
+                            # production system container. Measured: 0 trustees granted from an ACE carrying
+                            # both required rights.
+                            #
+                            # Bitwise tests also make the GenericRead and GenericAll special cases unnecessary:
+                            # GenericRead is 0x20094 and GenericAll 0xF01FF, and both already contain 0x4 and
+                            # 0x10, so they satisfy the requirement on their own bits.
+                            # ActiveDirectoryRights arrives as the enum from a live directory, but as an
+                            # integer or a comma-separated NAME STRING from the various shims and doubles
+                            # that also feed this reader. Casting to the enum normalises all three, since
+                            # an enum cast parses a name list. Only a value that cannot be parsed at all
+                            # falls back to matching names - which is what this used to do for every value,
+                            # and is why it was wrong.
+                            $rightsValue = $null
+                            try {
+                                $rightsValue = [int] ([System.DirectoryServices.ActiveDirectoryRights] $ace.ActiveDirectoryRights)
+                            } catch {
+                                $rightsValue = $null
+                            }
+                            $mask = 0
+                            if ($null -ne $rightsValue) {
+                                # ListObject (0x80) stands in for list-contents on a container whose parent
+                                # denies ListChildren.
+                                if (($rightsValue -band 0x4) -eq 0x4 -or ($rightsValue -band 0x80) -eq 0x80) { $mask = $mask -bor 0x4 }
+                                if (($rightsValue -band 0x10) -eq 0x10) { $mask = $mask -bor 0x10 }
+                            } else {
+                                $rightsText = [string] $ace.ActiveDirectoryRights
+                                if ($rightsText -match 'ListChildren|ListObject|GenericRead|GenericAll') { $mask = $mask -bor 0x4 }
+                                if ($rightsText -match 'ReadProperty|GenericRead|GenericAll') { $mask = $mask -bor 0x10 }
+                            }
+                            [PSCustomObject]@{
+                                Trustee = [string] $ace.IdentityReference
+                                IsAllow = ([string] $ace.AccessControlType -eq 'Allow')
+                                IsDeny  = ([string] $ace.AccessControlType -eq 'Deny')
+                                Mask    = $mask
+                                InheritOnly = ([string] $ace.PropagationFlags -match 'InheritOnly')
+                                # A non-empty ObjectType is this API's spelling of ACE_OBJECT_TYPE_PRESENT.
+                                PropertySetScoped = ($null -ne $ace.ObjectType -and
+                                    [string] $ace.ObjectType -ne '00000000-0000-0000-0000-000000000000' -and
+                                    -not [string]::IsNullOrWhiteSpace([string] $ace.ObjectType))
+                            }
                         })
+                    $granted = Get-mdiEffectiveDaclTrustee -Ace $aceRecord -RequiredMask (0x4 -bor 0x10)
                     $readMethod = 'directory module'
                 }
             } catch {
@@ -2555,16 +3950,42 @@ function Get-mdiDeletedObjectsPermission {
             }
         }
 
+        # Distinguishes "the DACL could not be read" from "the DACL was read and nobody qualified".
+        # Both used to arrive here as the same message, which sent an operator to check permissions on
+        # the container when the real answer was that the container's DACL is readable and simply
+        # grants read to nobody.
         if ($null -eq $granted -or @($granted).Count -eq 0) {
+            $descriptorWasRead = ($null -ne $readMethod)
             return [PSCustomObject]@{
-                isDeletedObjectsPermissionOk = 'N/A'
-                Measured                     = $false
+                isDeletedObjectsPermissionOk = $(if ($descriptorWasRead -and $DirectoryServiceAccount) { $false } else { 'N/A' })
+                # NotAsserted has to be carried here too, for exactly the reason spelled out on the main
+                # return path below: 'N/A' alone cannot tell "the DACL was read in full and there was no
+                # account to assert against" apart from a real measurement gap, and every consumer that
+                # cannot tell them apart charges the run for a measurement it was never asked to take.
+                # This return path was added later and did not carry the flag, so a readable container
+                # DACL that simply grants read to nobody - on the DEFAULT invocation, because
+                # -DirectoryServiceAccount is optional - failed Test-mdiDomainCheckPassed and raised a
+                # High "returned no usable result on this domain, so it is unverified" issue, while the
+                # HTML cell for the same fact read a benign grey "Not applicable". Two operator-visible
+                # surfaces disagreeing about one fact, which is the shape this flag exists to prevent.
+                #
+                # Both conditions are required. With an account supplied the answer is a definite
+                # failure, which must still be asserted; and when the descriptor could not be read at all
+                # this is a genuine gap that has to keep counting as an unread check rather than being
+                # excused as a question nobody asked.
+                NotAsserted                  = ($descriptorWasRead -and -not $DirectoryServiceAccount)
+                Measured                     = $descriptorWasRead
                 details                      = [PSCustomObject]@{
                     Container = $deletedObjectsDn
                     Trustees  = @()
-                    Detail    = ('The container was found but its security descriptor was not returned. Reading a DACL needs READ_CONTROL, ' +
-                        'which the default permissions on this container do not grant to every administrator. Check it manually on a domain ' +
-                        'controller with: dsacls "{0}"') -f $deletedObjectsDn
+                    Detail    = $(if ($descriptorWasRead) {
+                            ('The container security descriptor was read ({0}) and no trustee holds both List Contents and Read Property on it. ' +
+                            'Grant the Directory Service Account read access with: dsacls "{1}" /G "<DSA>":LCRP') -f $readMethod, $deletedObjectsDn
+                        } else {
+                            ('The container was found but its security descriptor was not returned. Reading a DACL needs READ_CONTROL, ' +
+                            'which the default permissions on this container do not grant to every administrator. Check it manually on a domain ' +
+                            'controller with: dsacls "{0}"') -f $deletedObjectsDn
+                        })
                 }
             }
         }
@@ -2572,25 +3993,120 @@ function Get-mdiDeletedObjectsPermission {
         $granted = @($granted | Where-Object { $_ } | Select-Object -Unique)
 
         # Without an explicit DSA name the check can only report who has access; it is informational in that case.
+        #
+        # Three outcomes, not two. A trustee that matched only by account name because neither side's SID
+        # could be translated is not proof of a grant - two different accounts in two domains share a
+        # short name often enough - so it is reported as unmeasured rather than as a pass. Asserting a
+        # pass there was a false green; asserting a failure there would be a false red, because the very
+        # same ambiguity covers one principal written in two legitimate forms (NetBIOS on the ACL, UPN
+        # from the operator). A definite failure still wins over an ambiguity: an account with no match
+        # of any kind is missing its grant regardless of what the other accounts did.
+        $ambiguousTrustee = @()
+        $unresolvableAccount = @()
+        # An unmatched DSA is only a MEASURED absence when every qualifying trustee is verifiably not
+        # a group. A group holder means the DSA may hold the grant transitively and this function did
+        # not look; an unclassifiable holder means the same thing with less information. Both are gaps
+        # in the measurement, so they take the same route as an ambiguous identity match rather than
+        # asserting an absence that was never established.
+        $groupTrustee = @()
+        $unknownKindTrustee = @()
         $status = if (-not $DirectoryServiceAccount) {
             'N/A'
         } else {
-            @($DirectoryServiceAccount | Where-Object {
-                    $account = $_
-                    @($granted | Where-Object { $_ -like ('*{0}*' -f $account) }).Count -eq 0
-                }).Count -eq 0
+            $anyAmbiguous = $false
+            $allSatisfied = $true
+            foreach ($dsa in $DirectoryServiceAccount) {
+                $matched = @(Get-mdiMatchingTrustee -Trustee $granted -Account $dsa)
+                if (@($matched | Where-Object { $_.Confidence -eq 'Verified' }).Count -gt 0) { continue }
+                $ambiguous = @($matched | Where-Object { $_.Confidence -eq 'Ambiguous' })
+                if ($ambiguous.Count -gt 0) {
+                    $anyAmbiguous = $true
+                    $ambiguousTrustee += @($ambiguous | ForEach-Object { '{0} (requested {1})' -f $_.Trustee, $dsa })
+                    continue
+                }
+                # No match of any kind. That is a definite failure ONLY if the account could be
+                # resolved to a SID, because then the ACL was genuinely searched for it and it was
+                # genuinely absent. When the name resolves to nothing - the account lives in a trusted
+                # forest this machine cannot reach, or the DSA was given as a bare name this domain
+                # does not know - there is nothing to compare against the SIDs on the ACL, and the
+                # answer "not granted" was never measured, it was merely unobtainable. Reporting it as
+                # a failure sent an Enterprise Admin to run dsacls /takeownership and re-grant LCRP on
+                # CN=Deleted Objects in production, to repair a delegation that may be perfectly intact.
+                #
+                # This deliberately does NOT fire on the ordinary orphaned-SID case. An ACL carrying
+                # the SID of a deleted account is common, but there the DSA itself resolves, so its SID
+                # can be compared against every entry and its absence is a real measurement.
+                if (-not (Resolve-mdiPrincipalSid -Name $dsa)) {
+                    $unresolvableAccount += $dsa
+                    $anyAmbiguous = $true
+                    continue
+                }
+                # The DSA resolved and matched no entry directly. Before calling that an absence,
+                # establish whether any holder could be granting it transitively. Classifying the
+                # holders - not the DSA - is what was missing: the ACL was searched for one identity
+                # while access is granted to a set of identities that expands.
+                #
+                # Classified ONCE per trustee. Re-deriving the kind inside each filter issued the
+                # same directory lookup three times per entry, and a lookup that succeeded once and
+                # failed the next time would have put a trustee in two buckets at once.
+                $holderKind = @(foreach ($trustee in $granted) {
+                        [PSCustomObject]@{ Trustee = $trustee; Kind = Get-mdiPrincipalKind -Name $trustee -Domain $Domain }
+                    })
+                $groupTrustee += @($holderKind | Where-Object { $_.Kind -eq 'Group' } | ForEach-Object { $_.Trustee })
+                $unknownKindTrustee += @($holderKind | Where-Object { $_.Kind -eq 'Unknown' } | ForEach-Object { $_.Trustee })
+                if (@($holderKind | Where-Object { $_.Kind -ne 'NonGroup' }).Count -eq 0) {
+                    $allSatisfied = $false
+                }
+            }
+            # Precedence is deliberate and unchanged: a DEFINITE failure still beats an unverified
+            # one. An account with no match of any kind, against holders that are all verifiably
+            # non-groups, is missing its grant regardless of what any other account did - so an
+            # unresolvable second DSA cannot mask a first DSA's real absence.
+            if (-not $allSatisfied) { $false }
+            elseif ($anyAmbiguous -or $groupTrustee.Count -gt 0 -or $unknownKindTrustee.Count -gt 0) { 'N/A' }
+            else { $true }
         }
 
         [PSCustomObject]@{
             isDeletedObjectsPermissionOk = $status
+            # NotAsserted: no -DirectoryServiceAccount was supplied, so the DACL was read in full but
+            # there was no account to assert against. That is a question this run was never asked, not a
+            # gap in what it measured - and it is the DEFAULT invocation, because the parameter is
+            # optional.
+            #
+            # It has to be carried explicitly. 'N/A' alone cannot distinguish it from the three real
+            # gaps below, and every consumer that could not tell them apart charged the run for a
+            # measurement it was never asked to take: the verdict returned NOT READY, the issue list
+            # raised a High "returned no usable result", and the score counted an unread check - all
+            # while the HTML cell for the same fact read a benign grey "Not applicable" (12601-12605),
+            # because the renderer was the only surface reading the Measured flag. Every default run
+            # failed this way.
+            NotAsserted                  = (-not $DirectoryServiceAccount)
             # Measured: the DACL WAS read. Reporting who has access without being told which account to
             # assert is an answer, not a gap - so this 'N/A' is measured, while the one above (the
-            # descriptor could not be read at all) is not.
-            Measured                     = $true
+            # descriptor could not be read at all) is not. An ambiguous identity match is different: the
+            # DACL was read but the identity behind the entry was not confirmed, so it is NOT measured
+            # and the run cannot be called ready on the strength of it.
+            Measured                     = ($ambiguousTrustee.Count -eq 0 -and $unresolvableAccount.Count -eq 0 -and
+                $groupTrustee.Count -eq 0 -and $unknownKindTrustee.Count -eq 0)
             details                      = [PSCustomObject]@{
                 Container = $deletedObjectsDn
                 Trustees  = $granted
-                Detail    = $(if ([string] $status -eq 'N/A') {
+                Detail    = $(if ($unresolvableAccount.Count -gt 0) {
+                    ('The requested account could not be resolved to a SID on this computer, so the ACL could not be searched for it and ' +
+                    'this check could not be completed - it is NOT a finding that the grant is missing. Unresolved: {0}. This is normal when ' +
+                    'the account lives in a trusted forest this computer cannot reach. Verify on a domain controller with: dsacls "{1}"') -f `
+                        (($unresolvableAccount | Select-Object -Unique) -join ', '), $deletedObjectsDn
+                } elseif ($ambiguousTrustee.Count -gt 0) {
+                    ('A trustee with the same account name was found but its identity could not be confirmed by SID, so this is not proof ' +
+                    'of a grant - the account or the ACL entry is in a domain this computer cannot resolve. Unconfirmed: {0}. Verify on a ' +
+                    'domain controller with: dsacls "{1}"') -f (($ambiguousTrustee | Select-Object -Unique) -join ', '), $deletedObjectsDn
+                } elseif ($groupTrustee.Count -gt 0 -or $unknownKindTrustee.Count -gt 0) {
+                    ('The Directory Service Account does not appear on the ACL directly, but read access is held by {0}, so it may already ' +
+                    'have access through group membership - this check does not expand groups and did NOT establish that the grant is ' +
+                    'missing. Do NOT re-grant on the strength of this result. Confirm membership on a domain controller with: dsacls "{1}"') -f `
+                        (@(@($groupTrustee) + @($unknownKindTrustee) | Where-Object { $_ } | Select-Object -Unique) -join ', '), $deletedObjectsDn
+                } elseif ([string] $status -eq 'N/A') {
                         'Read access is granted to: {0}. Re-run with -DirectoryServiceAccount to assert a specific account' -f ($granted -join ', ')
                     } elseif ($status) {
                         'The Directory Service Account has read access to the Deleted Objects container'
@@ -2602,10 +4118,198 @@ function Get-mdiDeletedObjectsPermission {
     } catch {
         [PSCustomObject]@{
             isDeletedObjectsPermissionOk = 'N/A'
+            # A failure to read the container is a real gap, never "not asserted" - the question was
+            # asked and could not be answered, so this must keep blocking the verdict.
+            NotAsserted                  = $false
             Measured                     = $false
             details                      = [PSCustomObject]@{ Detail = 'Unable to read the Deleted Objects container: ' + $_.Exception.Message; Trustees = @() }
         }
     }
+}
+
+function Get-mdiPrincipalKind {
+    <#
+        Whether an ACL trustee is a GROUP, a non-group, or something this host cannot classify.
+
+        The Deleted Objects check reduces the container DACL to a set of trustee strings and then
+        matches the requested Directory Service Account against them by SID or name. It never
+        expanded group membership, so a DSA that holds the grant THROUGH a group - which is the
+        recommended delegation shape, and is true by default because the container carries an ACE for
+        BUILTIN\Administrators - produced output byte-for-byte identical to a DSA with no grant at
+        all: "The Directory Service Account does not have read access", a High finding, and a
+        generated dsacls /takeownership + re-grant against a production system container, to repair a
+        delegation that was perfectly intact.
+
+        Three answers, not two. 'Unknown' is not 'NonGroup': a type lookup fails when the trustee is
+        an orphaned SID, a foreign security principal, or in a trust this host cannot query, and in
+        none of those cases is "not proven to be a group" the same as "proven to be a user". Treating
+        Unknown as non-group recreates the destructive false red the moment directory access is
+        imperfect - which is exactly the condition under which this tool is usually run.
+
+        Every principal in the BUILTIN SID namespace (S-1-5-32-*) is an alias, i.e. a group. That is
+        decided from the SID prefix rather than from .AccountDomainSid, which is NULL for aliases and
+        so cannot distinguish them, and rather than from the display name, which is localised.
+    #>
+    param (
+        [Parameter(Mandatory = $true)] [AllowNull()] [AllowEmptyString()] [string] $Name,
+        [Parameter(Mandatory = $false)] [AllowNull()] [string] $Domain
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return 'Unknown' }
+    $sid = Resolve-mdiPrincipalSid -Name $Name
+    if (-not $sid) { return 'Unknown' }
+    if ([string] $sid -match '^S-1-5-32-\d+$') { return 'Group' }
+    if ([string]::IsNullOrWhiteSpace($Domain)) { return 'Unknown' }
+
+    try {
+        $principal = Get-ADObject -Server $Domain -Filter "objectSid -eq '$sid'" -Properties objectClass -ErrorAction Stop |
+            Select-Object -First 1
+        if (-not $principal) { return 'Unknown' }
+        # objectClass is MULTI-VALUED in Active Directory and this must look at the whole set, not a
+        # cast of it. A group returns @('top', 'group') and a user @('top', 'person',
+        # 'organizationalPerson', 'user'), so "[string] $principal.objectClass" joined the values with
+        # a space and compared 'top group' against 'group' - always false. EVERY group therefore came
+        # back NonGroup, and the single-valued shape that made the comparison look right never occurs
+        # against a real directory.
+        #
+        # The Deleted Objects check then treats the trustee as a definite non-match instead of a
+        # container to expand, so a Directory Service Account holding its grant THROUGH a domain group
+        # - the recommended delegation shape - reported "does not have read access", a High finding,
+        # and the generated remediation ran dsacls /takeownership against a production system
+        # container to repair a delegation that was perfectly intact. That is the exact destructive
+        # false red the surrounding comment says this function exists to prevent.
+        #
+        # -contains over the collection, case-insensitively: LDAP class names are case-insensitive and
+        # the structural class is not guaranteed to be last on every object.
+        if (@($principal.objectClass) -contains 'group') { return 'Group' }
+        return 'NonGroup'
+    } catch {
+        Write-mdiVerbose ('Unable to determine whether trustee {0} is a group: {1}' -f $Name, $_.Exception.Message)
+        return 'Unknown'
+    }
+}
+
+function Test-mdiSensorIssueFixable {
+    <#
+        Whether the generated sensor-services fix can actually resolve this finding.
+
+        The generator marks findings as covered so they are not repeated under "findings that need
+        manual attention". Registering EVERY sensor issue meant the ones it cannot fix disappeared
+        from that advisory as well - and since they were never scripted either, they vanished from
+        both surfaces and the run ended "Remediation complete" over a domain controller with no
+        sensor installed.
+
+        The emitted code starts a stopped service and sets a non-Automatic start mode back to
+        Automatic. It cannot install a service that is not there, so that is the one case reported as
+        outstanding. The strings come from Get-mdiSensorHealth in this same script - they are not
+        Windows messages, so they are not localised and matching them here is safe.
+    #>
+    param ([Parameter(Mandatory = $false)] [AllowNull()] [string] $Issue)
+
+    if ([string]::IsNullOrWhiteSpace($Issue)) { return $false }
+    [string] $Issue -notmatch 'is not installed'
+}
+
+function Get-mdiDomainCheckIssueText {
+    <#
+        The one wording for a per-domain directory check that was measured and found wrong.
+
+        Shared for the same reason Get-mdiPortIssueText and Get-mdiNnrIssueText are: the remediation
+        generator marks findings as covered by matching their TEXT, so a second copy of this sentence
+        would drift silently and the finding would reappear under "needs manual attention" directly
+        below the section that just fixed it.
+    #>
+    param (
+        [Parameter(Mandatory = $true)] [string] $CheckName,
+        [Parameter(Mandatory = $false)] [switch] $Unverified
+    )
+
+    if ($Unverified) { '{0} could not be read on this domain, so it is unverified' -f $CheckName }
+    else { '{0} is not configured on this domain' -f $CheckName }
+}
+
+function Get-mdiNnrIssueText {
+    <#
+        The one wording for "no network name resolution method could resolve this target".
+
+        Shared for the same reason Get-mdiPortIssueText is: the remediation generator marks a finding
+        as covered by matching its TEXT, so a second copy of this string drifts silently. It already
+        did - the generator was keyed on the per-port wording, which the NNR probes never produce
+        because they are AtLeastOne and reported once per target.
+    #>
+    # AllowEmptyString, and Mandatory dropped. A record whose Target is empty or $null is exactly the
+    # kind of malformed input this function must survive: bound as a Mandatory [string] it threw
+    # "Cannot bind argument to parameter 'Target' because it is an empty string", the exception
+    # escaped Get-mdiIssueList, and Set-MdiReadinessReport never got to write the file - so a single
+    # unnamed NNR target produced NO HTML REPORT AT ALL for the whole estate. Losing the entire report
+    # is far worse than one row reading "an unnamed target", and an unnamed target is itself a fact
+    # worth stating rather than a reason to abort.
+    param ([Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [string] $Target)
+
+    $name = ([string] $Target).Trim()
+    if ([string]::IsNullOrEmpty($name)) { return 'No NNR method could resolve an unnamed target' }
+    'No NNR method could resolve ' + $name
+}
+
+function Get-mdiPortIssueText {
+    <#
+        The one wording for "a required port was measured as blocked".
+
+        Shared because two surfaces have to agree on it exactly: Get-mdiIssueList raises the finding,
+        and the remediation generator marks that same finding as covered once it has scripted a fix.
+        The generator matches on the issue TEXT, so a copy of this string in either place would drift
+        the moment one was reworded - and the symptom is silent: the finding stops being recognised as
+        covered and reappears under "findings that need manual attention", telling the operator to fix
+        by hand what the script just did.
+    #>
+    param ([Parameter(Mandatory = $true)] [object] $Record)
+
+    'A required network probe was measured as blocked: {0}/{1} to {2}: {3}' -f
+    [string] $Record.Protocol, [string] $Record.Port, [string] $Record.Target, [string] $Record.Detail
+}
+
+function Get-mdiV3ActionableBlocker {
+    <#
+        The v3.x sensor blockers a remediation script may act on.
+
+        Blockers is everything that stands between a server and the v3.x sensor. ActionableBlockers is
+        the subset somebody can actually change: a member server, or a domain controller too old for
+        the v3.x sensor, is not eligible at all, so none of its other blockers are work worth doing
+        and the list is deliberately EMPTY. The remediation advisory drops those on purpose - carrying
+        them would tell the operator on every run for ever that something needs manual attention with
+        nothing they could ever do to clear it.
+
+        An empty list is that answer. An ABSENT property is not. A report written by an earlier version
+        of this script - or by another tool - carries Blockers with no ActionableBlockers at all, and
+        reading the missing property as "nothing here is actionable" deleted every v3.x finding from
+        BOTH surfaces of the remediation script at once: the v3.x section was skipped AND the advisory
+        dropped the findings. On a real lab scan three findings that the issue list, the console count
+        and the HTML report all showed for the same run - including a domain controller not onboarded
+        to Defender for Endpoint - appeared nowhere in the generated script, which then closed by
+        announcing a smaller number of items still needing manual attention.
+
+        When the classification is absent the blockers are returned unfiltered. Surfacing a finding
+        that turns out to be architectural costs the operator a line to read; deleting one that was
+        real costs them the finding.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $Detail
+    )
+
+    if ($null -eq $Detail) { return @() }
+
+    # Presence is tested on the container, not by reading the value: $null is what BOTH "absent" and
+    # "present and empty" look like once read, and those are the two cases that must be told apart.
+    # A dictionary is checked by key, because a report that has been through another tool's JSON
+    # handling arrives as a hashtable rather than as a PSCustomObject.
+    $hasProperty = if ($Detail -is [Collections.IDictionary]) {
+        $Detail.Contains('ActionableBlockers')
+    } else {
+        $null -ne $Detail.PSObject.Properties['ActionableBlockers']
+    }
+
+    if (-not $hasProperty) { return @($Detail.Blockers | Where-Object { $_ }) }
+    @($Detail.ActionableBlockers | Where-Object { $_ })
 }
 
 function New-mdiRemediationScript {
@@ -2619,7 +4323,7 @@ function New-mdiRemediationScript {
     # CA and Entra Connect roles appeared three times, so the generated script set its power scheme,
     # restarted its sensor and rewrote its audit policy three times over.
     $servers = @(Merge-mdiServerByFqdn -Server @(@($ReportData.DomainControllers) + @($ReportData.CAServers) + @($ReportData.EntraConnectServers) |
-                Where-Object { $_ -and -not $_.Unreachable }))
+                Where-Object { $_ -and -not (Test-mdiServerIsUnreachable -Server $_) }))
 
     $script = New-Object -TypeName System.Collections.ArrayList
     $add = { param([string] $Line) [void] $script.Add($Line) }
@@ -2632,12 +4336,26 @@ function New-mdiRemediationScript {
     # literal early and the rest of the value is parsed as code. Newlines are collapsed because a literal
     # cannot span lines here.
     #
+    # ASCII U+0027 is not the only character Windows PowerShell accepts as a single-quote delimiter:
+    # the typographic quotes U+2018, U+2019, U+201A and U+201B close a literal just as surely. Escaping
+    # only U+0027 left a hole that needs no attacker to reach - U+2019 is the ordinary apostrophe in
+    # French and appears in localised Windows error text, which flows into detail strings, blocker
+    # text, the Deleted Objects DN and every advisory line. One of them ends the literal and turns the
+    # remainder of the value into executable code in a script the operator has been told to run; an
+    # odd number of them instead makes the generated file fail to parse at all. Proved by generating a
+    # script from a value carrying U+2019 and finding a live CommandAst in the result.
+    #
+    # All five are folded to an escaped ASCII apostrophe rather than doubled in place. Doubling would
+    # rely on the tokenizer accepting a doubled typographic quote as an escape, which is not
+    # documented; normalising leaves only ASCII quotes in the emitted literal, where the doubling rule
+    # is certain. The reader loses nothing but the shape of the apostrophe.
+    #
     # $cmt prepares a value for a comment line: a comment ends at the newline, so a value containing one
     # leaves the remainder of the text on its own line as EXECUTABLE SCRIPT. This is the more dangerous
     # of the two, and the reason both exist rather than relying on the values being well behaved.
     $lit = {
         param([object] $Value)
-        (([string] $Value) -replace '[\r\n]+', ' ') -replace "'", "''"
+        (([string] $Value) -replace '[\r\n]+', ' ') -replace "[\u0027\u2018\u2019\u201A\u201B]", "''"
     }
     # A value on a comment line must not be able to terminate the comment. Newlines are collapsed so
     # the remainder cannot fall onto its own line as executable script, AND the block-comment
@@ -2652,9 +4370,16 @@ function New-mdiRemediationScript {
     }
     # Emits a list of values as an indented block of single-quoted literals, each escaped. Used wherever
     # the generator writes an array of server names or addresses into the script.
+    #
+    # Escaped THROUGH $lit rather than by repeating the expression. The two carried separate copies of
+    # the same rule, so the typographic-quote hole above had to be found and fixed twice - and was
+    # fixed once. One spelling of one fact.
     $litList = {
         param([object[]] $Values)
-        $escaped = @($Values | Where-Object { $_ } | ForEach-Object { (([string] $_) -replace '[\r\n]+', ' ') -replace "'", "''" })
+        # Whitespace-only is dropped as well as empty. A server whose FQDN is ' ' is not a remoting
+        # target: emitted as a literal it produced a foreach body that ran against a blank computer
+        # name on every iteration.
+        $escaped = @($Values | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } | ForEach-Object { & $lit $_ })
         if ($escaped.Count -eq 0) { return "" }
         "    '" + ($escaped -join ("'," + [environment]::NewLine + "    '")) + "'"
     }
@@ -2662,7 +4387,7 @@ function New-mdiRemediationScript {
     & $add '<#'
     & $add '    Microsoft Defender for Identity - generated remediation script'
     & $add ('    Source report : mdi-{0}' -f (& $cmt $ReportData.Domain))
-    & $add ('    Generated     : {0}' -f [datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))
+    & $add ('    Generated     : {0}' -f [datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss', [cultureinfo]::InvariantCulture))
     & $add ''
     & $add '    REVIEW EVERY COMMAND BEFORE RUNNING IT. This script is generated from the findings of'
     & $add '    Test-MdiReadiness.ps1 and changes audit policy, registry values and firewall rules on'
@@ -2689,6 +4414,10 @@ function New-mdiRemediationScript {
     & $add '# or misbehaving server does not abort the rollout for every other server, and the run ends with'
     & $add '# an explicit list rather than an optimistic "complete".'
     & $add '$script:mdiFailed = New-Object System.Collections.ArrayList'
+    # Servers whose remediation could be neither confirmed nor disproved - the command ran but its
+    # status file could not be read back. Tracked separately from mdiFailed so the closing summary can
+    # say "unverified" rather than picking a side it has no evidence for.
+    & $add '$script:mdiUnconfirmed = New-Object System.Collections.ArrayList'
     & $add ''
     & $add '# WinRM is disabled in many environments, so remoting is probed once per server and WMI is'
     & $add '# used when it is unavailable. Win32_Process.Create returns no output, so the WMI path reports'
@@ -2719,21 +4448,69 @@ function New-mdiRemediationScript {
     & $add '    }'
     & $add ''
     & $add '    if ($script:mdiTransport[$ComputerName]) {'
+    # The WinRM branch must inspect $LASTEXITCODE exactly as the WMI branch below does.
+    #
+    # It used to call Invoke-Command and return, so a native command that FAILED - auditpol.exe,
+    # dsacls.exe, reg.exe all report failure through an exit code, not an exception - completed
+    # silently and the run ended "Remediation complete." Measured: eight failing auditpol calls
+    # reported success over WinRM while the identical script over WMI reported "the command exited
+    # with code 1". WinRM is the DEFAULT transport, so the silent path was the usual one.
+    #
+    # The check runs INSIDE the remote session, because $LASTEXITCODE is set in the session where the
+    # command ran and does not come back across the wire. Throwing there surfaces as a terminating
+    # error locally, which is what the caller already handles for the WMI path.
+    #
+    # $global:LASTEXITCODE is reset first: a stale value from an earlier command in the same session
+    # would otherwise be attributed to this one.
+    #
+    # What this wrapper can and cannot promise, stated precisely because the previous wording
+    # ('EVERY native call is checked, not merely the last') was not true and was read as a guarantee
+    # by the sections that emit BATCHES. The wrapper receives an opaque scriptblock and inspects
+    # $LASTEXITCODE once, AFTER it has run, so what it actually checks is the exit code left behind
+    # by whichever command ran LAST. For a single-command batch that is the whole story. For a
+    # multi-command batch it is not: a batch whose first call fails and whose last call succeeds
+    # reports success from here. Two sections were relying on the promise and were silently
+    # unprotected - the advanced audit policy (one auditpol.exe /set per subcategory) and the time
+    # synchronisation section (w32tm /resync followed by a read-only w32tm /query).
+    #
+    # A caller emitting more than one native command MUST therefore check each one inside the
+    # scriptblock, which is what the audit policy, time synchronisation and Deleted Objects sections
+    # now do. This check remains as the backstop for the final command.
+    & $add '        $mdiRemoteWrapper = {'
+    & $add '            param($mdiInner, $mdiArgs)'
+    & $add '            $global:LASTEXITCODE = 0'
+    & $add '            $mdiOut = if ($mdiArgs) { & $mdiInner @mdiArgs } else { & $mdiInner }'
+    & $add '            if ($LASTEXITCODE -ne 0) { throw ("the command exited with code " + $LASTEXITCODE) }'
+    & $add '            $mdiOut'
+    & $add '        }'
     & $add '        if ($ArgumentList) {'
-    & $add '            Invoke-Command -ComputerName $ComputerName -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList'
+    & $add '            Invoke-Command -ComputerName $ComputerName -ScriptBlock $mdiRemoteWrapper -ArgumentList $ScriptBlock, $ArgumentList -ErrorAction Stop'
     & $add '        } else {'
-    & $add '            Invoke-Command -ComputerName $ComputerName -ScriptBlock $ScriptBlock'
+    & $add '            Invoke-Command -ComputerName $ComputerName -ScriptBlock $mdiRemoteWrapper -ArgumentList $ScriptBlock, $null -ErrorAction Stop'
     & $add '        }'
     & $add '        return'
     & $add '    }'
     & $add ''
     & $add '    # Rebuild the arguments as literals, since a scriptblock sent through WMI carries no session state'
+    & $add '    #'
+    & $add '    # All FIVE single-quote characters are escaped, not only the ASCII apostrophe. Windows'
+    & $add '    # PowerShell treats U+2018/U+2019/U+201A/U+201B as string delimiters exactly like U+0027, so'
+    & $add '    # doubling only U+0027 left a value containing a typographic quote free to CLOSE its own'
+    & $add '    # literal and have the remainder parsed as code. Measured: an argument of'
+    & $add '    #   dc1<U+2019>; Set-Content -LiteralPath <U+2019>C:\...<U+2019> -Value PWNED; <U+2019>'
+    & $add '    # produced a two-element array and wrote the file - arbitrary code running through'
+    & $add '    # Win32_Process.Create on a DOMAIN CONTROLLER, under the privileges of the administrator who'
+    & $add '    # was told to run the remediation. Server and adapter names reach here from AD and from'
+    & $add '    # -DomainController / -CAServer, and a name pasted out of a document or a ticket carries'
+    & $add '    # typographic quotes routinely. The generator own literal helper already neutralises the'
+    & $add '    # whole set; this path had been left on the ASCII-only form.'
+    $quoteClass = '"[\u0027\u2018\u2019\u201A\u201B]"'
     & $add '    $invocation = if ($ArgumentList) {'
     & $add '        $literals = foreach ($argument in $ArgumentList) {'
-    & $add '            if ($argument -is [System.Array]) {'
-    & $add '                ''@('' + ((@($argument) | ForEach-Object { "''" + ([string] $_ -replace "''", "''''") + "''" }) -join '','') + '')'''
+    & $add '            if ($argument -is [Array]) {'
+    & $add ('                ''@('' + ((@($argument) | ForEach-Object { "''" + ([string] $_ -replace ' + $quoteClass + ', "''''") + "''" }) -join '','') + '')''')
     & $add '            } else {'
-    & $add '                "''" + ([string] $argument -replace "''", "''''") + "''"'
+    & $add ('                "''" + ([string] $argument -replace ' + $quoteClass + ', "''''") + "''"')
     & $add '            }'
     & $add '        }'
     & $add '        ''$__mdiArgs = @('' + ($literals -join '','') + '')'' + [environment]::NewLine +'
@@ -2746,6 +4523,11 @@ function New-mdiRemediationScript {
     & $add '    # Win32_Process.Create returns only whether the process STARTED, so without this the helper'
     & $add '    # reported success for a command that failed - and a remediation script that silently does'
     & $add '    # nothing is worse than one that fails loudly.'
+    & $add '    # The status file carries a Windows error message, which is LOCALISED - on a German or'
+    & $add '    # Japanese server it is not ASCII. Written as ASCII it came back as "FAIL: Acc?s refus?",'
+    & $add '    # so the one diagnostic the operator gets when a remediation step fails was unreadable in'
+    & $add '    # exactly the environments hardest to troubleshoot. UTF8 through Set-Content emits a byte'
+    & $add '    # order mark, which is what makes the Get-Content read below decode it correctly.'
     & $add '    $statusName = ''mdi-status-{0}.txt'' -f [guid]::NewGuid().ToString(''N'')'
     & $add '    $statusLocal = Join-Path $env:SystemRoot ("Temp\" + $statusName)'
     & $add '    $statusRemote = ''\\{0}\C$\Windows\Temp\{1}'' -f $ComputerName, $statusName'
@@ -2753,9 +4535,9 @@ function New-mdiRemediationScript {
     & $add '        ''  $ErrorActionPreference = "Stop"'' + [environment]::NewLine +'
     & $add '        ''  $global:LASTEXITCODE = 0'' + [environment]::NewLine + $invocation + [environment]::NewLine +'
     & $add '        ''  if ($LASTEXITCODE -ne 0) { throw ("the command exited with code " + $LASTEXITCODE) }'' + [environment]::NewLine +'
-    & $add '        ''  "OK" | Set-Content -Path "'' + $statusLocal + ''" -Encoding ASCII'' + [environment]::NewLine +'
+    & $add '        ''  "OK" | Set-Content -Path "'' + $statusLocal + ''" -Encoding UTF8'' + [environment]::NewLine +'
     & $add '        ''} catch {'' + [environment]::NewLine +'
-    & $add '        ''  ("FAIL: " + $_.Exception.Message) | Set-Content -Path "'' + $statusLocal + ''" -Encoding ASCII'' + [environment]::NewLine +'
+    & $add '        ''  ("FAIL: " + $_.Exception.Message) | Set-Content -Path "'' + $statusLocal + ''" -Encoding UTF8'' + [environment]::NewLine +'
     & $add '        ''}'''
     & $add ''
     & $add '    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($invocation))'
@@ -2767,11 +4549,14 @@ function New-mdiRemediationScript {
     & $add '        throw ("Unable to start the remediation command on {0}: Win32_Process.Create returned {1}" -f $ComputerName, $process.ReturnValue)'
     & $add '    }'
     & $add ''
-    & $add '    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)'
+    & $add '    # A stopwatch, not a wall-clock deadline: a clock correction while this waits - an NTP'
+    & $add '    # sync, or an administrator fixing the very skew this tool reported - would otherwise make'
+    & $add '    # the wait expire instantly or never expire at all, on a remediation run against a DC.'
+    & $add '    $waitTimer = [System.Diagnostics.Stopwatch]::StartNew()'
     & $add '    $filter = "ProcessId={0}" -f $process.ProcessId'
     & $add '    $exited = $false'
     & $add '    try {'
-    & $add '    while ((Get-Date) -lt $deadline) {'
+    & $add '    while ($waitTimer.Elapsed.TotalSeconds -lt $TimeoutSeconds) {'
     & $add '        $running = Get-WmiObject -ComputerName $ComputerName -Class Win32_Process -Filter $filter -ErrorAction SilentlyContinue'
     & $add '        if (-not $running) { $exited = $true; break }'
     & $add '        Start-Sleep -Seconds 2'
@@ -2784,6 +4569,16 @@ function New-mdiRemediationScript {
     & $add '    $status = $null'
     & $add '    try { $status = (Get-Content -Path $statusRemote -ErrorAction Stop -Raw).Trim() } catch {}'
     & $add '    if ($null -eq $status) {'
+    # Recorded, not merely warned about. The command may have succeeded or failed; we could not read
+    # the status file over the admin share, so we do not know - and "we do not know" is the one
+    # answer this tool must never round up to success. It used to warn and fall through, and the run
+    # still ended "Remediation complete", so a scrolled-past warning was the only trace that a
+    # production change had gone unverified.
+    #
+    # It is deliberately NOT added to mdiFailed either: claiming the command failed is as unfounded
+    # as claiming it succeeded. The closing summary reports it as its own third state, exactly as the
+    # report itself separates a failed check from an unmeasured one.
+    & $add '        [void] $script:mdiUnconfirmed.Add($ComputerName)'
     & $add '        Write-Warning ("Could not confirm the result on {0}: the status file could not be read over the admin share. Verify the change manually." -f $ComputerName)'
     & $add '    } elseif ($status -ne ''OK'') {'
     & $add '        throw ("The remediation command failed on {0}: {1}" -f $ComputerName, $status)'
@@ -2797,12 +4592,62 @@ function New-mdiRemediationScript {
     & $add ''
 
     $sections = 0
+    # Findings that a scripted section below actually addresses. The advisory at the end lists what is
+    # LEFT, so it needs to know what was handled - otherwise it repeats findings that the script fixes
+    # three lines further up and tells the operator that manual attention is still needed for something
+    # the script just did. Keyed by server and by the exact issue text the report uses, so the two views
+    # cannot drift apart.
+    $covered = New-Object -TypeName System.Collections.Generic.HashSet[string]
+    $coverKey = { param($Server, $Issue) '{0}{1}{2}' -f [string] $Server, [char]31, [string] $Issue }
+    # Coverage is claimed through here and nowhere else, because claiming it is what SILENCES the
+    # advisory at the end of the script. A server whose name is empty or whitespace is filtered out of
+    # every emitted target list by $litList - it cannot be a remoting target - so the section that was
+    # supposed to fix it consists of an empty foreach. Marking it covered anyway meant the finding was
+    # dropped from the advisory too, and the script closed "Remediation complete. Re-run
+    # Test-MdiReadiness.ps1 to verify." with a High severity issue neither fixed nor mentioned.
+    #
+    # One rule, applied at the single point where coverage is recorded: nothing $litList would refuse
+    # to emit may be called covered.
+    $markCovered = {
+        param($Server, $Issue)
+        if ([string]::IsNullOrWhiteSpace([string] $Server)) { return }
+        [void] $covered.Add((& $coverKey $Server $Issue))
+    }
+    # Boolean checks are reported as "<friendly name> check failed", which is how Get-mdiIssueList words
+    # them; the wording is produced by the same helper here so a rename cannot desynchronise the two.
+    $coverCheck = {
+        param($Servers, $PropertyName)
+        $issueText = (ConvertTo-mdiFriendlyName ([string] $PropertyName)) + ' check failed'
+        foreach ($s in $Servers) { & $markCovered $s.FQDN $issueText }
+    }
 
     # --- Advanced audit policy ---------------------------------------------------------------------------------
-    $auditFailures = @($servers | Where-Object { $_.PSObject.Properties['AdvancedAuditing'] -and -not $_.AdvancedAuditing })
-    if ($auditFailures.Count -gt 0) {
+    # Driven off a role table rather than the domain controller property alone. Only 'AdvancedAuditing'
+    # was inspected, which is the DC property: a certificate authority whose advanced audit policy was
+    # measured as misconfigured ('AdvancedAuditingCA') and an Entra Connect server in the same state
+    # ('AdvancedAuditingEntraConnect') produced NO remediation section at all - and because the advisory
+    # below used to be suppressed as soon as any other section fired, they produced no advisory either.
+    # A measured failure vanished from the generated script entirely. The GUID lists for both roles were
+    # already present in $settings and simply had no consumer.
+    #
+    # The gate is written '-eq $false' rather than '-not $_.X'. These readers return the tri-state
+    # $true / $false / 'N/A', and remediation must never be generated for a check that was not measured:
+    # 'N/A' means the audit policy could not be read, not that it is wrong, and rewriting audit policy on
+    # a server whose current policy is unknown is exactly the kind of change this tool must not invent.
+    $auditRoles = @(
+        [PSCustomObject]@{ Property = 'AdvancedAuditing'; Policy = $settings.AdvancedAuditPolicyDCs; Label = 'domain controllers' }
+        [PSCustomObject]@{ Property = 'AdvancedAuditingCA'; Policy = $settings.AdvancedAuditPolicyCAs; Label = 'certificate authority servers' }
+        [PSCustomObject]@{ Property = 'AdvancedAuditingEntraConnect'; Policy = $settings.AdvancedAuditPolicyEntraConnect; Label = 'Entra Connect servers' }
+    )
+    foreach ($role in $auditRoles) {
+        $roleProperty = [string] $role.Property
+        $auditFailures = @($servers | Where-Object {
+                $_.PSObject.Properties[$roleProperty] -and (Test-mdiCheckFailed -Value $_.$roleProperty)
+            })
+        if ($auditFailures.Count -eq 0) { continue }
         $sections++
-        & $add '#region Advanced audit policy'
+        & $coverCheck $auditFailures $roleProperty
+        & $add ('#region Advanced audit policy - {0}' -f $role.Label)
         & $add '# https://aka.ms/mdi/advancedauditing'
         & $add ('# Affected: {0}' -f (& $cmt ((@($auditFailures.FQDN)) -join ', ')))
         & $add 'foreach ($computer in @('
@@ -2811,13 +4656,25 @@ function New-mdiRemediationScript {
         & $add '    if ($PSCmdlet.ShouldProcess($computer, ''Configure the MDI advanced audit policy'')) {'
         & $add '        try {'
         & $add '        Invoke-MdiRemote -ComputerName $computer -ScriptBlock {'
-        foreach ($row in ($settings.AdvancedAuditPolicyDCs | ConvertFrom-Csv)) {
+        foreach ($row in ($role.Policy | ConvertFrom-Csv)) {
             # Single-quoted and $lit-escaped. The GUID comes from the hard-coded settings block today,
             # so a double-quoted argument is safe in practice - but it is the one place in the
             # generator where a value lands in an EXECUTABLE position rather than inside a literal, and
             # $cmt only collapses newlines. Making it a proper literal means a future settings change
             # cannot turn this line into command injection.
+            # EVERY call is checked, not merely the last. The wrapper Invoke-MdiRemote emits inspects
+            # $LASTEXITCODE ONCE, after the whole scriptblock has run, so in a BATCH only the FINAL
+            # command's code survives - and this section emits one /set per subcategory. Measured end
+            # to end with a stub auditpol.exe: 7 of 8 calls failing, generated script exit code 0, no
+            # failing server recorded and a transcript ending 'Remediation complete.' An operator was
+            # told the audit policy had been configured when almost none of it had.
+            #
+            # $global:LASTEXITCODE is reset before each call so a stale value from the previous
+            # subcategory cannot be attributed to this one, and the failing subcategory is NAMED,
+            # because 'auditpol failed' without saying which of eighteen it was is not actionable.
+            & $add '            $global:LASTEXITCODE = 0'
             & $add ('            auditpol.exe /set /subcategory:''{0}'' /success:enable /failure:enable' -f (& $lit $row.'Subcategory GUID'))
+            & $add ('            if ($LASTEXITCODE -ne 0) { throw ("auditpol.exe /set /subcategory:''' + (& $lit $row.'Subcategory GUID') + ''' exited with code " + $LASTEXITCODE) }')
         }
         & $add '        }'
         & $add '        } catch {'
@@ -2831,9 +4688,15 @@ function New-mdiRemediationScript {
     }
 
     # --- NTLM auditing -----------------------------------------------------------------------------------------
-    $ntlmFailures = @($servers | Where-Object { $_.PSObject.Properties['NtlmAuditing'] -and -not $_.NtlmAuditing })
+    # '-eq $false', not '-not $_.X'. These readers return the tri-state $true / $false / 'N/A', and the
+    # two forms agree on 'N/A' only by accident ('N/A' is a non-empty string and therefore truthy). They
+    # diverge on $null, which a legacy or partial report can carry: '-not $null' is $true, so the old
+    # form would have generated a registry change for a server whose NTLM auditing was never read. Every
+    # other gate in this generator already uses the explicit form.
+    $ntlmFailures = @($servers | Where-Object { $_.PSObject.Properties['NtlmAuditing'] -and (Test-mdiCheckFailed -Value $_.NtlmAuditing) })
     if ($ntlmFailures.Count -gt 0) {
         $sections++
+        & $coverCheck $ntlmFailures 'NtlmAuditing'
         & $add '#region NTLM auditing'
         & $add '# https://aka.ms/mdi/ntlmauditing'
         & $add ('# Affected: {0}' -f (& $cmt ((@($ntlmFailures.FQDN)) -join ', ')))
@@ -2844,7 +4707,15 @@ function New-mdiRemediationScript {
         & $add '        try {'
         & $add '        Invoke-MdiRemote -ComputerName $computer -ScriptBlock {'
         foreach ($entry in $settings.NTLMAuditing) {
-            $regPath, $regValue, $expected = $entry -split ','
+            # The same right-anchored parse the reader uses. These particular specifications are static
+            # and carry no comma today, but the generator WRITES REGISTRY VALUES on production domain
+            # controllers from whatever this produces, so it must not carry a second, weaker copy of a
+            # rule that has already been wrong once.
+            $spec = Split-mdiRegistrySpec -Spec $entry
+            if ($null -eq $spec) { continue }
+            $regPath = $spec.KeyPath
+            $regValue = $spec.ValueName
+            $expected = $spec.ExpectedValue
             # The expected value can be a regular expression alternation, so the first branch is the value to set
             $value = (($expected -split '\|')[0]).Trim()
             & $add ('            New-ItemProperty -Path ''HKLM:\{0}'' -Name ''{1}'' -Value {2} -PropertyType DWord -Force | Out-Null' -f (& $lit $regPath), (& $lit $regValue), ([int] $value))
@@ -2861,9 +4732,10 @@ function New-mdiRemediationScript {
     }
 
     # --- Power scheme ------------------------------------------------------------------------------------------
-    $powerFailures = @($servers | Where-Object { $_.PSObject.Properties['PowerSettings'] -and -not $_.PowerSettings })
+    $powerFailures = @($servers | Where-Object { $_.PSObject.Properties['PowerSettings'] -and (Test-mdiCheckFailed -Value $_.PowerSettings) })
     if ($powerFailures.Count -gt 0) {
         $sections++
+        & $coverCheck $powerFailures 'PowerSettings'
         & $add '#region High performance power scheme'
         & $add '# https://aka.ms/mdi/powersettings'
         & $add 'foreach ($computer in @('
@@ -2892,9 +4764,33 @@ function New-mdiRemediationScript {
     # reverse-direction fallback path, where the measurement answers a different question entirely.
     # Changing a firewall on the strength of a probe that never ran is the most damaging thing this
     # tool could do.
-    $blockedNnr = @(Get-mdiPortResultRecord -Server $servers |
-            Where-Object { $_.Applicable -eq $true -and -not $_.Success -and $_.Group -eq 'NNR' -and
-                [string] $_.Detail -notmatch $script:mdiPortNotTestedPattern })
+    #
+    # Grouped per TARGET through the same function the verdict uses, not filtered record by record.
+    # NNR probes are Requirement='AtLeastOne': a device is resolvable the moment ONE method answers,
+    # which is exactly what the 'Low success rate of active name resolution' alert measures. Selecting
+    # every individually-unsuccessful record instead meant a device that resolves perfectly well over
+    # NetBIOS still had inbound RPC opened because its RPC probe failed - a firewall change, on a
+    # production endpoint, widening attack surface, to fix a problem this tool's own report does not
+    # report: measured on a one-target/two-method fixture, the issue list returned 0 findings and the
+    # KPI read 1/1 resolvable while the generated script created MDI-NNR-RPC-In on that very host.
+    # Get-mdiBlockingPortFailure already performs the AtLeastOne grouping and marks the genuinely
+    # unresolvable targets 'NnrMeasured', so deriving from it keeps the remediation and the verdict on
+    # one definition instead of two that drift.
+    $nnrRecords = @(Get-mdiPortResultRecord -Server $servers)
+    $nnrKeySeparator = [string][char]31
+    $unresolvableKey = @(Get-mdiBlockingPortFailure -Record $nnrRecords |
+            Where-Object { [string] $_.BlockingKind -eq 'NnrMeasured' } |
+            ForEach-Object { (@($_.Server, $_.Target, $_.TargetIP) | ForEach-Object { [string] $_ }) -join $nnrKeySeparator })
+    # Routed through the shared measured-probe predicate rather than repeating its three clauses by
+    # hand. The longhand read '-not $_.Success', which is TRUE for a probe whose Success normalised to
+    # $null - a probe that produced no result at all - so a record nobody managed to measure could be
+    # written into the generated script as an explicit New-NetFirewallRule. That is an operator
+    # opening a port on a domain controller on the strength of a measurement that does not exist, and
+    # it is the same $null-is-not-a-failure defect the predicate was created for. Test-mdiProbeWasMeasured
+    # is the same definition the ports KPI, the detail matrix and the verdict already use.
+    $blockedNnr = @($nnrRecords |
+            Where-Object { (Test-mdiProbeWasMeasured -Record $_) -and $_.Success -eq $false -and $_.Group -eq 'NNR' -and
+                ((@($_.Server, $_.Target, $_.TargetIP) | ForEach-Object { [string] $_ }) -join $nnrKeySeparator) -in $unresolvableKey })
     $ruleMap = @{
         135  = @{ Name = 'MDI-NNR-RPC-In'; Protocol = 'TCP'; Display = 'MDI Network Name Resolution - NTLM over RPC (TCP 135)' }
         137  = @{ Name = 'MDI-NNR-NetBIOS-In'; Protocol = 'UDP'; Display = 'MDI Network Name Resolution - NetBIOS (UDP 137)' }
@@ -2916,7 +4812,7 @@ function New-mdiRemediationScript {
         # If no sensor is deployed yet the domain controllers are where the sensors will go, so they are
         # the correct source list for a pre-deployment run.
         if ($sensorHosts.Count -eq 0) {
-            $sensorHosts = @(@($ReportData.DomainControllers) | Where-Object { $_ -and -not $_.Unreachable })
+            $sensorHosts = @(@($ReportData.DomainControllers) | Where-Object { $_ -and -not (Test-mdiServerIsUnreachable -Server $_) })
         }
         # Every address of every sensor, not one each. The rules below scope inbound access by source
         # address, and a multi-homed sensor sends its NNR probes from whichever interface routes to the
@@ -2941,7 +4837,7 @@ function New-mdiRemediationScript {
     # emit a foreach over nothing and report success having changed nothing. Neither is acceptable in
     # a script an operator runs against production, so the section is skipped and the reason stated.
     if ($blockedNnr.Count -gt 0 -and ($sensorIps.Count -eq 0 -or $blockedTargets.Count -eq 0)) {
-        Write-Warning ('Network Name Resolution ports were found blocked, but the remediation section was skipped: {0}.' -f
+        Write-mdiWarning ('Network Name Resolution ports were found blocked, but the remediation section was skipped: {0}.' -f
             $(if ($sensorIps.Count -eq 0) { 'no sensor source address could be determined' } else { 'no target could be determined' }))
     }
 
@@ -3023,6 +4919,30 @@ function New-mdiRemediationScript {
         & $add '}'
         & $add '#endregion'
         & $add ''
+
+        # Marked as covered only for the targets this section actually SCRIPTS. Without this the same
+        # findings were emitted twice: once as firewall rules created here, and again at the end under
+        # "Findings that need manual attention", telling the operator to resolve by hand what the
+        # script had just done three lines earlier.
+        #
+        # Keyed on the wording the issue list really uses. The first attempt at this keyed on the
+        # per-PORT wording ("a required network probe was measured as blocked"), which the NNR probes
+        # never produce: they are AtLeastOne, so a target where every method failed is reported ONCE,
+        # per target, as "No NNR method could resolve X". The two sets were disjoint and the fix was
+        # dead code that still passed a test written against the same wrong assumption. The wording now
+        # comes from a shared helper used by the issue list itself, so they cannot disagree.
+        #
+        # A target is only covered when every one of its blocked NNR methods was scripted. If any
+        # failing method has no rule in $ruleMap then something about that target is still unfixed and
+        # the finding has to stay visible.
+        foreach ($target in $blockedTargets) {
+            $forTarget = @($blockedNnr | Where-Object { [string] $_.Target -eq [string] $target })
+            $unscripted = @($forTarget | Where-Object { -not $ruleMap.ContainsKey([int] $_.Port) })
+            if ($forTarget.Count -eq 0 -or $unscripted.Count -gt 0) { continue }
+            foreach ($server in @($forTarget | ForEach-Object { [string] $_.Server } | Select-Object -Unique)) {
+                & $markCovered $server (Get-mdiNnrIssueText -Target $target)
+            }
+        }
     }
 
     # --- Domain wide auditing ----------------------------------------------------------------------------------
@@ -3065,6 +4985,7 @@ function New-mdiRemediationScript {
         $objectValue = $domainRow.ObjectAuditing.isObjectAuditingOk
         if ([string] $objectValue -eq 'False') {
             $sections++
+            & $markCovered $domainName (Get-mdiDomainCheckIssueText -CheckName 'Object auditing')
             & $add '#region Domain object auditing'
             & $add '# https://aka.ms/mdi/objectauditing'
             & $add ('# Domain: {0}' -f (& $cmt $domainName))
@@ -3079,6 +5000,7 @@ function New-mdiRemediationScript {
             & $add ''
         } elseif ($domainRow.ObjectAuditingMeasured -eq $false) {
             $sections++
+            & $markCovered $domainName (Get-mdiDomainCheckIssueText -CheckName 'Object auditing' -Unverified)
             & $add '#region Domain object auditing (could not be verified)'
             & $add ('# Domain: {0}' -f (& $cmt $domainName))
             & $add ('Write-Warning ''Domain object auditing could not be read on {0}, so it is unverified. Check it manually: https://aka.ms/mdi/objectauditing''' -f (& $lit $domainName))
@@ -3096,6 +5018,7 @@ function New-mdiRemediationScript {
         $exchangeValue = $domainRow.ExchangeAuditing.isExchangeAuditingOk
         if ([string] $exchangeValue -eq 'False') {
             $sections++
+            & $markCovered $domainName (Get-mdiDomainCheckIssueText -CheckName 'Exchange auditing')
             & $add '#region Exchange auditing (manual)'
             & $add '# https://aka.ms/mdi/exchangeauditing'
             & $add ('# Domain: {0}' -f (& $cmt $domainName))
@@ -3106,6 +5029,7 @@ function New-mdiRemediationScript {
             & $add ''
         } elseif ($domainRow.ExchangeAuditingMeasured -eq $false) {
             $sections++
+            & $markCovered $domainName (Get-mdiDomainCheckIssueText -CheckName 'Exchange auditing' -Unverified)
             & $add '#region Exchange auditing (could not be verified)'
             & $add ('# Domain: {0}' -f (& $cmt $domainName))
             & $add ('Write-Warning ''Exchange auditing could not be read on {0}, so it is unverified. Check it manually: https://aka.ms/mdi/exchangeauditing''' -f (& $lit $domainName))
@@ -3118,6 +5042,7 @@ function New-mdiRemediationScript {
         $adfsValue = $domainRow.AdfsAuditing.isAdfsAuditingOk
         if ([string] $adfsValue -eq 'False') {
             $sections++
+            & $markCovered $domainName (Get-mdiDomainCheckIssueText -CheckName 'AD FS auditing')
             & $add '#region AD FS auditing (manual)'
             & $add '# https://aka.ms/mdi/adfsauditing'
             & $add ('# Domain: {0}' -f (& $cmt $domainName))
@@ -3128,6 +5053,7 @@ function New-mdiRemediationScript {
             & $add ''
         } elseif ($domainRow.AdfsAuditingMeasured -eq $false) {
             $sections++
+            & $markCovered $domainName (Get-mdiDomainCheckIssueText -CheckName 'AD FS auditing' -Unverified)
             & $add '#region AD FS auditing (could not be verified)'
             & $add ('# Domain: {0}' -f (& $cmt $domainName))
             & $add ('Write-Warning ''AD FS auditing could not be read on {0}, so it is unverified. Check it manually: https://aka.ms/mdi/adfsauditing''' -f (& $lit $domainName))
@@ -3137,9 +5063,41 @@ function New-mdiRemediationScript {
     }
 
     # --- Sensor services ---------------------------------------------------------------------------------------
-    $sensorStopped = @($servers | Where-Object { $_.PSObject.Properties['SensorHealth'] -and $_.SensorHealth -eq $false })
+    # A server whose sensor is not installed at all is excluded: the emitted code starts a stopped
+    # service and sets its start mode, neither of which can install anything, so including it produced
+    # a section that was guaranteed to fail against that server. Installed is tri-state and 'N/A' is a
+    # truthy string, so this compares explicitly - an unreadable service list means the sensor MIGHT be
+    # there and is still worth the attempt.
+    $sensorStopped = @($servers | Where-Object {
+            $_.PSObject.Properties['SensorHealth'] -and (Test-mdiCheckFailed -Value $_.SensorHealth) -and
+            [string] $_.Details.SensorHealthDetails.Installed -ne 'False'
+        })
     if ($sensorStopped.Count -gt 0) {
         $sections++
+        # Sensor health findings are reported with the detail text rather than a "check failed" line.
+        # Covered only for the issues the generated code below can actually RESOLVE. Registering every
+        # entry meant a finding it cannot fix was erased from the advisory as well as being absent from
+        # the script - it vanished from BOTH surfaces and the run ended "Remediation complete" over a
+        # domain controller whose sensor was not installed at all, or whose service would not start
+        # after the next reboot. That is the most severe class of defect this generator has: not a
+        # wrong fix, but a real finding silently disappearing.
+        foreach ($s in $sensorStopped) {
+            $fixableIssue = @($s.Details.SensorHealthDetails.Issues | Where-Object { $_ } |
+                    Where-Object { Test-mdiSensorIssueFixable -Issue $_ })
+            foreach ($sensorIssue in $fixableIssue) {
+                & $markCovered $s.FQDN $sensorIssue
+            }
+            # Same fallback as the time-sync section: with an empty Issues list nothing was covered,
+            # yet Get-mdiIssueList still emits the generic "Sensor Health check failed", so the script
+            # started the service and the report simultaneously told the operator to go and fix it by
+            # hand. Only claimed when the sensor is KNOWN to be installed - a server whose sensor is
+            # absent, or whose service list could not be read, is not something starting a service can
+            # repair, and covering it there would delete the finding from the manual-attention list
+            # without anything having fixed it. That is the one outcome worse than repeating a warning.
+            if ($fixableIssue.Count -eq 0 -and [string] $s.Details.SensorHealthDetails.Installed -eq 'True') {
+                & $markCovered $s.FQDN ((ConvertTo-mdiFriendlyName 'SensorHealth') + ' check failed')
+            }
+        }
         & $add '#region Defender for Identity sensor services'
         & $add ('# Affected: {0}' -f (& $cmt ((@($sensorStopped.FQDN)) -join ', ')))
         & $add 'foreach ($computer in @('
@@ -3151,8 +5109,16 @@ function New-mdiRemediationScript {
         & $add '            foreach ($name in ''AATPSensorUpdater'', ''AATPSensor'') {'
         & $add '                $service = Get-Service -Name $name -ErrorAction SilentlyContinue'
         & $add '                if ($service) {'
-        & $add '                    if ($service.StartType -eq ''Disabled'') { Set-Service -Name $name -StartupType Automatic }'
+        # Any start mode that is not Automatic, not only Disabled. A service left on Manual does not
+        # start after a reboot, so the sensor stops reporting the next time the DC restarts - and the
+        # readiness check raises exactly that finding, which this section then claimed to have fixed
+        # while only ever touching Disabled.
+        & $add '                    if ($service.StartType -ne ''Automatic'') { Set-Service -Name $name -StartupType Automatic }'
         & $add '                    if ($service.Status -ne ''Running'') { Start-Service -Name $name }'
+        & $add '                } else {'
+        # A service that is not installed cannot be started. Said out loud rather than passed over in
+        # silence, because this is the one sensor fault the script cannot repair.
+        & $add '                    Write-Warning ("The $name service is not installed on $env:COMPUTERNAME. Install or reinstall the Defender for Identity sensor: https://aka.ms/mdi/sensor-install")'
         & $add '                }'
         & $add '            }'
         & $add '        }'
@@ -3167,9 +5133,19 @@ function New-mdiRemediationScript {
     }
 
     # --- Time synchronisation ----------------------------------------------------------------------------------
-    $timeFailures = @($servers | Where-Object { $_.PSObject.Properties['TimeSync'] -and $_.TimeSync -eq $false })
+    $timeFailures = @($servers | Where-Object { $_.PSObject.Properties['TimeSync'] -and (Test-mdiCheckFailed -Value $_.TimeSync) })
     if ($timeFailures.Count -gt 0) {
         $sections++
+        foreach ($s in $timeFailures) {
+            & $markCovered $s.FQDN $s.Details.TimeSyncDetails.Detail
+            # The generic wording is covered as well as the detailed one. Get-mdiIssueList falls back
+            # to "Time Sync check failed" whenever the TimeSyncDetails record is absent, and covering
+            # only the detail left that generic finding uncovered - so the script resynchronised the
+            # clock AND the report told the operator the same clock still needed manual attention.
+            # A live scan always populates the detail, but a hand-edited or round-tripped report does
+            # not, and an advisory that cries wolf is one operators learn to skip past.
+            & $markCovered $s.FQDN ((ConvertTo-mdiFriendlyName 'TimeSync') + ' check failed')
+        }
         & $add '#region Time synchronisation'
         & $add '# MDI requires all sensor servers to be within five minutes of each other.'
         & $add ('# Affected: {0}' -f (& $cmt ((@($timeFailures.FQDN)) -join ', ')))
@@ -3179,7 +5155,20 @@ function New-mdiRemediationScript {
         & $add '    if ($PSCmdlet.ShouldProcess($computer, ''Resynchronise the clock'')) {'
         & $add '        try {'
         & $add '        Invoke-MdiRemote -ComputerName $computer -ScriptBlock {'
+        # The /resync call is checked HERE rather than being left to the wrapper. Invoke-MdiRemote
+        # inspects $LASTEXITCODE once, after the whole scriptblock, so in this two-command batch the
+        # only code ever examined belonged to the READ-ONLY /query /status that follows - and a query
+        # succeeds happily on a machine whose resync just failed. The remediating command was
+        # therefore structurally incapable of reporting failure. Measured end to end with a stub
+        # w32tm.exe: /resync exiting 1 with 'The computer did not resync because no time data was
+        # available.' on stderr still produced exit code 0, no failing server and 'Remediation
+        # complete.' A clock that is still wrong is exactly the fault MDI raises the alert for.
+        #
+        # /query /status is deliberately left after the check: it is diagnostic output for the
+        # transcript, and it must still run so the operator can see what the clock actually did.
+        & $add '            $global:LASTEXITCODE = 0'
         & $add '            w32tm.exe /resync /force'
+        & $add '            if ($LASTEXITCODE -ne 0) { throw ("w32tm.exe /resync /force exited with code " + $LASTEXITCODE) }'
         & $add '            w32tm.exe /query /status'
         & $add '        }'
         & $add '        } catch {'
@@ -3199,8 +5188,19 @@ function New-mdiRemediationScript {
     foreach ($domainRow in $auditedDomains) {
         $domainName = [string] $domainRow.Domain
         $deletedValue = $domainRow.DeletedObjects.isDeletedObjectsPermissionOk
-        if ([string] $deletedValue -eq 'False') {
+        # Defence in depth. A row that says False while ALSO recording that nothing was measured is
+        # self-contradictory, and the current producer no longer emits it - but a report that has been
+        # imported, hand-edited or written by an older version can still carry that shape, and this
+        # branch runs dsacls /takeownership against a production system container. An explicitly
+        # unmeasured result may never reach it. Tested with -ne $false rather than -eq $true so a
+        # legacy report that predates DeletedObjectsMeasured, where the property is absent and reads
+        # $null, keeps its remediation.
+        if ([string] $deletedValue -eq 'False' -and $domainRow.DeletedObjectsMeasured -ne $false) {
             $sections++
+            # This section runs dsacls.exe against the container, so the finding IS addressed here and
+            # must not also be listed under "findings that need manual attention" - which is what it
+            # was, telling the operator to grant by hand a permission the script had just granted.
+            & $markCovered $domainName (Get-mdiDomainCheckIssueText -CheckName 'Deleted Objects container permission')
             & $add '#region Deleted Objects container permissions'
             & $add '# https://aka.ms/mdi/dsa-permissions'
             & $add ('# Domain: {0}' -f (& $cmt $domainName))
@@ -3215,9 +5215,25 @@ function New-mdiRemediationScript {
             & $add '    if ([string]::IsNullOrWhiteSpace($dsaAccount)) {'
             & $add '        Write-Warning ''No Directory Service Account was given, skipping the Deleted Objects permission.'''
             & $add '    } else {'
+            # dsacls.exe reports failure through its EXIT CODE, not by throwing, so the try/catch
+            # below can never fire for the failure that actually happens: "Access is denied", "The
+            # object does not exist", an unresolvable DSA name. This section is the only part of the
+            # generated script that runs a native tool locally, outside Invoke-MdiRemote, and it was
+            # the only one with no $LASTEXITCODE check - so a dsacls that failed on every call
+            # produced a transcript byte-identical to a successful one, ending "Remediation
+            # complete." The comment on Invoke-MdiRemote names dsacls.exe as exactly this kind of
+            # command; the local call was simply missed.
+            #
+            # BOTH calls are checked, not just the last: /takeownership can fail while /G succeeds,
+            # and a run whose first call failed is a failed run. $global:LASTEXITCODE is reset first
+            # so a stale value from an earlier command cannot be attributed to this one.
             & $add '        try {'
+            & $add '            $global:LASTEXITCODE = 0'
             & $add '            dsacls.exe $container /takeownership'
+            & $add '            if ($LASTEXITCODE -ne 0) { throw ("dsacls.exe /takeownership exited with code " + $LASTEXITCODE) }'
+            & $add '            $global:LASTEXITCODE = 0'
             & $add '            dsacls.exe $container /G "${dsaAccount}:LCRP"'
+            & $add '            if ($LASTEXITCODE -ne 0) { throw ("dsacls.exe /G exited with code " + $LASTEXITCODE) }'
             & $add '        } catch {'
             & $add '            Write-Warning (''Deleted Objects permission failed: {0}'' -f $_.Exception.Message)'
             & $add '            [void] $script:mdiFailed.Add($container)'
@@ -3228,6 +5244,7 @@ function New-mdiRemediationScript {
             & $add ''
         } elseif ($domainRow.DeletedObjectsMeasured -eq $false) {
             $sections++
+            & $markCovered $domainName (Get-mdiDomainCheckIssueText -CheckName 'Deleted Objects container permission' -Unverified)
             & $add '#region Deleted Objects container permissions (could not be verified)'
             & $add ('# Domain: {0}' -f (& $cmt $domainName))
             & $add ('Write-Warning ''The Deleted Objects container permission could not be read on {0}, so it is unverified. Check it manually: https://aka.ms/mdi/dsa-permissions''' -f (& $lit $domainName))
@@ -3238,8 +5255,10 @@ function New-mdiRemediationScript {
 
     # --- Sensor v3.x blockers ----------------------------------------------------------------------------------
     # Only the blockers somebody can actually act on. @($null).Count is 1, so null entries are filtered
-    # out before counting.
-    $v3Blocked = @($servers | Where-Object { @($_.Details.SensorV3ReadyDetails.ActionableBlockers | Where-Object { $_ }).Count -gt 0 })
+    # out before counting. Resolved through Get-mdiV3ActionableBlocker, which tells a genuinely empty
+    # classification apart from an ABSENT one - reading a missing property as "nothing is actionable"
+    # skipped this whole section for reports written by an earlier version.
+    $v3Blocked = @($servers | Where-Object { @(Get-mdiV3ActionableBlocker -Detail $_.Details.SensorV3ReadyDetails).Count -gt 0 })
     if ($v3Blocked.Count -gt 0) {
         $sections++
         & $add '#region Sensor v3.x prerequisites (manual)'
@@ -3249,8 +5268,9 @@ function New-mdiRemediationScript {
             # Each blocker is printed with its server, so the person running the script sees exactly
             # what to fix without opening the file
             & $add ('Write-Host ''    {0}'' -ForegroundColor Yellow' -f (& $lit $srv.FQDN))
-            foreach ($blocker in @($srv.Details.SensorV3ReadyDetails.ActionableBlockers | Where-Object { $_ })) {
+            foreach ($blocker in @(Get-mdiV3ActionableBlocker -Detail $srv.Details.SensorV3ReadyDetails)) {
                 & $add ('Write-Host ''      - {0}'' -ForegroundColor Yellow' -f (& $lit $blocker))
+                & $markCovered $srv.FQDN $blocker
             }
         }
         & $add 'Write-Host '''''
@@ -3275,11 +5295,53 @@ function New-mdiRemediationScript {
         $outstanding = @()
     }
 
-    # Findings that produced no section above (every scriptable and advisory finding already added one,
-    # so this fires only when the section count is zero yet findings remain) are listed as advisory,
-    # named, so the operator is told exactly what still needs manual attention instead of being told
-    # everything is fine.
-    if ($sections -eq 0 -and $outstanding.Count -gt 0) {
+    # Findings that can never be acted on are removed before the advisory is built. A Windows Server 2016
+    # domain controller cannot run the v3.x sensor, and neither can a member server: those are statements
+    # of what the server IS, not tasks, and the report lists them so the estate can be planned. Carrying
+    # them into a REMEDIATION script would tell the operator that something still needs manual attention
+    # on every run for ever, with nothing they could ever do to clear it - which is how a warning stops
+    # being read at all. The sensor readiness check already separates the two: Blockers is everything,
+    # ActionableBlockers is the subset somebody can actually change.
+    #
+    # Resolved through Get-mdiV3ActionableBlocker so that an ABSENT classification - which is what a
+    # report from an earlier version carries - does not read as "none of this is actionable" and delete
+    # every v3.x finding from the advisory.
+    $unactionable = New-Object -TypeName System.Collections.Generic.HashSet[string]
+    foreach ($srv in $servers) {
+        $v3 = $srv.Details.SensorV3ReadyDetails
+        if ($null -eq $v3) { continue }
+        $actionable = @(Get-mdiV3ActionableBlocker -Detail $v3)
+        foreach ($blocker in @($v3.Blockers | Where-Object { $_ })) {
+            if (@($actionable | Where-Object { [string] $_ -eq [string] $blocker }).Count -eq 0) {
+                [void] $unactionable.Add(('{0}{1}{2}' -f [string] $srv.FQDN, [char]31, [string] $blocker))
+            }
+        }
+    }
+    if ($unactionable.Count -gt 0) {
+        $outstanding = @($outstanding | Where-Object {
+                -not $unactionable.Contains(('{0}{1}{2}' -f [string] $_.Server, [char]31, [string] $_.Issue))
+            })
+    }
+    # Anything a scripted section above already addresses is removed too. Without this the advisory
+    # repeated findings the script fixes a few lines earlier and then declared that manual attention was
+    # still required for work the script had just done - which trains the reader to ignore the warning.
+    if ($covered.Count -gt 0) {
+        $outstanding = @($outstanding | Where-Object {
+                -not $covered.Contains((& $coverKey $_.Server $_.Issue))
+            })
+    }
+
+    # Findings that produced no remediation section are listed as advisory, by name, so the operator is
+    # told exactly what still needs manual attention instead of being told everything is fine.
+    #
+    # This used to be gated on '$sections -eq 0', on the assumption that every finding either produced a
+    # section or was the only thing wrong. That assumption was false: an unreachable server, a check that
+    # could not be measured, a forest that could not be enumerated and a role with no scripted fix all
+    # produce findings with no section. So the moment ANY section fired - which is the normal case, since
+    # the script is only generated when something needs fixing - every unscriptable finding was silently
+    # dropped from the file and the script still ended by declaring the remediation complete. The
+    # operator ran it, saw success, and never learned that a domain controller had not been examined.
+    if ($outstanding.Count -gt 0) {
         $sections++
         & $add '#region Findings that need manual attention'
         & $add 'Write-Warning ''Some findings have no automatic fix and were not scripted above. They still need attention:'''
@@ -3297,22 +5359,156 @@ function New-mdiRemediationScript {
     } else {
         & $add ''
     & $add '# The outcome is stated explicitly. "Complete" on its own would read as success even when every'
-    & $add '# server failed.'
-    & $add 'if ($script:mdiFailed.Count -gt 0) {'
-    & $add '    Write-Host ('''' )'
-    & $add '    Write-Warning (''Remediation finished with failures on {0} server(s): {1}'' -f $script:mdiFailed.Count, (($script:mdiFailed | Select-Object -Unique) -join '', ''))'
-    & $add '    Write-Warning ''Fix the cause and re-run this script, then re-run Test-MdiReadiness.ps1 to verify.'''
-    & $add '} else {'
-    & $add ('Write-Host ''Remediation complete. Re-run Test-MdiReadiness.ps1 to verify.'' -ForegroundColor Green')
+    & $add '# server failed, or when findings were listed above that this script cannot fix.'
+    & $add '#'
+    & $add '# The failure list is de-duplicated BEFORE it is counted. mdiFailed is appended to once per'
+    & $add '# failing section, not once per server, so one unreachable domain controller that missed five'
+    & $add '# sections was reported as "failures on 5 server(s)" followed by a single name - a number five'
+    & $add '# times too large, sitting next to the list that contradicts it.'
+    & $add '$mdiFailedHosts = @($script:mdiFailed | Select-Object -Unique)'
+    # An unverified server blocks "complete" exactly as a failed one does. Reported on its own line
+    # because the remedy differs: a failure needs the cause fixed and the script re-run, an unverified
+    # result needs someone to look at that one server.
+    & $add '$mdiUnconfirmedHosts = @($script:mdiUnconfirmed | Select-Object -Unique | Where-Object { $_ -notin $mdiFailedHosts })'
+    & $add 'if ($mdiUnconfirmedHosts.Count -gt 0) {'
+    & $add '    Write-Host ('''')'
+    & $add '    Write-Warning (''The result could not be verified on {0} server(s): {1}'' -f $mdiUnconfirmedHosts.Count, ($mdiUnconfirmedHosts -join '', ''))'
+    & $add '    Write-Warning ''The command was started but its status could not be read back. Check those servers before assuming the change was applied.'''
     & $add '}'
+    & $add 'if ($mdiFailedHosts.Count -gt 0) {'
+    & $add '    Write-Host ('''' )'
+    & $add '    Write-Warning (''Remediation finished with failures on {0} server(s): {1}'' -f $mdiFailedHosts.Count, ($mdiFailedHosts -join '', ''))'
+    & $add '    Write-Warning ''Fix the cause and re-run this script, then re-run Test-MdiReadiness.ps1 to verify.'''
+    if ($outstanding.Count -gt 0) {
+        # The advisory above listed findings this script cannot fix, so the run is not complete even if
+        # every scripted step succeeded. Saying "Remediation complete" underneath that list is the same
+        # false green the advisory exists to prevent, one line further down the page.
+        #
+        # The dry-run banner belongs on THIS arm too. It only existed on the "nothing outstanding" arm,
+        # so the moment any un-scriptable finding appeared - a single unreachable domain controller is
+        # enough, and that is the common case - a -WhatIf preview and a real run ended with byte
+        # identical text. The transcript of a maintenance-window rehearsal is what the next person
+        # reads, and it told them the fixes had been applied.
+        & $add '} else {'
+        & $add '    if ($WhatIfPreference) {'
+        & $add ('        Write-Host ''WhatIf: nothing was changed. Re-run without -WhatIf to apply these fixes.'' -ForegroundColor Yellow')
+        & $add ('        Write-Warning (''{0} finding(s) listed above cannot be fixed by this script and will still need manual attention.'')' -f $outstanding.Count)
+        & $add '    } else {'
+        & $add ('        Write-Warning (''Scripted remediation finished, but {0} finding(s) listed above still need manual attention.'')' -f $outstanding.Count)
+        & $add '        Write-Warning ''Resolve those, then re-run Test-MdiReadiness.ps1 to verify.'''
+        & $add '    }'
+        & $add '}'
+    } else {
+        & $add '} else {'
+        & $add '# -WhatIf suppresses every Invoke-MdiRemote call, because they all sit inside ShouldProcess.'
+        & $add '# This banner did not, so a dry run ended with "Remediation complete" having changed nothing -'
+        & $add '# and the transcript of a maintenance-window preview is what the next person reads, not the'
+        & $add '# What if: lines above it.'
+        & $add ('    if ($WhatIfPreference) {')
+        & $add ('        Write-Host ''WhatIf: nothing was changed. Re-run without -WhatIf to apply these fixes.'' -ForegroundColor Yellow')
+        & $add ('    } elseif ($mdiUnconfirmedHosts.Count -gt 0) {')
+        # "Complete" must not appear over a server whose result nobody could read. This is the same
+        # rule the report itself applies: a check that was not measured is not a check that passed.
+        & $add ('        Write-Warning ''Remediation finished, but the result could not be verified on every server. Re-run Test-MdiReadiness.ps1 to confirm.''')
+        & $add ('    } else {')
+        & $add ('        Write-Host ''Remediation complete. Re-run Test-MdiReadiness.ps1 to verify.'' -ForegroundColor Green')
+        & $add ('    }')
+        & $add '}'
+    }
     }
 
     $content = $script.ToArray() -join [environment]::NewLine
-    $content | Out-File -FilePath $FilePath -Force -Encoding utf8
+    Write-mdiReportFile -Content $content -FilePath $FilePath
     [PSCustomObject]@{
         Path         = (Resolve-Path -Path $FilePath).Path
         SectionCount = $sections
     }
+}
+
+function Get-mdiRunTimestamp {
+    <#
+        The instant a baseline run happened, as UTC, or $null when the value is not a timestamp.
+
+        This used to be a single TryParseExact against the 's' round-trip format - the format this
+        script itself writes - and everything else was discarded as unparseable. That is far narrower
+        than the range of timestamps a real history file carries: an entry written by an older build,
+        one edited by hand, one merged from another host, or one carrying a UTC offset. A discarded
+        entry has no position on the time axis, and when EVERY entry is discarded the caller falls
+        back to the file's append order, which is exactly the order that cannot be trusted.
+
+        Measured on the shipped code, all three of these parse perfectly well as dates and were
+        nevertheless dropped, so a run that had fallen 60 points rendered a green "up 60 pt":
+            '10/1/2026 00:00:00'          vs '9/1/2026 00:00:00'
+            '2026-10-01'                  vs '2026-9-01'          (single-digit month)
+            '2026-09-01T12:00:00+02:00'   vs '2026-09-01T09:30:00+00:00'
+
+        Everything is normalised to UTC so that two runs recorded in different time zones order by the
+        instant they actually happened rather than by their wall-clock text, and a value with no zone
+        is read as local time - which is what the 's' format this script writes represents. Parsing is
+        INVARIANT: the operator's culture must not decide whether 01/09 is January or September.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $Value
+    )
+
+    if ($null -eq $Value) { return $null }
+    $text = ([string] $Value).Trim()
+    if ([string]::IsNullOrEmpty($text)) { return $null }
+
+    $invariant = [Globalization.CultureInfo]::InvariantCulture
+    # AssumeLocal for a value that carries no offset, AdjustToUniversal so one that does is converted
+    # rather than compared against local wall-clock ticks.
+    $styles = [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeLocal
+    $parsed = [datetime]::MinValue
+
+    # The canonical format this script writes is tried first and on its own, so a value that is
+    # ambiguous under the general parser can never outrank an exact round-trip match.
+    if ([datetime]::TryParseExact($text, 's', $invariant, $styles, [ref] $parsed)) { return $parsed }
+    if ([datetime]::TryParse($text, $invariant, $styles, [ref] $parsed)) { return $parsed }
+    $null
+}
+
+function Get-mdiChronologicalRun {
+    <#
+        Baseline history runs in the order they actually happened.
+
+        The history file is APPEND-ORDERED, which is chronological right up until it is not: a hand
+        merge, a restored backup, two hosts writing the same share, or a clock that stepped backwards
+        all produce a file whose order is not time order. Two separate consumers trusted that order
+        and both got the trend WRONG - which matters more than an ordinary defect, because the trend
+        is the entire reason the baseline feature exists.
+
+          * Pruning kept the LAST N lines of the file. On an out-of-order history that discarded the
+            chronologically newest run and kept older, poorer ones, and the delta pill then rendered
+            a green "up 30 points" for an estate that had actually fallen 50.
+
+          * Plotting sorted by timestamp only when EVERY entry could be parsed, and silently gave up
+            otherwise. A single junk entry with no timestamp therefore reordered every real run: with
+            the junk entry in the middle, the same two genuine runs rendered "up 40 points" instead
+            of "down 40".
+
+        Runs are returned oldest first. A run whose Timestamp cannot be parsed has no position on a
+        time axis at all, so it is EXCLUDED rather than guessed at - it must never become the
+        "previous run" the delta is measured against. Its index is kept as the tiebreak for runs
+        recorded within the same second, which would otherwise swap places on every render.
+
+        If NOTHING in the file carries a parseable timestamp the file predates this format, and the
+        original append order is the best evidence available, so it is returned unchanged.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [AllowEmptyCollection()] $Run
+    )
+
+    $all = @($Run | Where-Object { $null -ne $_ })
+    if ($all.Count -eq 0) { return @() }
+
+    $stamped = @(for ($i = 0; $i -lt $all.Count; $i++) {
+            [PSCustomObject]@{ Index = $i; Stamp = (Get-mdiRunTimestamp $all[$i].Timestamp); Run = $all[$i] }
+        })
+
+    $dated = @($stamped | Where-Object { $null -ne $_.Stamp })
+    if ($dated.Count -eq 0) { return $all }
+    @($dated | Sort-Object -Property Stamp, Index | ForEach-Object { $_.Run })
 }
 
 function Get-mdiBaselineHistory {
@@ -3338,7 +5534,14 @@ function Get-mdiBaselineHistory {
         # that have nothing to do with readiness - and the report drew a confident "up 8 points since
         # the last run" arrow over it. Comparing the fingerprint lets the delta say "not comparable"
         # instead of inventing a trend.
-        CheckNames    = @($Statistics.CheckTotals.Keys | Sort-Object)
+        # The synthetic incomplete-scan entry is excluded. It exists so the per-check chart can show
+        # the gap a partial scan leaves - the checks it never reached cannot be named - but it is a
+        # property of THAT RUN, not of the check set. Storing it in the fingerprint made a partial run
+        # and the healthy run after it look like different check sets, so the trend reported "the set
+        # of checks changed" and refused to draw a delta exactly when the estate had recovered and the
+        # operator most wanted to see the improvement.
+        CheckNames    = @($Statistics.CheckTotals.Keys |
+                Where-Object { $_ -ne $script:mdiIncompleteScanCheckName } | Sort-Object)
         ServerNames   = @($Statistics.Servers | ForEach-Object { [string] $_.FQDN } |
                 Where-Object { $_ } | Sort-Object)
         ChecksPassed  = [int] $Statistics.ChecksPassed
@@ -3348,13 +5551,25 @@ function Get-mdiBaselineHistory {
         # Total -gt 0 as well, matching the Overview KPI. A server whose every check was unreadable has
         # Total 0 and Failed 0, and counting it as ready wrote a wrong figure into the history, where it
         # permanently distorts the trend chart.
-        ServersReady  = @($Statistics.ServerScores | Where-Object { $_.Total -gt 0 -and $_.Failed -eq 0 }).Count
+        # Unread -eq 0 is required here, exactly as the Overview requires it. Without it the history
+        # recorded a server as ready that the report itself calls not-ready - a server with one failing
+        # check and one unread check counted as ready in the trend and not-ready on the page. The trend
+        # is what gets reported upward and it is written permanently, so a number that disagrees with
+        # the report it came from is worse than no number at all.
+        ServersReady  = @($Statistics.ServerScores | Where-Object { Test-mdiServerIsReady -Score $_ }).Count
         PortsOpen     = [int] $Statistics.PortsOpen
         PortsTotal    = [int] $Statistics.PortsTotal
         NnrResolvable = [int] $Statistics.NnrResolvable
         NnrTargets    = [int] $Statistics.NnrTargetCount
         V3Ready       = [int] $Statistics.V3Ready
         V3Evaluated   = [int] $Statistics.V3Evaluated
+        # The v3 population that could NOT be evaluated, persisted alongside the two counts it is the
+        # missing third of. Without it the entry stores "1 of 1 ready" for a run that could assess one
+        # server in three, and a consumer of the history - the trend chart, or anyone reading the file
+        # later - cannot recover that the coverage was 33%, only that it looked like 100%. The history
+        # is written permanently and is what gets reported upward, so an unrecoverable overstatement
+        # here outlives the run that produced it.
+        V3Unevaluated = [int] $Statistics.V3Unevaluated
     }
 
     # If nothing else works, the run still gets its own entry back for the report. The trend is a
@@ -3368,7 +5583,7 @@ function Get-mdiBaselineHistory {
     try {
         if (-not (Test-Path -Path $BaselinePath)) { [void] (New-Item -ItemType Directory -Path $BaselinePath -Force) }
     } catch {
-        Write-Warning ('Unable to create the baseline directory {0}, skipping the trend update for this run: {1}' -f $BaselinePath, $_.Exception.Message)
+        Write-mdiWarning ('Unable to create the baseline directory {0}, skipping the trend update for this run: {1}' -f $BaselinePath, $_.Exception.Message)
         return $result
     }
 
@@ -3380,17 +5595,48 @@ function Get-mdiBaselineHistory {
     # missing trend point is far cheaper than a failed forest scan.
     $lockFile = $file + '.lock'
     $lock = $null
-    $lockDeadline = [datetime]::Now.AddSeconds(15)
-    while ($null -eq $lock -and [datetime]::Now -lt $lockDeadline) {
+    $lockError = $null
+    # Stopwatch, not a wall-clock deadline: a clock correction mid-wait would otherwise make this
+    # expire instantly or never.
+    $lockTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($null -eq $lock -and $lockTimer.Elapsed.TotalSeconds -lt 15) {
         try {
-            $lock = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::OpenOrCreate,
-                [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            $lock = [IO.File]::Open($lockFile, [IO.FileMode]::OpenOrCreate,
+                [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
         } catch {
+            # Only CONTENTION is worth retrying. An UnauthorizedAccessException means the folder is
+            # not writable by this account and waiting cannot change that: every run then stalled the
+            # full fifteen seconds and reported "another run is writing the baseline history",
+            # sending the operator to hunt a concurrent scan that does not exist while the real cause
+            # - an ACL on a folder they explicitly passed with -BaselinePath - went unmentioned.
+            # Measured: 17.1s versus about 2s for the same scan without the retry.
+            #
+            # The exception is UNWRAPPED first. PowerShell wraps a failing .NET method call in a
+            # MethodInvocationException, so testing $_.Exception directly never matches the type that
+            # actually occurred and every failure fell through to the generic branch.
+            $lockError = $_
+            $lockCause = $_.Exception
+            while ($null -ne $lockCause.InnerException) { $lockCause = $lockCause.InnerException }
+            $isContention = $lockCause -is [IO.IOException] -and
+                ($lockCause.HResult -eq -2147024864 -or $lockCause.HResult -eq -2147024863)
+            if (-not $isContention) { break }
             Start-Sleep -Milliseconds 150
         }
     }
     if ($null -eq $lock) {
-        Write-Warning ('Unable to acquire an exclusive lock on {0} within 15s; another run is writing the baseline history. Skipping the trend update for this run.' -f $lockFile)
+        $lockCause = $null
+        if ($null -ne $lockError) {
+            $lockCause = $lockError.Exception
+            while ($null -ne $lockCause.InnerException) { $lockCause = $lockCause.InnerException }
+        }
+        $reason = if ($lockCause -is [UnauthorizedAccessException]) {
+            'the folder is not writable by this account: {0}' -f ($lockCause.Message -replace '[\r\n]+', ' ')
+        } elseif ($null -ne $lockCause -and $lockCause -isnot [IO.IOException]) {
+            ($lockCause.Message -replace '[\r\n]+', ' ')
+        } else {
+            'another run is writing the baseline history'
+        }
+        Write-mdiWarning ('Unable to acquire an exclusive lock on {0} - {1}. Skipping the trend update for this run.' -f $lockFile, $reason)
         return $result
     }
 
@@ -3398,29 +5644,115 @@ function Get-mdiBaselineHistory {
         $history = @()
         if (Test-Path -Path $file) {
             try {
-                # ConvertFrom-Json emits a JSON array as a single object in Windows PowerShell, so the result must be
-                # assigned before being wrapped: @(Get-Content | ConvertFrom-Json) would nest the whole history into a
-                # one-element array and every later index would return an array instead of a run.
-                $parsed = Get-Content -Path $file -Raw | ConvertFrom-Json
+                # Read as UTF-8 EXPLICITLY rather than with Get-Content, which on Windows PowerShell 5.1
+                # sniffs for a byte order mark and falls back to the ANSI code page when there is none.
+                # This file is written with a BOM here, so our own round trip was safe - but anything
+                # else that touches it writes BOM-less UTF-8: PowerShell 7, VS Code, jq, a hand merge.
+                # Read as ANSI, "dc-muenchen" with an umlaut came back as two characters, and line 4346
+                # then wrote the corrupted name BACK. The trend compares the set of server names, so an
+                # estate that had not changed was reported as having changed - permanently, because the
+                # damage is now in the file.
+                #
+                # UTF-8 is a superset of ASCII, so a file that happens to be plain ASCII is unaffected,
+                # and a BOM is skipped by the decoder rather than becoming a stray character.
+                $parsed = [IO.File]::ReadAllText($file, [Text.Encoding]::UTF8) | ConvertFrom-Json
+                # Assigned before being wrapped: ConvertFrom-Json emits a JSON array as a single
+                # pipeline object in Windows PowerShell, so @(... | ConvertFrom-Json) would nest the
+                # whole history into a one-element array and every later index would return an array
+                # instead of a run.
                 $history = @($parsed)
             } catch {
-                Write-Warning ('Unable to read the baseline history at {0}, starting a new one: {1}' -f $file, $_.Exception.Message)
+                Write-mdiWarning ('Unable to read the baseline history at {0}, starting a new one: {1}' -f $file, $_.Exception.Message)
                 $history = @()
             }
         }
 
-        $history = @($history) + $entry
-        if ($history.Count -gt $KeepRuns) { $history = @($history | Select-Object -Last $KeepRuns) }
+        # Ordered by TIME before anything is discarded. Keeping the last N lines of the file threw away
+        # the chronologically newest run whenever the file was not in time order, and the trend then
+        # pointed the wrong way - see Get-mdiChronologicalRun.
+        #
+        # Ordering EXCLUDES a run whose Timestamp cannot be parsed, which is right for a time axis and
+        # catastrophic for a file. This used to write the ordered result straight back, so those runs
+        # were not merely left off the chart - they were deleted from the operator's history for good.
+        # Measured: a three-run legacy file with no Timestamp on any entry came back with one entry
+        # after the next scan, with no warning at all, and the report then said "At least two runs are
+        # needed to draw a trend" about a baseline it had just destroyed. Get-mdiChronologicalRun's
+        # own legacy fallback ("if NOTHING carries a parseable timestamp, return unchanged") could
+        # never fire here, because the current entry is appended first and always carries one.
+        #
+        # The two concerns are now separated: $history is what the TREND may plot, $persisted is what
+        # the FILE keeps. Undated runs are preserved, first and in their original relative order,
+        # because nothing is known about where they belong in time.
+        $previous = @($history)
+        $history = Get-mdiChronologicalRun -Run (@($previous) + $entry)
+        # Classified by the SAME parser that decides the trend order, not by a second inline copy of
+        # it. This used to re-implement the narrow "exact 's' round-trip only" test that
+        # Get-mdiRunTimestamp was deliberately widened to replace, so the two disagreed about every
+        # timestamp carrying a UTC offset or a Z suffix - the shapes a JSON round trip, an older
+        # build, another host's file or a hand edit all produce.
+        #
+        # Such an entry was counted as UNDATED here while Get-mdiChronologicalRun placed it in the
+        # TREND, so it appeared in both lists and the concatenation at the end of this block wrote it
+        # to the file TWICE. Every subsequent run doubled it again - a real history went 3, 5, 9, 17
+        # entries - and the run-count pill inflated with it, while the warning told the operator those
+        # runs carried "no usable timestamp" at the very moment they were being plotted.
+        $undated = @($previous | Where-Object { $null -eq (Get-mdiRunTimestamp -Value $_.Timestamp) })
+        # Retained but never silent: an entry with no usable timestamp cannot be trended, and an
+        # operator who is not told will read a shortened trend as an estate with less history than it
+        # has. The pruning cap applies to the whole file so a corrupt history cannot grow without end.
+        #
+        # The cap is shared out BEFORE either list is trimmed, rather than being applied to the dated
+        # history and then again to the concatenation. It used to be applied twice:
+        #
+        #     if ($history.Count -gt $KeepRuns) { $history = @($history | Select-Object -Last $KeepRuns) }
+        #     $persisted = @(@($undated) + @($history))
+        #     if ($persisted.Count -gt $KeepRuns) { $persisted = @($persisted | Select-Object -Last $KeepRuns) }
+        #
+        # - which let the dated history claim the WHOLE cap first, so the second trim had nothing
+        # left to give the undated runs. Select-Object -Last drops from the HEAD, and the undated
+        # runs were prepended, so they were the first thing deleted. On any MATURE history - one
+        # whose dated runs have reached the cap, which is simply what a file looks like after a
+        # couple of months of scans - EVERY undated run was destroyed on EVERY run, while the
+        # warning immediately below told the operator they were being kept. Measured with 2 undated
+        # and 5 dated at KeepRuns 5: warning raised saying they are kept, 0 retained. With room to
+        # spare the same file kept both, which is why the existing all-undated test never saw it.
+        #
+        # That is the w54-F1 guarantee - undated runs are preserved rather than deleted in silence -
+        # coming apart at the one point the file is under pressure, which is exactly when an
+        # operator's oldest hand-merged or restored history matters most.
+        #
+        # Untrendable entries are not allowed to consume the whole cap: the trend needs dated runs
+        # and the CURRENT run must always survive, so the undated runs are held to KeepRuns - 1 and
+        # the dated history is guaranteed at least one slot. If the cap still forces an undated run
+        # out, the warning SAYS SO rather than promising it was kept - a warning that lies is worse
+        # than no warning, because it is the thing that stops the operator going to look.
+        $undatedKept = @($undated)
+        $undatedDropped = 0
+        $maxUndated = [Math]::Max(0, $KeepRuns - 1)
+        if ($undatedKept.Count -gt $maxUndated) {
+            $undatedDropped = $undatedKept.Count - $maxUndated
+            $undatedKept = @($undatedKept | Select-Object -Last $maxUndated)
+        }
+        $datedRoom = [Math]::Max(1, $KeepRuns - $undatedKept.Count)
+        if ($history.Count -gt $datedRoom) { $history = @($history | Select-Object -Last $datedRoom) }
+        if ($undated.Count -gt 0) {
+            if ($undatedDropped -gt 0) {
+                Write-mdiWarning ('{0} run(s) in the baseline history at {1} carry no usable timestamp and are left out of the trend; {2} of them were dropped to keep the file within the {3}-run retention limit.' -f $undated.Count, $file, $undatedDropped, $KeepRuns)
+            } else {
+                Write-mdiWarning ('{0} run(s) in the baseline history at {1} carry no usable timestamp, so they are kept in the file but left out of the trend.' -f $undated.Count, $file)
+            }
+        }
+        $persisted = @(@($undatedKept) + @($history))
 
         try {
-            $history | ConvertTo-Json -Depth 4 | Out-File -FilePath $file -Force -Encoding utf8
+            Write-mdiReportFile -Content ($persisted | ConvertTo-Json -Depth 4) -FilePath $file
             $result = [PSCustomObject]@{
                 Path    = $file
                 History = @($history)
                 Current = $entry
             }
         } catch {
-            Write-Warning ('Unable to write the baseline history to {0}: {1}' -f $file, $_.Exception.Message)
+            Write-mdiWarning ('Unable to write the baseline history to {0}: {1}' -f $file, $_.Exception.Message)
         }
     } finally {
         # Cleanup is wrapped in its own try/catch: a throw inside finally REPLACES the original
@@ -3433,19 +5765,133 @@ function Get-mdiBaselineHistory {
     $result
 }
 
+function Get-mdiTrendRunCountText {
+    <#
+        How many runs the trend pill is allowed to claim.
+
+        The pill read "(3 run(s) recorded)" using the count of runs it PLOTTED. Points are dropped by
+        New-mdiTrendChart whenever an entry carries no usable score or no timestamp - deliberately, so a
+        corrupted entry cannot fabricate a delta - but the pill then reported the survivors as the
+        history. Measured: a nine-entry baseline with six unreadable entries produced a pill
+        byte-for-byte identical to a genuine three-run history, while the verbose surface printed nine
+        for the same file. A reader could not tell a young baseline from a corrupted one, and the two
+        surfaces of one fact disagreed.
+
+        Stated in one place because both pills need it and they must not drift apart.
+    #>
+    param (
+        [Parameter(Mandatory = $true)] [int] $Plotted,
+        [Parameter(Mandatory = $true)] [int] $Recorded
+    )
+
+    if ($Recorded -gt $Plotted) {
+        return '{0} of {1} recorded runs plotted; the rest carry no usable score or timestamp' -f $Plotted, $Recorded
+    }
+    return '{0} run(s) recorded' -f $Plotted
+}
+
 function New-mdiTrendChart {
     param (
-        [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $History,
+        [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [AllowNull()] [object[]] $History,
         [Parameter(Mandatory = $false)] [int] $Width = 720,
         [Parameter(Mandatory = $false)] [int] $Height = 190
     )
 
-    # Only well-formed scalar runs can be plotted, so malformed history entries are skipped rather than throwing
+    # Only well-formed scalar runs can be plotted, so malformed history entries are skipped rather than
+    # throwing. ChecksPassed is bounded by the COVERED population - measured plus unread - as well as
+    # being present: a hand-edited or corrupted entry claiming 20 of 10 checks passed plotted above the
+    # top of the chart and produced a delta of minus one hundred and fifty points against the run after
+    # it.
+    #
+    # The population gate is on measured + unread, not on ChecksTotal alone. A run where the estate
+    # became unreadable - Total 0, Unread 5 - has a perfectly well-defined coverage of 0%, and it IS
+    # written to the baseline; gating on ChecksTotal deleted it from the chart instead. Measured on a
+    # three-run history (good, blind, good): only two points were plotted, the x-axis jumped straight
+    # from 04-Aug to 18-Aug, and the pill read "up 20 pt vs previous run" across a week in which
+    # nothing had been measured at all. The one week that most needed to be visible was the one week
+    # the chart hid, and the delta was drawn straight over the gap as though it were progress.
+    # Counted BEFORE the filters below drop anything, so the pill can say how many runs the baseline
+    # actually holds rather than how many survived being read.
+    $recordedRuns = @($History | Where-Object { $null -ne $_ }).Count
+
     $points = @($History | Where-Object {
-            $_ -and @($_.ChecksTotal).Count -eq 1 -and ($_.ChecksTotal -as [int]) -gt 0 -and $null -ne ($_.ChecksPassed -as [int])
+            if (-not $_) { return $false }
+            if (@($_.ChecksTotal).Count -ne 1) { return $false }
+            # ChecksPassed is validated exactly as ChecksTotal is, and for a stronger reason.
+            #
+            # Get-mdiCoverageCount returns 0 for anything it cannot parse - absent, $null, '',
+            # 'n/a', an array - which is the right answer for a COUNT but the wrong answer for a
+            # DATA POINT. A history entry whose ChecksPassed was lost (a truncated write, a merge, an
+            # older schema, a file edited by hand) was therefore plotted as a perfectly legitimate
+            # 0%, every comparability guard passed because the check names and server names still
+            # matched, and the following run rendered a green "up 100 pt vs previous run" on an
+            # estate where nothing whatsoever had changed. Measured: two identical 5/5 runs read
+            # "0 pt"; delete ChecksPassed from the first and the same pair reads "up 100 pt".
+            #
+            # That pill is what gets pasted into a change ticket to close a remediation, so a
+            # fabricated improvement is worse than no chart. An entry that cannot state how many
+            # checks passed is not a measurement and is dropped, like one that cannot state how many
+            # were covered.
+            if (@($_.ChecksPassed).Count -ne 1) { return $false }
+            $passedRaw = $_.ChecksPassed
+            if ($null -eq $passedRaw) { return $false }
+            if ($passedRaw -is [bool]) { return $false }
+            $passedValue = [double] 0
+            if ($passedRaw -is [int] -or $passedRaw -is [long] -or $passedRaw -is [double] -or $passedRaw -is [decimal]) {
+                $passedValue = [double] $passedRaw
+            } else {
+                # A string is accepted only when it really is a number: JSON round-trips can widen an
+                # integer to a string, but 'n/a' is not a score.
+                $parsed = [double] 0
+                if (-not [double]::TryParse([string] $passedRaw, [Globalization.NumberStyles]::Float,
+                        [Globalization.CultureInfo]::InvariantCulture, [ref] $parsed)) { return $false }
+                $passedValue = $parsed
+            }
+            # The VALUE is checked, not only its type. A native NaN, Infinity or negative double is a
+            # [double] and sailed past the type test above, while the string forms of the same things
+            # were correctly rejected by TryParse - so the guard's strictness depended on whether the
+            # history had been round-tripped through JSON as text. Measured: an entry with ChecksPassed
+            # of NaN or -5 was floored to zero by Get-mdiCoverageCount and PLOTTED as a legitimate 0%,
+            # and the next genuine run rendered "up 50 pt vs previous run" over an estate that had not
+            # changed. That pill is what gets pasted into a change ticket to close a remediation, so a
+            # fabricated improvement is the most expensive thing this chart can draw. Rejected here for
+            # the same reason and by the same rule Test-mdiServerIsReady already applies to a score.
+            if ([double]::IsNaN($passedValue) -or [double]::IsInfinity($passedValue)) { return $false }
+            if ($passedValue -lt 0) { return $false }
+            $covered = Get-mdiCoverageDenominator -Measured $_.ChecksTotal -Unread $_.ChecksUnread
+            if ($covered -le 0) { return $false }
+            $passed = Get-mdiCoverageCount -Value $_.ChecksPassed
+            $passed -le $covered
         })
+
+    # Ordered by timestamp rather than by position in the file. The delta below is taken from the last
+    # two points, and the x-axis is drawn in array order, so a history whose entries are not in
+    # chronological order reported the arrow BACKWARDS - a run that improved from 80% to 90% rendered as
+    # "-10 pt vs previous run". The tool always appends in order, but a file that was hand-merged from
+    # two collectors, restored from a backup, or written either side of a clock correction or a DST
+    # change is not in order, and a percentage-point figure with an arrow on it is exactly the number
+    # that gets reported upward.
+    #
+    # Shared with the pruning in Get-mdiBaselineHistory, because the two disagreeing is what produced
+    # the defect: one kept the last N lines of the file while the other sorted by time.
+    #
+    # This used to sort only when EVERY entry carried a parseable timestamp, and silently gave up
+    # otherwise on the reasoning that a mixture had no ordering to recover. It had the opposite effect:
+    # ONE junk entry with no timestamp disabled the ordering for every real run beside it, so the same
+    # two genuine runs rendered "up 40 points" or "down 40 points" purely according to where the junk
+    # sat in the file. An entry with no timestamp has no position on a time axis, so it is dropped
+    # rather than allowed to become the run the delta is measured against.
+    $points = @(Get-mdiChronologicalRun -Run $points)
+
     if ($points.Count -lt 2) {
-        return '<p class="muted">At least two runs are needed to draw a trend. Re-run the script with the same -BaselinePath to build history.</p>'
+        # Says WHY there is no trend. "At least two runs are needed" on a nine-run baseline reads as a
+        # young history when the truth is that seven entries could not be read.
+        $unplottable = $recordedRuns - $points.Count
+        $suffix = if ($unplottable -gt 0) {
+            ' {0} of {1} recorded run(s) could not be plotted because they carry no usable score or timestamp.' -f $unplottable, $recordedRuns
+        }
+        else { '' }
+        return '<p class="muted">At least two runs are needed to draw a trend. Re-run the script with the same -BaselinePath to build history.' + $suffix + '</p>'
     }
 
     $padLeft = 42; $padRight = 14; $padTop = 14; $padBottom = 26
@@ -3453,12 +5899,26 @@ function New-mdiTrendChart {
     $plotHeight = $Height - $padTop - $padBottom
 
     $coords = @(for ($i = 0; $i -lt $points.Count; $i++) {
-            $passed = [double] ($points[$i].ChecksPassed -as [int])
-            $total = [double] ($points[$i].ChecksTotal -as [int])
-            $pct = ($passed / $total) * 100
+            # Coerced through the shared helper, like the filter above. Using -as [int] here meant a
+            # value beyond Int32 overflowed to zero at exactly this point: an unread count of three
+            # billion made the plot, the tooltip and the delta all report a flat 100% (5/5) for a run
+            # in which nothing had been read. The filter accepted the point correctly and the
+            # arithmetic beneath it then threw the reason away.
+            $passed = Get-mdiCoverageCount -Value $points[$i].ChecksPassed
+            $total = Get-mdiCoverageCount -Value $points[$i].ChecksTotal
+            $unread = Get-mdiCoverageCount -Value $points[$i].ChecksUnread
+            $denominator = Get-mdiCoverageDenominator -Measured $total -Unread $unread
+            $pct = Get-mdiCoveragePercent -Passed $passed -Measured $total -Unread $unread
             $x = $padLeft + ($plotWidth * $i / ($points.Count - 1))
             $y = $padTop + $plotHeight - ($plotHeight * $pct / 100)
-            [PSCustomObject]@{ X = $x; Y = $y; Pct = $pct; Point = $points[$i] }
+            # The denominator travels with the point so the tooltip states the same fraction the
+            # percentage was computed from. Showing passed/ChecksTotal beside a percentage derived
+            # from passed/(ChecksTotal+ChecksUnread) put two contradictory numbers in one label -
+            # measured: "16% (8/10)".
+            [PSCustomObject]@{ X = $x; Y = $y; Pct = $pct; Point = $points[$i]
+                Denominator = $denominator
+                UnreadNote = $(if ($unread -gt 0) { ', {0} not read' -f (Get-mdiWholeNumberText $unread) } else { '' })
+            }
         })
 
     $parts = New-Object -TypeName System.Collections.ArrayList
@@ -3482,8 +5942,8 @@ function New-mdiTrendChart {
 
     foreach ($c in $coords) {
         [void] $parts.Add('<circle class="trend-dot" cx="' + (ConvertTo-mdiSvgNumber $c.X) + '" cy="' + (ConvertTo-mdiSvgNumber $c.Y) + '" r="3.5">' +
-            '<title>' + (ConvertTo-mdiHtmlEncoded ([string] $c.Point.Timestamp)) + ': ' + [int] [math]::Round($c.Pct) + '% (' +
-            [int] $c.Point.ChecksPassed + '/' + [int] $c.Point.ChecksTotal + ')</title></circle>')
+            '<title>' + (ConvertTo-mdiHtmlEncoded ([string] $c.Point.Timestamp)) + ': ' + [int] [math]::Floor($c.Pct) + '% (' +
+            (Get-mdiWholeNumberText $c.Point.ChecksPassed) + '/' + (Get-mdiWholeNumberText $c.Denominator) + $c.UnreadNote + ')</title></circle>')
     }
 
     [void] $parts.Add('<text class="axis" x="' + $padLeft + '" y="' + ($Height - 8) + '">' +
@@ -3515,33 +5975,81 @@ function New-mdiTrendChart {
     $previousServers = @($previous.ServerNames | Where-Object { $_ })
     $currentServers = @($current.ServerNames | Where-Object { $_ })
 
-    $sameChecks = ($previousChecks -join '|') -eq ($currentChecks -join '|')
-    $sameServers = ($previousServers -join '|') -eq ($currentServers -join '|')
+    # The scanner version is part of comparability. A check whose semantics changed between releases
+    # keeps its NAME, so the fingerprint matches and the delta is drawn - but the two numbers were
+    # produced by different definitions of the same question. Measured: 3 of 5 under 2.1.0 followed by
+    # 5 of 5 under 3.0.0 rendered "+40 pt", presenting a change in this tool's own strictness as an
+    # improvement in the customer's estate. Every fix in this project that corrected a false green
+    # moved a check from passing to failing, so the version guard is what stops those corrections from
+    # being read as a regression the customer caused.
+    $previousVersion = ([string] $previous.ScriptVersion).Trim()
+    $currentVersion = ([string] $current.ScriptVersion).Trim()
+    # Only compared when BOTH sides recorded one: a history written before the field existed must fall
+    # through to the fingerprint checks rather than be declared incomparable on a missing value.
+    # Trimmed and compared case-insensitively - ' 1.1.0 ' and '1.1.0' are the same build, and treating
+    # stray whitespace from a hand-edited history as a version change suppresses a delta that should
+    # have been drawn.
+    $sameVersion = ([string]::IsNullOrWhiteSpace($previousVersion) -or [string]::IsNullOrWhiteSpace($currentVersion) -or
+        [string]::Equals($previousVersion, $currentVersion, [StringComparison]::OrdinalIgnoreCase))
+
+    # Sorted at compare time rather than trusting the writer to have sorted. The writer does sort, but a
+    # history file written by an earlier version, edited by hand, or merged from elsewhere carries the
+    # names in whatever order it had, and comparing the joined strings then reported "the set of servers
+    # changed" for two runs over exactly the same estate.
+    $sameChecks = (($previousChecks | Sort-Object) -join '|') -eq (($currentChecks | Sort-Object) -join '|')
+    $sameServers = (($previousServers | Sort-Object) -join '|') -eq (($currentServers | Sort-Object) -join '|')
     $hasFingerprint = $previousChecks.Count -gt 0 -and $currentChecks.Count -gt 0
 
-    $prevTotal = [double] ($previous.ChecksTotal -as [int])
-    $currTotal = [double] ($current.ChecksTotal -as [int])
+    $prevTotal = Get-mdiCoverageCount -Value $previous.ChecksTotal
+    $currTotal = Get-mdiCoverageCount -Value $current.ChecksTotal
+    # Coverage is part of the comparison, not just the measured total. The plot divides by
+    # measured + unread, so the delta has to divide by the same thing or the two disagree on the same
+    # page: measured with 8 of 10 passing in both runs but 40 checks unreadable in the second, the
+    # line correctly fell from 80% to 16% while the pill beneath it read "-> 0 pt vs previous run".
+    # The pill is the number that gets copied into a status report, so a false "no change" there is
+    # worse than a wrong chart.
+    $prevUnread = Get-mdiCoverageCount -Value $previous.ChecksUnread
+    $currUnread = Get-mdiCoverageCount -Value $current.ChecksUnread
+    $prevDenominator = Get-mdiCoverageDenominator -Measured $prevTotal -Unread $prevUnread
+    $currDenominator = Get-mdiCoverageDenominator -Measured $currTotal -Unread $currUnread
 
-    if (-not $hasFingerprint -or -not $sameChecks -or -not $sameServers -or $prevTotal -le 0 -or $currTotal -le 0) {
+    # The number of checks actually measured is part of comparability, not just which checks exist. The
+    # names come from the check totals, so a check that went unread on one server keeps its name in the
+    # fingerprint while the total shrinks: nine of ten followed by eight of eight is the same set of
+    # checks measured LESS, and it rendered as a ten point improvement. Measuring less is not progress.
+    #
+    # Comparability is judged on the FULL population - measured plus unread - because that is what the
+    # percentage is now a fraction of. Two runs that measured ten checks each are not comparable if one
+    # of them also had forty it could not read.
+    $samePopulation = ($prevDenominator -eq $currDenominator)
+
+    if (-not $hasFingerprint -or -not $sameChecks -or -not $sameServers -or -not $samePopulation -or
+        -not $sameVersion -or $prevDenominator -le 0 -or $currDenominator -le 0) {
         $reason = if (-not $hasFingerprint) {
             'the previous run predates the comparison fingerprint'
+        } elseif (-not $sameVersion) {
+            'the scanner version changed ({0} then {1})' -f $previousVersion, $currentVersion
         } elseif (-not $sameServers) {
             'the set of servers changed'
         } elseif (-not $sameChecks) {
             'the set of checks changed'
+        } elseif (-not $samePopulation) {
+            'a different number of checks was covered ({0} then {1})' -f (Get-mdiWholeNumberText $prevDenominator), (Get-mdiWholeNumberText $currDenominator)
         } else {
             'one of the runs measured nothing'
         }
-        $deltaText = 'Not comparable with the previous run - {0} ({1} run(s) recorded)' -f $reason, $points.Count
+        $deltaText = 'Not comparable with the previous run - {0} ({1})' -f $reason,
+        (Get-mdiTrendRunCountText -Plotted $points.Count -Recorded $recordedRuns)
         return ($parts.ToArray() -join '') + '<p><span class="pill na">' + (ConvertTo-mdiHtmlEncoded $deltaText) + '</span></p>'
     }
 
-    $prevPct = ([double] ($previous.ChecksPassed -as [int]) / $prevTotal) * 100
-    $currPct = ([double] ($current.ChecksPassed -as [int]) / $currTotal) * 100
+    $prevPct = Get-mdiCoveragePercent -Passed $previous.ChecksPassed -Measured $prevTotal -Unread $prevUnread
+    $currPct = Get-mdiCoveragePercent -Passed $current.ChecksPassed -Measured $currTotal -Unread $currUnread
     $delta = $currPct - $prevPct
     $tone = if ($delta -gt 0.5) { 'ok' } elseif ($delta -lt -0.5) { 'bad' } else { 'na' }
     $arrow = if ($delta -gt 0.5) { '&uarr;' } elseif ($delta -lt -0.5) { '&darr;' } else { '&rarr;' }
-    $deltaText = '{0} {1} pt vs previous run ({2} run(s) recorded)' -f $arrow, [math]::Round($delta, 1), $points.Count
+    $deltaText = '{0} {1} pt vs previous run ({2})' -f $arrow, [math]::Round($delta, 1),
+    (Get-mdiTrendRunCountText -Plotted $points.Count -Recorded $recordedRuns)
 
     ($parts.ToArray() -join '') + '<p><span class="pill ' + $tone + '">' + $deltaText + '</span></p>'
 }
@@ -3557,7 +6065,23 @@ function New-mdiTrendChart {
     flag is a boolean that would otherwise be counted as a passed or failed check.
 #>
 $script:mdiInformationalProperty = @('SensorVersion', 'CapturingComponent', 'MachineType', 'OS', 'IP', 'Addresses', 'FQDN', 'Domain', 'Comment', 'Details')
-$script:mdiStatusFlag = @('PartialFailure', 'Unreachable')
+$script:mdiStatusFlag = @('PartialFailure', 'Unreachable', 'IsPlaceholder')
+
+<#
+    The readiness checks this script produces, by name.
+
+    Used only to decide whether a STRING may be promoted to a check. A real boolean is a check
+    wherever it appears, so a check added later still works without touching this list; but a string
+    is ambiguous, and promoting any string that happens to read 'True' or 'False' turned a descriptive
+    field into a fake failing check - a server carrying SiteName='False' was reported as failing a
+    "Site Name check" that does not exist. Excluding the informational names was not enough, because
+    that list cannot know about a field a future version, another tool, or a hand-edited report adds.
+#>
+$script:mdiCheckName = @(
+    'OSVersion', 'AdvancedAuditing', 'AdvancedAuditingCA', 'AdvancedAuditingEntraConnect',
+    'NtlmAuditing', 'PowerSettings', 'RequiredPorts', 'SensorHealth', 'SensorV3Ready',
+    'TimeSync', 'CAAuditing', 'CapacitySufficient', 'RootCertificates', 'ServerRequirements'
+)
 
 <#
     How a port probe that never RAN is told apart from one that ran and found the port shut.
@@ -3612,32 +6136,132 @@ function ConvertTo-mdiSafeFileName {
     if ([string]::IsNullOrWhiteSpace($safe)) { 'domain' } else { $safe }
 }
 
+function ConvertTo-mdiBoolean {
+    <#
+        A stored tri-state value as a real boolean, or $null when it says "not measured".
+
+        PowerShell treats every non-empty string as true, so a value that has been through a JSON round
+        trip in another tool, a hand-edited report, or an older version of this script can carry the
+        STRING 'False' - and every "Where-Object { $_.Success }" in the aggregation then counted it as a
+        success. Parsed explicitly rather than cast: [bool]'False' is $true, which is exactly the trap.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Value
+    )
+
+    if ($Value -is [bool]) { return $Value }
+    if ($null -eq $Value) { return $null }
+    $text = ([string] $Value).Trim()
+    if ($text -eq '') { return $null }
+    $parsed = $false
+    if ([bool]::TryParse($text, [ref] $parsed)) { return $parsed }
+    # 'N/A' and anything else unrecognised mean "no measurement", never "yes".
+    $null
+}
+
 function Get-mdiCheckProperty {
     <#
         The boolean readiness checks on a server object, with the status flags removed.
+
+        A check stored as the STRING 'True' or 'False' is recognised as well as a real boolean, and is
+        returned with its value normalised - but only for a property that is a KNOWN check name. A
+        string 'False' used to be invisible: it is not [bool], so it was not a check, and it is not
+        'N/A', so it was not unread either - the check simply vanished and the server reported a clean
+        sweep of everything that was left. Measured 5 of 5, ready, no issues, verdict READY, on a
+        server whose advanced audit policy was recorded as failing.
+
+        The name check matters as much as the value check. Promoting ANY string that reads 'True' or
+        'False' turned a descriptive field into a readiness check: a server carrying SiteName='False'
+        was reported as failing a "Site Name check" that does not exist, which is a false red invented
+        out of nothing. A real boolean is still accepted from any property, so a check added in a later
+        version works without being listed here; only the ambiguous string form is restricted.
     #>
     param (
         [Parameter(Mandatory = $true)] [object] $Server
     )
-    @($Server.PSObject.Properties | Where-Object {
-            $_.Value -is [bool] -and $_.Name -notin $script:mdiStatusFlag
+    @(foreach ($prop in $Server.PSObject.Properties) {
+            if ($prop.Name -in $script:mdiStatusFlag) { continue }
+            if ($prop.Value -is [bool]) { $prop; continue }
+            if ($prop.Value -isnot [string]) { continue }
+            if ($prop.Name -notin $script:mdiCheckName) { continue }
+            $parsed = ConvertTo-mdiBoolean $prop.Value
+            if ($null -eq $parsed) { continue }
+            [PSCustomObject]@{ Name = $prop.Name; Value = $parsed }
         })
 }
+
+function Get-mdiUnreadCheckName {
+    <#
+        The NAMES of the checks that could not be measured on this server.
+
+        Extracted so the per-server score and the per-check chart count the same things. They used to
+        derive "unread" independently: the score enumerated the server's own properties, while the
+        chart could only see checks that Get-mdiCheckProperty had returned - and that function drops
+        any value which does not parse to a boolean, so an 'N/A' check is ABSENT from its output, not
+        merely non-boolean. A check unread on every server therefore vanished from the chart entirely
+        while the score card still counted it, and the two totals on one page disagreed.
+
+        Absence is deliberately NOT treated as unread. A certification authority legitimately carries
+        fewer checks than a domain controller, and charging it for checks that do not apply would
+        invent a gap on every CA in the estate. Only a property that is PRESENT and unreadable counts.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)] [object] $Server,
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] [string[]] $ExcludeName = @()
+    )
+
+    @($Server.PSObject.Properties | Where-Object {
+            $_.Name -notin $script:mdiInformationalProperty -and
+            $_.Name -notin $script:mdiStatusFlag -and
+            $_.Name -notin $ExcludeName -and
+            (([string] $_.Value -eq 'N/A') -or
+                (($_.Name -in $script:mdiCheckName) -and ($_.Value -isnot [bool]) -and
+                    ($null -eq (ConvertTo-mdiBoolean $_.Value))))
+        } | ForEach-Object { [string] $_.Name })
+}
+
+# The name given to the gap left by a scan that stopped part way. A partial scan simply never adds
+# the checks it did not reach, so they are ABSENT rather than stored as 'N/A' and cannot be counted
+# by name. The score has always charged one unread for that, and this is the same fact given a name
+# so the per-check chart can show it too and the two totals reconcile.
+$script:mdiIncompleteScanCheckName = 'ScanCompleted'
 
 function Get-mdiUnreadCheckCount {
     <#
         Checks that could not be measured. Descriptive fields are excluded, because 'N/A' there is an
         answer rather than a gap.
+
+        A KNOWN check whose value is a string that does not parse as a boolean counts as unread too,
+        not only the literal 'N/A'. A check recorded as an empty string, a stray number or a word like
+        'Unknown' used to vanish completely: it was not a boolean so it was not scored, and it was not
+        'N/A' so it was not unread either - the server reported a clean sweep of whatever was left and
+        the verdict came back ready with a check nobody had actually read. Merge-mdiCheckValue already
+        treats those values as unmeasured, so this also stops the two disagreeing about the same value.
+
+        ExcludeName lets a caller that resolves a check itself - the statistics resolve RequiredPorts
+        against the port measurement rather than the stored summary - keep that check from being
+        counted twice.
     #>
     param (
-        [Parameter(Mandatory = $true)] [object] $Server
+        [Parameter(Mandatory = $true)] [object] $Server,
+        [Parameter(Mandatory = $false)] [AllowEmptyCollection()] [string[]] $ExcludeName = @()
     )
-    @($Server.PSObject.Properties | Where-Object {
-            $_.Name -notin $script:mdiInformationalProperty -and
-            $_.Name -notin $script:mdiStatusFlag -and
-            $_.Value -is [string] -and $_.Value -eq 'N/A'
-        }).Count
+    $unread = @(Get-mdiUnreadCheckName -Server $Server -ExcludeName $ExcludeName).Count
+
+    # A scan that stopped part way keeps the checks that ran and simply never adds the rest, so the
+    # ones that were missed are ABSENT rather than stored as 'N/A'. Absent properties cannot be
+    # enumerated, so this returned zero and the report read "all checks passed" and "servers fully
+    # ready 2/2" for a server whose scan had died - the more that failed to run, the greener it got.
+    # The number missed is unknowable here, but that at least one was is not, and one is enough to
+    # stop every consumer claiming a complete picture.
+    if (($unread -eq 0) -and ($Server.PartialFailure -eq $true)) { return 1 }
+    $unread
 }
+
+# The one place the RequiredPorts check is named, because the statistics resolve it from the port
+# measurement instead of the stored summary and several functions have to agree on which check that is.
+$script:mdiRequiredPortsCheckName = 'RequiredPorts'
 
 <#
     Verbose output is one long stream of similar-looking lines, which makes it hard to follow which
@@ -3716,7 +6340,10 @@ $script:mdiTrafficSampleScript = {
     )
 
     $samples = New-Object -TypeName System.Collections.ArrayList
-    $deadline = [datetime]::Now.AddSeconds($DurationSeconds)
+    # Stopwatch rather than a wall-clock deadline. Capacity sampling runs for minutes by design, which
+    # is exactly the window in which an NTP correction or a DST transition lands - and a clock that
+    # jumps back would leave this loop sampling indefinitely.
+    $sampleTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
     do {
         try {
@@ -3747,8 +6374,44 @@ $script:mdiTrafficSampleScript = {
                 if ($physical.Count -eq 0 -or $teamedMax -ge $physicalMax) { $adapters = $teamed }
             }
 
+            # A packet rate is only a MEASUREMENT if some adapter actually returned a number.
+            #
+            # This used to be a bare "$total += [double] $adapter.PacketsPersec", and [double] of a
+            # missing value is 0 - not an error, not a null, a clean zero. A domain controller whose
+            # network performance counters are broken or disabled (a corrupt perflib, a counter set
+            # never rebuilt after an in-place upgrade) therefore reported a measured 0 packets/sec,
+            # which sails through every downstream guard: the "no reading arrived" tests are written
+            # as "$null -ne $_.PacketsPerSec" and that can never be false once the sum has been taken.
+            # The result was the report stating "the server has enough resources for a sensor v2.x at
+            # 0 busy packets/sec" in green, about a busy production domain controller nobody had
+            # measured. Zero traffic also trivially satisfies the CPU and memory bands, so every part
+            # of the verdict agreed with every other part and none of them had any data.
+            #
+            # Counting the readable adapters separately restores the distinction. No adapter with a
+            # readable counter means no sample, which is the same answer as no adapter at all above.
             $total = 0
-            foreach ($adapter in $adapters) { $total += [double] $adapter.PacketsPersec }
+            $readAdapterCount = 0
+            foreach ($adapter in $adapters) {
+                $raw = $adapter.PacketsPersec
+                if ($null -eq $raw) { continue }
+                if ($raw -is [string]) {
+                    # Parsed invariantly: a counter surfaced as text on a German host reads "12,5",
+                    # and the operator's decimal separator must not decide whether it is 12 or 125.
+                    $parsed = [double] 0
+                    if (-not [double]::TryParse($raw, [Globalization.NumberStyles]::Float,
+                            [Globalization.CultureInfo]::InvariantCulture, [ref] $parsed)) { continue }
+                    $total += $parsed
+                    $readAdapterCount++
+                } else {
+                    try {
+                        $total += [double] $raw
+                        $readAdapterCount++
+                    } catch {
+                        # A value that cannot be made a number is not a reading of zero
+                    }
+                }
+            }
+            if ($readAdapterCount -eq 0) { return $null }
 
             # The official tool also records compute and memory utilisation alongside the packet rate
             $cpuPercent = $null
@@ -3757,10 +6420,19 @@ $script:mdiTrafficSampleScript = {
                 $cpu = @(Get-WmiObject -ComputerName $ComputerName -Namespace 'root\cimv2' -Class $CpuPerfClass `
                         -Property 'Name', 'PercentProcessorTime' -ErrorAction Stop |
                         Where-Object { $_.Name -eq '_Total' })[0]
-                if ($cpu) { $cpuPercent = [double] $cpu.PercentProcessorTime }
+                # The PROPERTY is checked, not only that an instance came back. WMI can return a counter
+                # instance whose value is empty - a provider that partly failed, a hardened server, a
+                # counter class present but not populated - and [double] $null is 0, not "unknown". That
+                # zero passes the "$null -ne" gate the averages use, so it was averaged in as a real
+                # reading and the capacity table then said "0% avg / 0% max" CPU and "0.00 GB min" free
+                # memory about a server where neither counter was ever read. Both are false statements
+                # and they fail in opposite directions: 0% CPU reads as an idle server with headroom to
+                # spare, 0.00 GB free reads as a server out of memory. Left null the row correctly
+                # renders 'n/a'.
+                if ($cpu -and $null -ne $cpu.PercentProcessorTime) { $cpuPercent = [double] $cpu.PercentProcessorTime }
                 $memory = Get-WmiObject -ComputerName $ComputerName -Namespace 'root\cimv2' -Class $MemoryPerfClass `
                     -Property 'AvailableMBytes' -ErrorAction Stop
-                if ($memory) { $availableMb = [double] $memory.AvailableMBytes }
+                if ($memory -and $null -ne $memory.AvailableMBytes) { $availableMb = [double] $memory.AvailableMBytes }
             } catch {
                 # Utilisation is supplementary: a server that does not expose these classes is still sized
             }
@@ -3772,10 +6444,33 @@ $script:mdiTrafficSampleScript = {
                     AvailableMb   = $availableMb
                 })
         } catch {
+            # A transient WMI failure keeps whatever was already measured instead of throwing the whole
+            # sample away. This was "return $null", so ONE RPC blip - the sort that happens routinely
+            # across a WAN link or while a DC is briefly busy - discarded every reading collected before
+            # it. Measured: 9 good readings lost after 9.1s, and at the documented maximum
+            # -CapacityPlanningDuration 86400 a single hiccup on any one of 17,280 polls threw away a
+            # full 24-hour sample. The samples live only in this runspace, so there is no partial
+            # artefact to fall back on and the operator is told the counters could not be read at all.
+            #
+            # Only a sample that produced NOTHING is still a failure: partial data is reported as
+            # partial, which the caller already distinguishes through SampleCount / FullWindow, and the
+            # bands downstream are computed from the readings that genuinely arrived.
+            if ($samples.Count -gt 0) { break }
             return $null
         }
-        if ([datetime]::Now -lt $deadline) { Start-Sleep -Seconds $IntervalSeconds }
-    } while ([datetime]::Now -lt $deadline)
+        if ($sampleTimer.Elapsed.TotalSeconds -lt $DurationSeconds) {
+            # Capped to what is LEFT of the budget, not a flat interval. Both settings are validated
+            # independently - [ValidateRange(30, 86400)] on the duration and [ValidateRange(1, 60)] on
+            # the interval, with no cross-validation - so an entirely legal
+            # "-CapacityPlanningDuration 30 -CapacityPlanningInterval 60" slept a full 60s past a 30s
+            # request. Measured: 60.18s elapsed for a 30s sample, one reading, which the capacity table
+            # then renders as "0 s". The operator waits twice as long as they asked for and gets a
+            # sample too short to size anything.
+            $remaining = $DurationSeconds - $sampleTimer.Elapsed.TotalSeconds
+            $sleepSeconds = [Math]::Min([double] $IntervalSeconds, $remaining)
+            if ($sleepSeconds -gt 0) { Start-Sleep -Milliseconds ([int] ($sleepSeconds * 1000)) }
+        }
+    } while ($sampleTimer.Elapsed.TotalSeconds -lt $DurationSeconds)
 
     if ($samples.Count -eq 0) { return $null }
     , $samples.ToArray()
@@ -3817,7 +6512,7 @@ function Get-mdiTrafficSampleSet {
         # disposed by the finally below.
         $pool.Open()
     } catch {
-        Write-Warning ('Unable to start parallel traffic sampling: {0}. Capacity planning is skipped.' -f $_.Exception.Message)
+        Write-mdiWarning ('Unable to start parallel traffic sampling: {0}. Capacity planning is skipped.' -f $_.Exception.Message)
         $pool.Dispose()
         return $collected
     }
@@ -3842,18 +6537,37 @@ function Get-mdiTrafficSampleSet {
                 })
         }
 
-        # The wait is bounded. EndInvoke blocks unconditionally, so a domain controller whose WMI hangs -
-        # common over an unstable link or with a wedged DCOM - froze the capacity phase forever with no
-        # way out. The budget is the sampling duration plus a margin for the WMI round trips.
-        $waitMs = ([Math]::Max(1, $DurationSeconds) * 1000) + 120000
+        # The wait is bounded FOR THE PHASE, not for each job in turn.
+        #
+        # $waitMs used to be handed to WaitOne inside this sequential loop, so a budget documented as
+        # "the sampling duration plus a margin" was actually spent once PER SERVER: three domain
+        # controllers with wedged WMI cost three full budgets one after another, and the phase an
+        # operator was told would take about two minutes ran for hours on a large estate. The jobs all
+        # run CONCURRENTLY in the pool, so waiting for them one at a time and charging each the whole
+        # budget is a straightforward accounting error.
+        #
+        # The deadline is shared and measured on a monotonic Stopwatch, so an NTP correction during
+        # sampling cannot expire it or extend it. Jobs that have already finished are collected with
+        # no wait at all, because WaitOne on a signalled handle returns immediately whatever the
+        # timeout.
+        #
+        # It scales with WAVES rather than with servers. When the pool throttle is smaller than the
+        # number of targets - a very large forest - later jobs genuinely cannot start until earlier
+        # ones finish, so a single flat deadline would abandon work that had never been given a chance
+        # to run. One budget per wave bounds the phase without punishing a queued server.
+        $perJobWaitMs = ([Math]::Max(1, $DurationSeconds) * 1000) + 120000
+        $waveCount = [Math]::Max(1, [Math]::Ceiling($pending.Count / [double] [Math]::Max(1, $throttle)))
+        $totalWaitMs = [double] $perJobWaitMs * $waveCount
+        $waitTimer = [System.Diagnostics.Stopwatch]::StartNew()
         foreach ($job in $pending) {
             try {
-                if ($job.Handle.AsyncWaitHandle.WaitOne($waitMs, $false)) {
+                $remainingMs = [int] [Math]::Max(0, $totalWaitMs - $waitTimer.Elapsed.TotalMilliseconds)
+                if ($job.Handle.AsyncWaitHandle.WaitOne($remainingMs, $false)) {
                     $output = $job.Shell.EndInvoke($job.Handle)
                     $rows = @($output | Where-Object { $_ })
                     $collected[$job.Computer] = if ($rows.Count -gt 0) { $rows } else { $null }
                 } else {
-                    Write-Warning ('Traffic sampling on {0} did not finish within {1}s and was abandoned' -f $job.Computer, [int] ($waitMs / 1000))
+                    Write-mdiWarning ('Traffic sampling on {0} did not finish within the {1}s budget shared by this phase and was abandoned' -f $job.Computer, [int] ($totalWaitMs / 1000))
                     try { $job.Shell.Stop() } catch {}
                     $collected[$job.Computer] = $null
                 }
@@ -3887,6 +6601,49 @@ function Get-mdiTrafficSample {
     , $rows
 }
 
+function Get-mdiPacketRateReading {
+    <#
+        One packets/sec reading, or $null when the value is not a usable measurement.
+
+        Every caller used to convert with a bare [double] cast, which has three separate failure
+        modes that all produce a number a downstream guard cannot tell from a real reading:
+
+          * [double] '' and [double] $null are a clean ZERO, not an error. A row carrying an empty
+            counter was therefore averaged in as an idle interval, and a server nobody measured came
+            back green at "0 busy packets/sec".
+          * The cast is culture-sensitive for a thousands separator, so a counter surfaced as text
+            reading '12,5' on a German host became 125 - an order of magnitude out, enough to move
+            the server into the wrong sizing band. The sampler already parses invariantly; the
+            aggregation did not, so the two disagreed about the same reading.
+          * A NEGATIVE rate is not a slow server, it is a wrapped or broken counter. Nothing rejected
+            it, and because no row of the sizing table matches a negative value the band lookup fell
+            through to its "above the top of the table" fallback and sized the server against the
+            LARGEST band - while the verdict, which only tests the upper bounds, still said 'Yes'.
+            The report read "The server has enough resources for a sensor v2.x at -200 busy
+            packets/sec" in green, against the 75k-100k requirement.
+
+        Returning $null for all three makes an unusable reading indistinguishable from a reading that
+        never arrived, which is the state the callers already handle correctly.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $Value
+    )
+
+    if ($null -eq $Value) { return $null }
+    $parsed = [double] 0
+    if ($Value -is [string]) {
+        if (-not [double]::TryParse($Value, [Globalization.NumberStyles]::Float,
+                [Globalization.CultureInfo]::InvariantCulture, [ref] $parsed)) { return $null }
+    } else {
+        try { $parsed = [double] $Value } catch { return $null }
+    }
+    if ([double]::IsNaN($parsed) -or [double]::IsInfinity($parsed)) { return $null }
+    # A packet rate cannot be negative. This is the only guard that rejects a value the cast was
+    # perfectly happy to produce, so it is the one that closes the green "-200 busy packets/sec" row.
+    if ($parsed -lt 0) { return $null }
+    $parsed
+}
+
 function Get-mdiBusyPacketsPerSecond {
     param (
         [Parameter(Mandatory = $true)] [object[]] $Sample,
@@ -3895,12 +6652,18 @@ function Get-mdiBusyPacketsPerSecond {
 
     # 'The sizing tool determines whether your server is supported based on the Busy Packets/Second value,
     #  which is calculated based on the 15 busiest minutes over a 24 hour period.'
-    $values = @($Sample | ForEach-Object { [double] $_.PacketsPerSec })
+    $values = @($Sample | ForEach-Object { Get-mdiPacketRateReading $_.PacketsPerSec } | Where-Object { $null -ne $_ })
+    # Callers gate on Get-mdiPacketRateReading before reaching here, so this is a defence in depth
+    # rather than a live path - but Measure-Object over an empty set returns $null and [int] $null is
+    # 0, which is the exact "unmeasured looks measured" shape this function exists downstream of.
+    if ($values.Count -eq 0) { return $null }
     $average = ($values | Measure-Object -Average).Average
     $peak = ($values | Measure-Object -Maximum).Maximum
 
     $windowSeconds = $WindowMinutes * 60
-    $span = ($Sample[-1].Timestamp - $Sample[0].Timestamp).TotalSeconds
+    # Absolute value: samples arriving out of order produced a NEGATIVE span, which is not a shorter
+    # sample, and it was rendered to the operator as "sampled only -1200 second(s)".
+    $span = [math]::Abs(($Sample[-1].Timestamp - $Sample[0].Timestamp).TotalSeconds)
 
     $busy = if ($span -lt $windowSeconds) {
         # The sample is shorter than the busy window, so the whole sample is the best available estimate
@@ -3919,8 +6682,8 @@ function Get-mdiBusyPacketsPerSecond {
             $windowEnd = $windowStart.AddSeconds($windowSeconds)
             $window = @($Sample | Where-Object { $_.Timestamp -ge $windowStart -and $_.Timestamp -le $windowEnd })
             if ($window.Count -eq 0) { continue }
-            $windowAverage = ($window | ForEach-Object { [double] $_.PacketsPerSec } | Measure-Object -Average).Average
-            if ($windowAverage -gt $best) { $best = $windowAverage }
+            $windowAverage = ($window | ForEach-Object { Get-mdiPacketRateReading $_.PacketsPerSec } | Where-Object { $null -ne $_ } | Measure-Object -Average).Average
+            if ($null -ne $windowAverage -and $windowAverage -gt $best) { $best = $windowAverage }
         }
         # If no full window existed after all, fall back to the whole-sample average rather than zero.
         if ($best -le 0) { $best = $average }
@@ -3992,19 +6755,42 @@ function Get-mdiCapacityPlanning {
         return & $notSized 'Missing traffic data' 'Unable to read the network performance counters over WMI'
     }
 
-    # A sample row with a null PacketsPerSec is a reading that never arrived, not a measured zero. Summing
-    # or averaging an all-null collection yields 0 (Measure-Object -Sum/-Average returns $null, and [int]
-    # $null is 0), and the sizing table then hands back a confident 'Yes' for a server whose traffic was
-    # never actually observed. Require at least one non-null PacketsPerSec reading before producing a
-    # verdict; with none, the traffic was not sampled and capacity is 'N/A', not a pass. A genuinely idle
-    # DC that really sampled 0 packets/sec is indistinguishable from "no data arrived" here, so the detail
-    # says so rather than guessing a green result.
-    $packetSamples = @($collected | Where-Object { $null -ne $_.PacketsPerSec })
+    # A sample row whose PacketsPerSec is not a usable reading is a reading that never arrived, not a
+    # measured zero. Get-mdiPacketRateReading rejects $null, an empty or unparsable string, a value
+    # that only parses under the operator's own culture, and a negative (wrapped) counter - all of
+    # which a bare [double] cast turned into a plausible number. Summing or averaging those yields 0
+    # (Measure-Object -Sum/-Average returns $null, and [int] $null is 0), and the sizing table then
+    # hands back a confident 'Yes' for a server whose traffic was never actually observed. Require at
+    # least one usable PacketsPerSec reading before producing a verdict; with none, the traffic was
+    # not sampled and capacity is 'N/A', not a pass. A genuinely idle DC that really sampled 0
+    # packets/sec is indistinguishable from "no data arrived" here, so the detail says so rather than
+    # guessing a green result.
+    $packetSamples = @($collected | Where-Object { $null -ne (Get-mdiPacketRateReading $_.PacketsPerSec) })
     if ($packetSamples.Count -eq 0) {
         return & $notSized 'Missing traffic data' ('Network traffic was not sampled on {0}: no packets/sec readings were returned, so capacity cannot be sized (an idle server that truly measured 0 packets/sec cannot be distinguished from a failed measurement here)' -f $ComputerName)
     }
+    # A PARTIALLY sampled window cannot be sized either, and this is worse than no data at all because
+    # it looks like data. Only the rows that carry a reading are real, but the busy-rate calculation
+    # was handed the whole collection - where [double] $null is 0 - so every interval that failed to
+    # arrive was averaged in as an idle period. One measured reading at 100,000 packets/sec, the
+    # published ceiling for an unsupported server, plus nine unread intervals averaged to 10,000 and
+    # returned a confident green. The identical reading on its own correctly returns False.
+    #
+    # Sizing the server from the readings that did arrive would be no better: a busy window that was
+    # only partly observed understates the peak the sensor has to keep up with. So a short sample is
+    # reported as unsized, naming how much of it was actually read.
+    if ($packetSamples.Count -ne @($collected).Count) {
+        return & $notSized 'Incomplete traffic data' ('Only {0} of {1} packets/sec reading(s) were returned from {2}, so the busy period was only partly observed and capacity cannot be sized' -f
+            $packetSamples.Count, @($collected).Count, $ComputerName)
+    }
 
-    $traffic = Get-mdiBusyPacketsPerSecond -Sample $collected -WindowMinutes $capacity.BusyWindowMinutes
+    $traffic = Get-mdiBusyPacketsPerSecond -Sample $packetSamples -WindowMinutes $capacity.BusyWindowMinutes
+    # Get-mdiBusyPacketsPerSecond returns $null when nothing in the sample was a usable reading. The
+    # gate above should already have caught that, but reading .BusyPacketsPerSec off $null yields
+    # $null, and $null flows through the band lookup and the verdict as a plausible zero.
+    if ($null -eq $traffic) {
+        return & $notSized 'Missing traffic data' ('Network traffic was not sampled on {0}: no usable packets/sec readings were returned, so capacity cannot be sized' -f $ComputerName)
+    }
     $busy = $traffic.BusyPacketsPerSec
 
     $cpuSamples = @($collected | Where-Object { $null -ne $_.CpuPercent } | ForEach-Object { [double] $_.CpuPercent })
@@ -4097,9 +6883,46 @@ function Get-mdiPowerScheme {
     # on a real misconfiguration. Casting to [string] collapses the array to one string so the scalar
     # -match populates $Matches from THIS server's output. The not-measured branch below already casts
     # for the same reason; this aligns the pass branch with it.
-    if ([string] $details -match ':\s+(?<guid>[a-fA-F0-9]{8}[-]?([a-fA-F0-9]{4}[-]?){3}[a-fA-F0-9]{12})\s+\((?<name>.*)\)') {
+    # ANCHORED to a whole line, not matched anywhere in the output. powercfg /getactivescheme prints
+    # exactly one line on success - "<label>: <guid>  (<name>)" - where only the LABEL is localised.
+    # The old pattern looked for ": <guid> (<name>)" ANYWHERE in the text, and an error message is
+    # free to contain both. Measured with a stubbed powercfg:
+    #
+    #   "ERROR: powercfg.exe was blocked by policy: 8c5e7fda-...-a6e23a8c635c (High performance)"
+    #       -> reported isPowerSchemeOk = TRUE. A server whose power scheme could not be read at all
+    #          was certified as correctly configured.
+    #   "ERROR: ... blocked by application-control policy. Activity ID: {01234567-...} (Corporate WDAC policy)"
+    #       -> reported isPowerSchemeOk = FALSE and the generated remediation script wrote
+    #          powercfg /setactive onto that server. Changing a production power plan on the strength
+    #          of a GUID scraped out of an error message is the expensive kind of wrong answer.
+    #
+    # ^[^:]* cannot cross the first colon, so an error that carries its own "...: <guid> (<name>)"
+    # tail no longer satisfies it, while every localised success line still does - the label differs
+    # by language ("Power Scheme GUID", "Energieschema-GUID") but never contains a colon.
+    # Examined LINE BY LINE, not as one joined string. Invoke-mdiRemoteCommand returns Get-Content
+    # output, which is an ARRAY of lines whenever the redirected file holds more than one - a stderr
+    # warning ahead of the scheme line, a blank line, a localised banner - and casting that array to
+    # [string] joins it with SPACES, not newlines. A line anchor therefore cannot see the individual
+    # lines at all: the whole array collapses to ONE line beginning with the warning, and a genuine
+    # success line preceded by any noise was classified as unreadable. Splitting on newlines as well
+    # covers the other shape, a single string that already contains them.
+    #
+    # Each line is matched with a SCALAR -match, which is what populates $Matches. Applying -match to
+    # an array makes it a FILTER that returns the matching elements and does NOT populate $Matches -
+    # so $Matches.guid would keep whatever a previous server left in it, and a domain controller on
+    # the Balanced scheme would inherit the prior server's High performance GUID. That exact false
+    # green is why the original code collapsed the array to a string; iterating the lines keeps the
+    # scalar match while restoring the line structure the anchor needs.
+    $schemeGuid = $null
+    foreach ($line in @(@($details) | ForEach-Object { [string] $_ -split "`r?`n" })) {
+        if ($line -match '^[^:]*:\s+(?<guid>[a-fA-F0-9]{8}[-]?([a-fA-F0-9]{4}[-]?){3}[a-fA-F0-9]{12})\s+\((?<name>[^)]*)\)\s*$') {
+            $schemeGuid = [string] $Matches.guid
+            break
+        }
+    }
+    if ($null -ne $schemeGuid) {
         $return = [PSCustomObject]@{
-            isPowerSchemeOk = $Matches.guid -eq '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c'
+            isPowerSchemeOk = $schemeGuid -eq '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c'
             details         = $details
         }
     } elseif ($null -eq $details -or [string]::IsNullOrWhiteSpace([string] $details) -or
@@ -4108,12 +6931,15 @@ function Get-mdiPowerScheme {
         # branch below then reported the power scheme as misconfigured on a machine that was simply
         # not answering. One list means one behaviour everywhere.
         [string] $details -match $script:mdiPortNotTestedPattern -or
-        # Structural, not textual. powercfg /getactivescheme always prints a GUID when it succeeds, and a
-        # GUID is hex in every locale, so output containing no GUID at all is definitionally unreadable -
-        # whatever language the error is in. This replaces an English-only phrase list that let a
-        # non-English error (for example WDAC blocking powercfg.exe on a German DC) fall through to the
-        # else branch and be reported as a wrong power scheme - a false red on estates never seen in testing.
-        [string] $details -notmatch '[a-fA-F0-9]{8}-[a-fA-F0-9]{4}') {
+        # Structural, not textual, and now keyed on the ACTIVE SCHEME LINE rather than on "does this
+        # text contain hex anywhere". powercfg /getactivescheme always prints that line when it
+        # succeeds, in every locale, so output without it is definitionally unreadable whatever
+        # language the error is in. The previous test - "contains no GUID at all" - was satisfied by
+        # any error carrying an unrelated GUID such as a WDAC Activity ID, which then fell through to
+        # the else branch and was reported as a WRONG power scheme rather than an unread one: a false
+        # red that also wrote powercfg /setactive into the remediation script. It replaced an
+        # English-only phrase list that had the same failure on non-English errors.
+        $true) {
         # The scheme was not read, so it is not known to be wrong. Reporting an unread check as a
         # failure sends people to change a power plan that is very likely already correct.
         $return = [PSCustomObject]@{
@@ -4164,8 +6990,22 @@ function Get-mdiServerRequirements {
         # With SilentlyContinue these came back null on an access denied, and $null -ge 2 is false, so a
         # server with ample hardware was reported as failing the minimum requirements without any error
         # ever being raised. The query now stops on error and a missing answer is reported as unknown.
+        #
+        # The individual PROPERTIES are checked too, not only that the objects came back. WMI can return
+        # an instance with a property empty - a provider that partly failed, a hardened server, a VM
+        # whose host withheld a value - and $null -ge 6GB is false, so a value that was never read was
+        # reported as insufficient hardware. That is a false red, and its remediation is somebody buying
+        # memory for a server that already has enough.
         if ($null -eq $csi -or $null -eq $osdisk) {
             throw 'the hardware inventory was not returned'
+        }
+        $unread = @(
+            $(if ($null -eq $csi.NumberOfLogicalProcessors) { 'logical processor count' })
+            $(if ($null -eq $csi.TotalPhysicalMemory) { 'physical memory' })
+            $(if ($null -eq $osdisk.FreeSpace) { 'free space on the system drive' })
+        ) | Where-Object { $_ }
+        if (@($unread).Count -gt 0) {
+            throw ('the hardware inventory did not return {0}' -f (@($unread) -join ', '))
         }
 
         $minRequirements = @{
@@ -4196,6 +7036,52 @@ function Get-mdiServerRequirements {
     $return
 }
 
+function Split-mdiRegistrySpec {
+    <#
+        A registry specification, "key path,value name,expected value", split into its three parts.
+
+        Only the KEY PATH carries data from the environment: the certification authority's common name
+        is interpolated into it, and a CN legitimately contains a comma - "Contoso, Inc CA" is an
+        ordinary company name. Splitting left to right therefore produced four fields where three were
+        expected, and the multiple assignment silently took the first three: the path was truncated at
+        the comma, the value name became " Inc CA" and the expected value became the string
+        "AuditFilter". OpenSubKey returns null for a key that does not exist, so the absent value was
+        then compared against that expectation and a CORRECTLY configured certification authority came
+        back as a MEASURED $false - a false red telling an administrator to fix auditing that was
+        already right, pointing at a registry path that does not exist. Three separate hunts found it
+        independently; reproduced end to end against the shipped reader with AuditFilter = 127, where
+        3 of 9 realistic CA names broke.
+
+        The value name and the expected value are literals from this script's own settings and never
+        contain a comma, so the split is anchored at the RIGHT: the last two fields are those two, and
+        everything before them is the path, however many commas it holds.
+
+        A specification may carry two fields or three. Three is "path,value,expected"; two is
+        "path,value" with no expectation, which is how the certification authority's own name is read
+        before it can be interpolated into anything. The two-field form is never built from
+        environment data - its path is a constant - so it is taken literally, while the three-field
+        form is the one whose path can contain commas and is therefore anchored at the right.
+
+        Anything shorter cannot be interpreted at all, and $null is returned so the caller reports the
+        entry as unread rather than inventing a measurement from whatever the split happened to
+        produce.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [AllowEmptyString()] [string] $Spec
+    )
+
+    $fields = @([string] $Spec -split ',')
+    if ($fields.Count -lt 2) { return $null }
+    if ($fields.Count -eq 2) {
+        return [PSCustomObject]@{ KeyPath = $fields[0]; ValueName = $fields[1]; ExpectedValue = $null }
+    }
+    [PSCustomObject]@{
+        KeyPath       = ($fields[0..($fields.Count - 3)] -join ',')
+        ValueName     = $fields[$fields.Count - 2]
+        ExpectedValue = $fields[$fields.Count - 1]
+    }
+}
+
 function Get-mdiRegistryValueSet {
     param (
         [Parameter(Mandatory = $true)] [string] $ComputerName,
@@ -4209,23 +7095,69 @@ function Get-mdiRegistryValueSet {
     try {
         $hklm = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey('LocalMachine', $ComputerName, 'Registry64')
     } catch {
-        Write-Warning ('Unable to read the registry of {0}: {1}' -f $ComputerName, $_.Exception.Message)
+        Write-mdiWarning ('Unable to read the registry of {0}: {1}' -f $ComputerName, $_.Exception.Message)
         return $null
     }
 
     try {
         foreach ($reg in $ExpectedRegistrySet) {
-            $regKeyPath, $regValue, $expectedValue = $reg -split ','
+            # Split from the right by Split-mdiRegistrySpec, because the key path is the one field that
+            # can contain a comma - the certification authority's name is interpolated into it.
+            $spec = Split-mdiRegistrySpec -Spec $reg
+            if ($null -eq $spec) {
+                # A specification this reader cannot interpret measured nothing. It is emitted as
+                # unreadable rather than skipped: every caller counts these rows against what it asked
+                # for, and quietly returning fewer would read as a clean result for an entry nobody
+                # looked at.
+                [PSCustomObject]@{
+                    regKey        = [string] $reg
+                    value         = $null
+                    expectedValue = $null
+                    Readable      = $false
+                }
+                continue
+            }
+            $regKeyPath = $spec.KeyPath
+            $regValue = $spec.ValueName
+            $expectedValue = $spec.ExpectedValue
             $value = $null
+            $valueKind = $null
             $regKey = $null
+            $readable = $true
             try {
                 # OpenSubKey returns null for a key that does not exist rather than throwing, so calling
                 # GetValue on the result fails with "You cannot call a method on a null-valued expression".
                 # A missing key is a legitimate finding: it means the setting was never configured.
                 $regKey = $hklm.OpenSubKey($regKeyPath)
-                if ($regKey) { $value = $regKey.GetValue($regValue) }
+                if ($regKey) {
+                    $value = $regKey.GetValue($regValue)
+                    # The KIND is read as well as the value, because "the setting holds 2" and "the
+                    # setting is a REG_DWORD holding 2" are different facts and only the second one
+                    # is honoured by the component that consumes it. GetValue stringifies a REG_SZ
+                    # "2" and a REG_DWORD 2 identically, so a caller comparing the text alone cannot
+                    # tell them apart. GetValueKind throws when the value does not exist, so it is
+                    # only called once GetValue has returned something.
+                    # In its OWN try/catch, and deliberately non-fatal. GetValueKind is a second call
+                    # against the same remote handle and can fail on its own - an exotic value type,
+                    # a provider that does not implement it, a handle that went away between the two
+                    # calls. Letting that failure reach the outer catch marked the row UNREADABLE and
+                    # threw away a value that had already been read successfully, which turned a
+                    # measured CA auditing pass into "not measured". The kind is an ENRICHMENT of a
+                    # successful read, so when it cannot be obtained it is left null and the callers
+                    # fall back to comparing the value alone.
+                    if ($null -ne $value) {
+                        try { $valueKind = [string] $regKey.GetValueKind($regValue) } catch { $valueKind = $null }
+                    }
+                }
             } catch {
-                Write-Warning ('Unable to read {0}\{1} on {2}: {3}' -f $regKeyPath, $regValue, $ComputerName, $_.Exception.Message)
+                # An exception here means the value was NOT READ - the key exists but access was denied,
+                # or the remote registry dropped mid-enumeration. That is not the same as a value that
+                # was read and found absent, and the row used to be indistinguishable from one: both
+                # carried a null value, so a caller comparing against the expected setting reported a
+                # measured misconfiguration for a value nobody had managed to look at. The flag lets
+                # each caller tell "configured wrongly" from "could not be checked".
+                $readable = $false
+                Write-mdiWarning ('Unable to read {0}\{1} on {2}: {3}' -f $regKeyPath, $regValue, $ComputerName, $_.Exception.Message)
             } finally {
                 if ($regKey) { try { $regKey.Close() } catch {} }
             }
@@ -4233,7 +7165,9 @@ function Get-mdiRegistryValueSet {
             [PSCustomObject]@{
                 regKey        = '{0}\{1}' -f $regKeyPath, $regValue
                 value         = $value
+                valueKind     = $valueKind
                 expectedValue = $expectedValue
+                Readable      = $readable
             }
         }
     } finally {
@@ -4258,13 +7192,40 @@ function Get-mdiNtlmAuditing {
             details          = 'Not tested - the registry could not be read on this server'
         }
     }
+    # A value that could not be READ is not a value that is wrong. The helper used to report a failed
+    # read as a null value, which is exactly what an unconfigured setting looks like, so one access
+    # denied on one entry reported NTLM auditing as misconfigured - and the generated remediation then
+    # rewrote registry values on the strength of a read that never happened.
+    $unreadable = @($details | Where-Object { $_.PSObject.Properties['Readable'] -and $_.Readable -eq $false })
+    if ($unreadable.Count -gt 0) {
+        return [PSCustomObject]@{
+            isNtlmAuditingOk = 'N/A'
+            details          = ('Not tested - {0} of {1} registry value(s) could not be read on this server: {2}' -f
+                $unreadable.Count, @($details).Count, ((@($unreadable | ForEach-Object { [string] $_.regKey })) -join ', '))
+        }
+    }
     [PSCustomObject]@{
         # Anchored. The expected value is a regex so that "1|2" can express two acceptable settings,
         # but unanchored it also matches anything CONTAINING the expected value: AuditFilter expects
         # 127 and accepted 1270, AuditNTLMInDomain expects 7 and accepted 17, and RestrictSendingNTLM
         # expects 1|2 and accepted 21. These are DWORDs and hold whatever a script or a mistyped policy
         # wrote, so a misconfigured audit control read as configured.
-        isNtlmAuditingOk = @($details | Where-Object { [string] $_.value -notmatch ('^(?:' + $_.expectedValue + ')$') }).Count -eq 0
+        # The TYPE is checked as well as the text. These settings are REG_DWORD - the comment above
+        # already said so - but nothing verified it, and GetValue renders a REG_SZ "2" and a
+        # REG_DWORD 2 as the same string. LSA reads these values as DWORDs, so a string one is not
+        # honoured: the estate is NOT auditing NTLM, and the report said it was. Measured with a
+        # stubbed registry: kind=String value="2" returned isNtlmAuditingOk = True, and so did
+        # value="2" with a trailing newline. That is a false green on an audit control, which is the
+        # worst kind - nobody goes looking. It also suppressed the remediation, so the script
+        # declined to fix the setting it had misread.
+        #
+        # A wrong TYPE is a measured failure, not an unread check: the value was read successfully,
+        # and what it says is that the setting is not in effect.
+        isNtlmAuditingOk = @($details | Where-Object {
+                [string] $_.value -notmatch ('^(?:' + $_.expectedValue + ')$') -or
+                ($null -ne $_.value -and $null -ne $_.valueKind -and
+                    [string] $_.valueKind -notin @('DWord', 'QWord'))
+            }).Count -eq 0
         details          = $details | Select-Object regKey, value
     }
 }
@@ -4295,10 +7256,40 @@ function Get-mdiCAAuditing {
             details        = 'Not tested - the registry could not be read on this server'
         }
     }
+    # Same reasoning as Get-mdiNtlmAuditing: a value that could not be read is not a value that is
+    # wrong. Without this an access denied on one entry reported the certification authority's auditing
+    # as misconfigured, and the remediation would rewrite CA audit settings on the strength of a read
+    # that never happened.
+    $unreadable = @($details | Where-Object { $_.PSObject.Properties['Readable'] -and $_.Readable -eq $false })
+    if ($unreadable.Count -gt 0) {
+        return [PSCustomObject]@{
+            isCaAuditingOk = 'N/A'
+            details        = ('Not tested - {0} of {1} registry value(s) could not be read on this server: {2}' -f
+                $unreadable.Count, @($details).Count, ((@($unreadable | ForEach-Object { [string] $_.regKey })) -join ', '))
+        }
+    }
     [PSCustomObject]@{
-        # Anchored for the same reason as the NTLM auditing check: AuditFilter expects 127, and
-        # unanchored it accepted 1270 and 1127 as correctly configured.
-        isCaAuditingOk = @($details | Where-Object { [string] $_.value -notmatch ('^(?:' + $_.expectedValue + ')$') }).Count -eq 0
+        # A REQUIRED-BITS SUBSET test, not equality. AuditFilter is a bitmask and the expected value is
+        # 127, meaning "audit all seven CA event categories". A certification authority configured to
+        # audit MORE than MDI asks for is not misconfigured - it is auditing a superset and still emits
+        # every event MDI reads - but an equality test called it broken and the report told the operator
+        # to reduce their auditing. Anchoring alone was not enough: it fixed 1270 and 1127 being accepted
+        # while still rejecting a legitimate superset.
+        #
+        # Only entries whose expected value is a plain integer are treated as a bitmask. The registry set
+        # also carries non-numeric expectations, and those keep the anchored string comparison.
+        isCaAuditingOk = @($details | Where-Object {
+                $expectedText = [string] $_.expectedValue
+                $actualText = [string] $_.value
+                $expectedNumber = 0
+                $actualNumber = 0
+                if ([int]::TryParse($expectedText, [ref] $expectedNumber) -and
+                    [int]::TryParse($actualText, [ref] $actualNumber)) {
+                    ($actualNumber -band $expectedNumber) -ne $expectedNumber
+                } else {
+                    $actualText -notmatch ('^(?:' + $expectedText + ')$')
+                }
+            }).Count -eq 0
         details        = $details | Select-Object regKey, value
     }
 }
@@ -4326,12 +7317,12 @@ function Get-mdiCertReadiness {
     $storeError = $null
     try {
         $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("\\$ComputerName\Root",
-            [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine)
-        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+            [Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine)
+        $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
         $details = $store.Certificates | Where-Object { $settings.RootCertificates -contains $_.Thumbprint }
     } catch {
         $storeError = $_.Exception.Message -replace '[\r\n]+', ' '
-        Write-Warning ('Unable to read the certificate store of {0}: {1}' -f $ComputerName, $storeError)
+        Write-mdiWarning ('Unable to read the certificate store of {0}: {1}' -f $ComputerName, $storeError)
     } finally {
         if ($store) { try { $store.Close() } catch {} }
     }
@@ -4355,8 +7346,12 @@ function Get-mdiCertReadiness {
     # A root inside its validity window but within the renewal horizon is still a pass, with a warning so
     # the operator can renew it before it lapses. Never a failure - it is valid today.
     $expiringSoon = @($valid | Where-Object { $_.NotAfter -le $now.AddDays($script:mdiCertExpiryWarningDays) })
+    # Formatted invariantly before substitution: the -f operator formats {2:yyyy-MM-dd} in the CURRENT
+    # culture, so this renewal warning told a th-TH operator their root certificate "expires on
+    # 2569-08-23" - a date 543 years away, in a sentence whose entire purpose is to convey urgency.
     foreach ($cert in $expiringSoon) {
-        Write-Warning ('Root certificate {0} ({1}) expires on {2:yyyy-MM-dd}; renew it before it lapses.' -f $cert.Thumbprint, $cert.Subject, $cert.NotAfter)
+        Write-mdiWarning ('Root certificate {0} ({1}) expires on {2}; renew it before it lapses.' -f
+            $cert.Thumbprint, $cert.Subject, $cert.NotAfter.ToString('yyyy-MM-dd', [cultureinfo]::InvariantCulture))
     }
 
     [PSCustomObject]@{
@@ -4432,21 +7427,50 @@ function Get-mdiSensorVersion {
             Class        = 'Win32_Service'
             Property     = 'Name', 'PathName', 'State'
             Filter       = "Name = 'AATPSensor'"
-            ErrorAction  = 'SilentlyContinue'
+            # Stop, not SilentlyContinue. With SilentlyContinue a WMI connection that FAILED and a
+            # query that succeeded and found no AATPSensor both return $null, so the two could not be
+            # told apart and both ended up as 'N/A'. The server table rewrites 'N/A' in this column to
+            # the assertion "Not installed", so a domain controller whose WMI was unreachable was
+            # reported as having no sensor - a positive claim from a read that never happened.
+            ErrorAction  = 'Stop'
         }
         $service = Get-WmiObject @serviceParams
         if ($service) {
+            # PathName is a command line, not a file name: it is usually quoted and may carry arguments
+            # ("C:\...\Microsoft.Tri.Sensor.exe" -k netsvcs). Passing it whole asks CIM_DataFile for a
+            # file whose name includes the arguments, which matches nothing.
+            $executable = [string] $service.PathName
+            $executable = $executable.Trim()
+            if ($executable.StartsWith('"')) {
+                $closing = $executable.IndexOf('"', 1)
+                if ($closing -gt 0) { $executable = $executable.Substring(1, $closing - 1) }
+            } elseif ($executable -match '^(?<path>.+?\.exe)(\s|$)') {
+                $executable = $Matches.path
+            }
+
+            # The value has to be QUOTED. Without the quotes WQL rejects the whole query - measured
+            # against a real provider: Invalid query "select Version from CIM_DataFile where Name=C:\..."
+            # - so the version silently came back empty on every server and the sensor version read as
+            # unknown even where the sensor was installed and running. The separators are doubled
+            # because a backslash escapes in WQL; -replace '\\', '\\' does exactly that, verified by
+            # querying a known file and getting its version back.
             $versionParams = @{
                 ComputerName = $ComputerName
                 Namespace    = 'root\cimv2'
                 Class        = 'CIM_DataFile'
                 Property     = 'Version'
-                Filter       = 'Name={0}' -f ($service.PathName -replace '\\', '\\')
+                Filter       = "Name='{0}'" -f ($executable -replace '\\', '\\')
                 ErrorAction  = 'SilentlyContinue'
             }
-            $return = (Get-WmiObject @versionParams).Version
+            $version = (Get-WmiObject @versionParams).Version
+            # An installed sensor whose version could not be read is not a sensor that is absent.
+            $return = if ([string]::IsNullOrWhiteSpace([string] $version)) { 'N/A' } else { $version }
         } else {
-            $return = 'N/A'
+            # The query was ANSWERED and returned no AATPSensor, so this server genuinely has no
+            # sensor installed. Said here rather than left as 'N/A', because 'N/A' in this column
+            # means "could not be read" and the two must not share a marker: the table used to
+            # rewrite both to "Not installed", which stated a fact about servers nobody had read.
+            $return = 'Not installed'
         }
     } catch {
         # A raw HRESULT in a version field reads as if that string were the sensor version. The field
@@ -4578,12 +7602,149 @@ function Get-mdiAdvancedAuditing {
         $columnCount = ($output[0] -split ',').Count
         $header = $knownHeader[0..($columnCount - 1)]
 
-        $actual = @($output | Select-Object -Skip 1 | ConvertFrom-Csv -Header $header | Where-Object {
-                $_.'Subcategory GUID' -in $expected.'Subcategory GUID'
-            } | Select-Object -Property $properties)
+        $allRows = @($output | Select-Object -Skip 1 | ConvertFrom-Csv -Header $header)
+
+        # SYSTEM policy rows only. 'auditpol /backup' also exports PER-USER audit policy, and a
+        # per-user row carries the same Subcategory GUID as the system row for that subcategory - so
+        # the GUID alone does not identify a row, which is exactly what the previous comment here
+        # assumed. Measured both ways on the shipped function:
+        #   - a perfectly configured domain controller reported NOT configured the moment any
+        #     per-user row existed, because the comparison counts multiplicity: a remediation script
+        #     rewriting the audit policy of a machine that was already correct;
+        #   - a truncated backup missing the SYSTEM row for Credential Validation reported
+        #     CONFIGURED when a per-user row for that GUID survived - detection coverage the customer
+        #     does not have, and nothing else in the report would ever contradict it.
+        #
+        # Identified WITHOUT reading the localised text. Policy Target is translated, so matching the
+        # literal 'System' would work only in English.
+        #
+        # A per-user target is recognised by its SHAPE, which is locale-neutral: per-user policy is
+        # always recorded against a user principal - 'DOMAIN\user', 'user@domain', or a raw SID
+        # 'S-1-5-21-...' - and the system target is a single translated word carrying none of those
+        # markers. Selecting instead by "the target covering the most distinct subcategories" was a
+        # heuristic that inverts on the case that matters: a per-user policy configured across every
+        # subcategory TIES with the system policy and won the alphabetical tiebreak ('CONTOSO\alice'
+        # before 'System'), and one covering more won outright. Measured on the shipped function - a
+        # domain controller whose SYSTEM policy was 0, which is blind, reported as correctly
+        # configured because alice's per-user row for the same subcategory read 3. Nothing else in
+        # the report would ever contradict it.
+        #
+        # The subcategory count is kept only as a tiebreak among the remaining targets, and the
+        # user-shaped filter is skipped entirely if it would remove everything, so an export whose
+        # system target is itself unusual is left readable rather than filtered to nothing.
+        # A backup with no Policy Target column at all (an older or trimmed export) is left as-is.
+        $rows = $allRows
+        if ($columnCount -ge 4) {
+            $withGuid = @($allRows | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_.'Subcategory GUID') })
+            $notPerUser = @($withGuid | Where-Object { [string] $_.'Policy Target' -notmatch '\\|@|^S-1-' })
+            $candidates = if ($notPerUser.Count -gt 0) { $notPerUser } else { $withGuid }
+            $byTarget = @($candidates | Group-Object -Property 'Policy Target' |
+                    Sort-Object -Property @{ Expression = { @($_.Group.'Subcategory GUID' | Select-Object -Unique).Count } ; Descending = $true },
+                        @{ Expression = { [string] $_.Name } })
+            if (@($withGuid | Group-Object -Property 'Policy Target').Count -gt 1 -and $byTarget.Count -gt 0) {
+                $systemTarget = $byTarget[0].Name
+                Write-mdiVerbose ('The audit policy backup from {0} carries more than one policy target; reading the system policy ({1}) and ignoring per-user rows' -f
+                    $ComputerName, $systemTarget)
+                $rows = @($allRows | Where-Object { [string] $_.'Policy Target' -eq [string] $systemTarget })
+            }
+        }
+
+        # Normalised on BOTH sides before anything is matched or compared. 'auditpol /backup' produces a
+        # column-aligned CSV, so its fields can carry padding, and the two comparisons below are exact
+        # string comparisons that padding defeats in two different ways:
+        #
+        #   * a padded Subcategory GUID failed the -in filter, so the row was not collected at all and
+        #     the completeness guard then reported the export as truncated - "carried 8 subcategories
+        #     but only 0 of the 8 MDI requires" - for a backup that was complete and correct;
+        #   * a padded Setting Value passed the filter and then failed Compare-Object, which is far
+        #     worse: a MEASURED audit-policy failure, and eight `auditpol.exe /set` calls written into
+        #     the remediation script against a production domain controller that was already right.
+        $trim = { param($Value) ([string] $Value).Trim() }
+        $expectedRows = @($expected | ForEach-Object {
+                [PSCustomObject]@{
+                    'Subcategory GUID' = & $trim $_.'Subcategory GUID'
+                    'Setting Value'    = & $trim $_.'Setting Value'
+                }
+            })
+        $expectedGuids = @($expectedRows.'Subcategory GUID')
+
+        $actual = @($rows | Where-Object {
+                (& $trim $_.'Subcategory GUID') -in $expectedGuids
+            } | ForEach-Object {
+                [PSCustomObject]@{
+                    'Subcategory GUID' = & $trim $_.'Subcategory GUID'
+                    'Setting Value'    = & $trim $_.'Setting Value'
+                }
+            })
+
+        # A backup that does not carry every subcategory MDI asks about cannot be compared, because the
+        # absent rows are indistinguishable from subcategories that are genuinely not audited.
+        #
+        # This is decided by whether the EXPECTED subcategories are present, not by the size of the
+        # file, and that distinction is load-bearing. Measured on a live domain controller: a complete
+        # backup carries 64 subcategories and every one of the 8 MDI requires appears in it - including
+        # the ones that are NOT audited, which are present with Setting Value 0 (one read 0 and another
+        # read 1 on that host). So a required subcategory is never simply absent from a complete
+        # backup: if it is missing, the export was cut off mid-write or the CSV could not be parsed.
+        #
+        # Judging completeness by a row-count threshold instead was tried and is strictly worse: an
+        # export truncated at, say, 50 of 64 rows clears any plausible threshold while still missing
+        # required subcategories, and every one of them would then be reported as a subcategory that is
+        # not audited - a measured audit-policy failure, and a remediation script that rewrites audit
+        # policy, on a domain controller that was very probably already correct.
+        #
+        # This also covers the localised-separator case: where the list separator is not a comma the
+        # column split yields one column, no row exposes a Subcategory GUID, every expected GUID is
+        # therefore missing, and the check correctly reports that it could not read the policy rather
+        # than that the policy is wrong.
+        # Counted from the SYSTEM rows, not from every line in the file. Counting all of them made a
+        # backup that carried per-user policy look larger than it was, so a truncated system policy
+        # could clear the completeness test on the strength of rows describing a different target.
+        $totalSubcategory = @($rows | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_.'Subcategory GUID') }).Count
+        if ($totalSubcategory -eq 0) {
+            # No row exposed a GUID at all - a separator that is not a comma, or an empty export.
+            # Falling back to the raw line count keeps the existing "carried N subcategories but none
+            # could be parsed" message truthful rather than reporting zero of zero.
+            $totalSubcategory = @($output | Select-Object -Skip 1 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+        }
+        $missing = @($expectedRows | Where-Object { $_.'Subcategory GUID' -notin $actual.'Subcategory GUID' })
+        if ($missing.Count -gt 0) {
+            return [PSCustomObject]@{
+                isAdvancedAuditingOk = 'N/A'
+                details              = ('Not tested - the audit policy backup from {0} carried {1} subcategories in total but only {2} of the {3} MDI requires. A complete backup lists every subcategory the machine has, including those set to no auditing, so this export was either cut off before it finished or could not be parsed (which happens when the export uses a list separator other than a comma). A partial backup cannot show whether the missing subcategories are audited.' -f
+                    $ComputerName, $totalSubcategory, ($expected.Count - $missing.Count), $expected.Count)
+            }
+        }
+
+        # Unreachable in practice - the guard above already returns when any expected subcategory is
+        # missing, and a set that parsed nothing is missing all of them - but Compare-Object throws on
+        # a null DifferenceObject, so this stays as a cheap backstop rather than a crash.
+        if (@($actual).Count -eq 0) {
+            return [PSCustomObject]@{
+                isAdvancedAuditingOk = 'N/A'
+                details              = ('Not tested - the audit policy backup from {0} carried {1} subcategories but none could be parsed, so the settings were not read.' -f
+                    $ComputerName, $totalSubcategory)
+            }
+        }
+
+        # A row that is PRESENT but whose Setting Value is not a number was never read. An export cut
+        # off mid-write, a Setting Value column that is empty, and a 6-column export with no Setting
+        # Value column at all all produce this - and every one of them compared unequal to the expected
+        # value and was reported as a MEASURED audit-policy failure, which writes `auditpol.exe /set`
+        # against a production domain controller whose current policy is unknown. That is the single
+        # most expensive wrong answer this check can give, so an unreadable setting is unmeasured,
+        # exactly as an unreadable backup already is.
+        $unreadableSetting = @($actual | Where-Object { $null -eq (Get-mdiMeasuredInteger $_.'Setting Value') })
+        if ($unreadableSetting.Count -gt 0) {
+            return [PSCustomObject]@{
+                isAdvancedAuditingOk = 'N/A'
+                details              = ('Not tested - the audit policy backup from {0} carried {1} of the {2} subcategories MDI requires without a readable Setting Value, so their audit settings were not measured. The export was cut off mid-write, or its Setting Value column is empty.' -f
+                    $ComputerName, $unreadableSetting.Count, $expectedRows.Count)
+            }
+        }
 
         $compareParams = @{
-            ReferenceObject  = @($expected | Select-Object -Property $properties)
+            ReferenceObject  = $expectedRows
             DifferenceObject = $actual
             Property         = $properties
         }
@@ -4620,9 +7781,9 @@ function Get-mdiDsSacl {
         $searchRoot = [adsi] $LdapPath
         $searcher = New-Object -TypeName System.DirectoryServices.DirectorySearcher -ArgumentList $searchRoot
         $searcher.CacheResults = $false
-        $searcher.SearchScope = [System.DirectoryServices.SearchScope]::Base
-        $searcher.ReferralChasing = [System.DirectoryServices.ReferralChasingOption]::All
-        $searcher.SecurityMasks = [System.DirectoryServices.SecurityMasks]::Sacl
+        $searcher.SearchScope = [DirectoryServices.SearchScope]::Base
+        $searcher.ReferralChasing = [DirectoryServices.ReferralChasingOption]::All
+        $searcher.SecurityMasks = [DirectoryServices.SecurityMasks]::Sacl
         $searcher.PropertiesToLoad.AddRange(('ntsecuritydescriptor,distinguishedname,objectsid' -split ','))
 
         $result = ($searcher.FindOne()).Properties
@@ -4662,7 +7823,7 @@ function Get-mdiDsSacl {
         }
 
         $appliedAuditing = @($descriptor.SystemAcl) | Select-Object *,
-            @{N = 'AccessMaskDetails'; E = { (([Enum]::ToObject([System.DirectoryServices.ActiveDirectoryRights], $_.AccessMask))).ToString() } },
+            @{N = 'AccessMaskDetails'; E = { (([Enum]::ToObject([DirectoryServices.ActiveDirectoryRights], $_.AccessMask))).ToString() } },
             @{N = 'AuditFlagsValue'; E = { $_.AuditFlags.value__ } },
             @{N = 'AceFlagsValue'; E = { $_.AceFlags.value__ } }
 
@@ -4682,59 +7843,29 @@ function Get-mdiDsSacl {
     } catch {
         $e = $_
         $message = if ($e.Exception.InnerException.Message) { $e.Exception.InnerException.Message } else { $e.Exception.Message }
-        # Reading a SACL needs SeSecurityPrivilege, which a non-administrative account does not hold, and
-        # the directory can also be unreachable. Neither means the auditing is wrong, so those are
-        # reported as unknown rather than as a misconfiguration. Only a genuine mismatch is a failure.
+        # Reaching this catch means the SACL was never READ, so it can never be evidence that auditing
+        # is misconfigured. A genuine misconfiguration is detected on the success path above, by
+        # comparing the ACEs the directory actually returned; it does not arrive as an exception.
         #
-        # Decided by the DIRECTORY error code first, because exception text is LOCALISED. On a German
-        # or Italian domain controller "access is denied" is not what comes back, so a text match
-        # stopped recognising the most common cause and the domain was reported as having auditing
-        # misconfigured - the single worst answer this tool can give, on estates that would never see
-        # it in testing.
+        # This used to classify the failure first - by directory ErrorCode, then by exception type, then
+        # by an ENGLISH text match - and only concluded "not measured" when NO error code was present at
+        # all. So an exception that DID carry a code the list did not recognise fell through to a
+        # measured failure: ERROR_DS_BUSY, a search time limit, an administrative limit or an opaque
+        # COM error each reported the domain's auditing as misconfigured, and the generated remediation
+        # then told an Enterprise Admin to rewrite SACLs on a naming context the tool had never read.
+        # Recognising more codes would only move that line; nothing recognised or unrecognised changes
+        # the fact that nothing was read, so the classification is gone rather than extended.
         #
-        # Only ErrorCode is trusted, NOT HResult. Verified: every .NET exception carries an HResult,
-        # and an ordinary PowerShell RuntimeException reports -2146233087 (0x80131501 COR_E_SYSTEM).
-        # Collecting HResult would therefore mean a code is ALWAYS found, the text fallback below
-        # would be unreachable, and any exception that happened to carry a matching value would be
-        # silently reclassified. ErrorCode is present only on DirectoryServicesCOMException and
-        # COMException, which is exactly where a meaningful directory status lives.
-        $codes = New-Object -TypeName System.Collections.ArrayList
-        $candidate = $e.Exception
-        # Bounded, because a malformed exception chain that referenced itself would spin here for ever.
-        $depth = 0
-        while ($candidate -and $depth -lt 16) {
-            $property = $candidate.PSObject.Properties['ErrorCode']
-            if ($property -and $null -ne $property.Value) { [void] $codes.Add([int] $property.Value) }
-            $candidate = $candidate.InnerException
-            $depth++
-        }
-        # -2147016656 0x80072030 ERROR_DS_NO_SUCH_OBJECT       the container is not there
-        # -2147016672 0x80072020 ERROR_DS_OPERATIONS_ERROR     the server could not process the request
-        # -2147024891 0x80070005 E_ACCESSDENIED                no SeSecurityPrivilege
-        # -2147016670 0x80072022 ERROR_DS_INSUFF_ACCESS_RIGHTS
-        # -2147016646 0x8007203A ERROR_DS_SERVER_DOWN          the directory is unreachable
-        $notMeasuredCodes = @(-2147016656, -2147016672, -2147024891, -2147016670, -2147016646)
-        $notMeasured = @($codes | Where-Object { $_ -in $notMeasuredCodes }).Count -gt 0
-        # Access-denied does not always arrive as a directory ErrorCode. Constrained Language Mode, WDAC or
-        # .NET code-access security intercepting before LDAP raises a System.UnauthorizedAccessException or
-        # System.Security.SecurityException - neither of which carries an ErrorCode property - and a DC
-        # demoted mid-scan surfaces an access-denied HRESULT with no ErrorCode either. Test-mdiIsNotRunError
-        # recognises those by exception TYPE and by numeric code, never by localised text, so they are
-        # classified as "not measured" here rather than falling through to the English text fallback and
-        # being reported as a measured auditing failure - the single worst answer this tool can give.
-        if (-not $notMeasured) { $notMeasured = Test-mdiIsNotRunError $e }
-        if (-not $notMeasured -and $codes.Count -eq 0) {
-            # No directory status or recognised exception type was available, so the message is all there
-            # is. English-only, and therefore a last resort rather than the primary test.
-            $notMeasured = $message -match 'access is denied|insufficient|privilege|server is not operational|referral|unavailable|credentials'
-        }
+        # The run still cannot be called ready - an unread check blocks the verdict - but nobody is sent
+        # to change a setting that was never seen.
+        Write-mdiVerbose ('Unable to read the SACL of {0}: {1}' -f $LdapPath, ($message -replace '[\r\n]+', ' '))
         # Measured is carried explicitly rather than inferred by the caller from the tri-state, because
         # 'N/A' has two meanings - "this role does not exist here", which is a legitimate pass, and
         # "the SACL could not be read", which is a gap. A caller that guessed from the value alone
         # could only get one of them right.
         $return = [PSCustomObject]@{
-            isAuditingOk = if ($notMeasured) { 'N/A' } else { $false }
-            Measured     = -not $notMeasured
+            isAuditingOk = 'N/A'
+            Measured     = $false
             details      = $message
         }
     } finally {
@@ -4755,7 +7886,7 @@ function Get-mdiObjectAuditing {
     )
 
     Write-mdiVerbose 'Getting MDI related DS Object auditing configuration'
-    $expectedAuditing = $settings.ObjectAuditing | ConvertFrom-Csv | Select-Object SecurityIdentifier, AccessMask, AuditFlagsValue, InheritedObjectAceType
+    $expectedAuditing = $settings.ObjectAuditing | ConvertFrom-Csv | Select-Object SecurityIdentifier, AccessMask, AuditFlagsValue, AceFlagsValue, InheritedObjectAceType
 
     # The delegated Managed Service Account entry only applies where that class exists in the schema.
     #
@@ -4771,7 +7902,7 @@ function Get-mdiObjectAuditing {
         $rootDse = [adsi]('LDAP://{0}/ROOTDSE' -f $Domain)
         $schemaNc = [string] $rootDse.schemaNamingContext.Value
         if (-not [string]::IsNullOrWhiteSpace($schemaNc)) {
-            $dmsaPresent = [System.DirectoryServices.DirectoryEntry]::Exists(
+            $dmsaPresent = [DirectoryServices.DirectoryEntry]::Exists(
                 ('LDAP://{0}/CN=ms-DS-Delegated-Managed-Service-Account,{1}' -f $Domain, $schemaNc))
         }
     } catch {
@@ -4809,14 +7940,24 @@ function Get-mdiObjectAuditing {
     # match count of N, which satisfied "N expected entries" while N-1 expected entries had zero
     # coverage - a false green where Groups, Computers and service accounts had no auditing at all. It
     # also produced a false red where two valid ACEs both matched a single expected entry (2 -ne 1).
+    #
+    # The audit flags are a REQUIRED-BITS SUBSET test, not an equality. Every expected row here asks for
+    # Success (1). A domain that audits Success AND Failure (3) is auditing strictly more than MDI needs
+    # and still emits every event it reads, but an equality test called that domain misconfigured and the
+    # remediation script then told an Enterprise Admin to rewrite the SACL on the domain root. Auditing
+    # nothing (0) and Failure only (2) still fail, because neither carries the required bit. The access
+    # mask beside it has always been a subset test (HasFlag); the flags were the odd one out.
+    #
+    # AceFlagsValue is compared too, and it was not compared at all until now. Every row here audits
+    # DESCENDANT objects - users, groups, computers, service accounts - which only happens when the ACE
+    # on the domain root carries ContainerInherit (2). An ACE without it audits the domain root object
+    # itself and nothing beneath it, so MDI sees none of the activity these entries exist to capture -
+    # and the check reported the domain as correctly configured. That is the worst answer this tool can
+    # give: the customer believes MDI can detect attacks on user and group objects when it cannot.
+    # Subset again, never equality, because a real ACE also carries SuccessfulAccess (64) and, when it
+    # was inherited from above, Inherited (16) - an equality test would false-red on both.
     $isAuditingOk = @($expectedAuditing | Where-Object {
-            $exp = $_
-            @($appliedAuditing | Where-Object {
-                    ($exp.SecurityIdentifier -eq $_.SecurityIdentifier) -and
-                    ($exp.AuditFlagsValue -eq $_.AuditFlagsValue) -and
-                    ($exp.InheritedObjectAceType -eq $_.InheritedObjectAceType) -and
-                    (([System.DirectoryServices.ActiveDirectoryRights]$_.AccessMask).HasFlag(
-                        ([System.DirectoryServices.ActiveDirectoryRights]($exp.AccessMask)))) }).Count -gt 0
+            Test-mdiAuditAceSatisfied -Expected $_ -Applied $appliedAuditing
         }).Count -eq @($expectedAuditing).Count
 
     $return = @{
@@ -4853,7 +7994,7 @@ function Get-mdiExchangeAuditing {
         }
     }
     $exchangePath = 'LDAP://{0}/CN=Microsoft Exchange,CN=Services,{1}' -f $Domain, $configurationNc
-    if ([System.DirectoryServices.DirectoryEntry]::Exists($exchangePath)) {
+    if ([DirectoryServices.DirectoryEntry]::Exists($exchangePath)) {
 
         $ldapPath = 'LDAP://{0}/{1}' -f $Domain, $configurationNc
 
@@ -4877,14 +8018,16 @@ function Get-mdiExchangeAuditing {
         $appliedAuditing = $result.details
         # Iterate the EXPECTED entries so duplicate ACEs cannot inflate the match count (false green) and
         # two ACEs matching one expected entry cannot fail the equality (false red). See Get-mdiObjectAuditing.
+        #
+        # AceFlagsValue is part of the expected row (194 = ContainerInherit + Success + Failure) and was
+        # not being compared at all, so an ACE of 192 - the same without ContainerInherit - passed. That
+        # entry audits the configuration container itself and nothing beneath it, and the objects the
+        # sensor watches are the descendants, so the audit MDI depends on was absent while the check
+        # reported it configured. Both flag comparisons are REQUIRED-BITS SUBSET tests: an ACE inherited
+        # from a parent also carries Inherited (16), giving 210, and an equality test would reject a
+        # perfectly valid inherited entry.
         $isAuditingOk = @($expectedAuditing | Where-Object {
-                $exp = $_
-                @($appliedAuditing | Where-Object {
-                        ($exp.SecurityIdentifier -eq $_.SecurityIdentifier) -and
-                        ($exp.AuditFlagsValue -eq $_.AuditFlagsValue) -and
-                        ($exp.InheritedObjectAceType -eq $_.InheritedObjectAceType) -and
-                        (([System.DirectoryServices.ActiveDirectoryRights]$_.AccessMask).HasFlag(
-                            ([System.DirectoryServices.ActiveDirectoryRights]($exp.AccessMask)))) }).Count -gt 0
+                Test-mdiAuditAceSatisfied -Expected $_ -Applied $appliedAuditing
             }).Count -eq @($expectedAuditing).Count
         $return = @{
             isExchangeAuditingOk = $isAuditingOk
@@ -4932,7 +8075,7 @@ function Get-mdiAdfsAuditing {
     # ever, over a role the environment simply does not have. "There is no AD FS here" is an ANSWER.
     $containerPresent = $false
     try {
-        $containerPresent = [System.DirectoryServices.DirectoryEntry]::Exists($ldapPath)
+        $containerPresent = [DirectoryServices.DirectoryEntry]::Exists($ldapPath)
     } catch {
         # An error deciding EXISTENCE is itself a failure to measure: it is not evidence of absence.
         return @{
@@ -4969,15 +8112,12 @@ function Get-mdiAdfsAuditing {
     } else {
         $appliedAuditing = $result.details
         # Iterate the EXPECTED entries so duplicate ACEs cannot inflate the match count (false green) and
-        # two ACEs matching one expected entry cannot fail the equality (false red). See Get-mdiObjectAuditing.
+        # two ACEs matching one expected entry cannot fail the equality (false red). AceFlagsValue is
+        # compared as a required-bits subset for the same reason as the Exchange check: without it an
+        # entry missing ContainerInherit audited the container and nothing beneath it, and an equality
+        # test would reject an inherited entry, which carries an extra Inherited bit.
         $isAuditingOk = @($expectedAuditing | Where-Object {
-                $exp = $_
-                @($appliedAuditing | Where-Object {
-                        ($exp.SecurityIdentifier -eq $_.SecurityIdentifier) -and
-                        ($exp.AuditFlagsValue -eq $_.AuditFlagsValue) -and
-                        ($exp.InheritedObjectAceType -eq $_.InheritedObjectAceType) -and
-                        (([System.DirectoryServices.ActiveDirectoryRights]$_.AccessMask).HasFlag(
-                            ([System.DirectoryServices.ActiveDirectoryRights]($exp.AccessMask)))) }).Count -gt 0
+                Test-mdiAuditAceSatisfied -Expected $_ -Applied $appliedAuditing
             }).Count -eq @($expectedAuditing).Count
         $return = @{
             isAdfsAuditingOk = $isAuditingOk
@@ -4986,6 +8126,188 @@ function Get-mdiAdfsAuditing {
         }
     }
     $return
+}
+
+function Test-mdiAuditAceSatisfied {
+    <#
+        Whether a set of audit ACEs read from a directory object satisfies one expected audit entry.
+
+        Every term is a REQUIRED-BITS SUBSET test, never an equality, because a real-world ACE is
+        routinely broader than the minimum MDI needs and being broader is not a defect:
+          - AuditFlagsValue: an entry auditing Success+Failure (3) satisfies an expected Success (1).
+          - AceFlagsValue:   a real ACE also carries SuccessfulAccess (64) and, when inherited from a
+                             parent, Inherited (16) - so the expected ContainerInherit (2) arrives as
+                             194 or 210. An equality test rejected every inherited entry.
+          - AccessMask:      HasFlag, same reasoning.
+
+        InheritedObjectAceType was the one term left as an equality, and it produced a FALSE RED on a
+        configuration that is not merely valid but STRICTER than the one expected. The expected rows
+        each name one object class (audit descendant USER objects, descendant GROUP objects, ...). An
+        administrator who audits ALL descendant objects writes a single ACE with no object-type
+        restriction at all, so InheritedObjectAceType is empty - and empty means "every class", which
+        necessarily includes the class being looked for. The equality test rejected it, all five rows
+        failed, and the remediation script then told an Enterprise Admin to rewrite the SACL on the
+        domain root of a domain that was auditing MORE than was asked of it.
+
+        An applied ACE that names a DIFFERENT class is still rejected: auditing groups says nothing
+        about users. So the rule is: the applied entry matches when it restricts to the same class, or
+        when it restricts to no class at all. An all-zero GUID is treated as empty - both spellings of
+        "unrestricted" appear depending on which API produced the record.
+
+        TWO exceptions to "broader is fine", both proven by probe:
+
+        1. NoPropagateInherit and InheritOnly are extra bits that make an ACE NARROWER, not broader.
+           Treating them as supersets accepted a SACL that does not deliver the required subtree
+           coverage and reported it as configured - a false green.
+
+        2. The match is decided over the SET of qualifying ACEs, not one ACE at a time. Success and
+           Failure are commonly written as two separate ACEs, and testing each alone failed a
+           correctly configured domain. The access mask is unioned SEPARATELY FOR EACH required audit
+           flag, so evidence for Success cannot be borrowed to satisfy Failure.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)] [AllowNull()] $Expected,
+        [Parameter(Mandatory = $true)] [AllowNull()] $Applied
+    )
+
+    $emptyGuid = '00000000-0000-0000-0000-000000000000'
+    $wantedClass = [string] $Expected.InheritedObjectAceType
+
+    # NoPropagateInherit (0x04) and InheritOnly (0x08) are the two ACE flags that make an entry
+    # NARROWER rather than broader, so the required-bits subset test above is the wrong test for them.
+    #
+    # Every expected row asks for ContainerInherit (the shipped rows are AceFlags 194 = ContainerInherit
+    # + SuccessfulAccess + FailedAccess), which means "audit this object and everything beneath it".
+    #   - NoPropagateInherit limits inheritance to immediate children only, so the subtree below the
+    #     first level is not audited at all.
+    #   - InheritOnly removes the object itself from the ACE, so the container is not audited - but that
+    #     only costs coverage when the expected row actually asks for the object itself.
+    # Both were accepted as harmless extra bits, and a SACL that did NOT provide the required coverage
+    # was reported as correctly configured - a false GREEN on a detection-coverage check, which is the
+    # most expensive answer this tool can give.
+    #
+    # InheritOnly is therefore judged against the row's SCOPE, not applied blindly. A row restricted to a
+    # descendant CLASS - which is every ObjectAuditing row, each naming user, group, computer, MSA, gMSA
+    # or dMSA - can never cover the object the SACL sits on, because the domain root is a domainDNS
+    # object and not an instance of any of those classes. Windows writes precisely that shape: choosing
+    # "Applies to: Descendant User objects" on the Auditing tab produces ContainerInherit + InheritOnly,
+    # raw AceFlags 74, and dsacls reports it back the same way. Measured: with 0x08 treated as narrowing
+    # unconditionally, 0 of the 6 shipped rows could be satisfied by the very ACEs the documented
+    # procedure creates, so a correctly configured domain was told "object auditing is not configured"
+    # and handed remediation advice to rewrite a domain-root SACL that was already right. The
+    # unrestricted rows (Exchange, AD FS) DO cover their own object, so 0x08 stays narrowing for them.
+    #
+    # Tested against the EXPECTED row rather than against zero, so a future expected row that
+    # deliberately asks for one of these bits still matches an applied ACE carrying it.
+    $expectedRestrictsClass = -not ([string]::IsNullOrWhiteSpace($wantedClass) -or $wantedClass -eq $emptyGuid)
+    $narrowingFlags = if ($expectedRestrictsClass) { 0x04 } else { 0x04 -bor 0x08 }
+    $expectedNarrowing = ([int] $Expected.AceFlagsValue) -band $narrowingFlags
+
+    # SuccessfulAccess (0x40) and FailedAccess (0x80) are the ACE-HEADER spelling of the audit TYPE,
+    # and they are deliberately excluded from the structural gate below.
+    #
+    # The shipped expected rows carry AceFlags 194 = ContainerInherit + SuccessfulAccess + FailedAccess,
+    # so requiring all of those bits on a single applied ACE demanded that ONE entry audit both success
+    # and failure. Windows does not write it that way: adding a Success entry and a Failure entry on the
+    # Auditing tab produces TWO ACEs, one with AceFlags 66 and one with 130, and dsacls reports them
+    # back the same way. Neither carries both bits, so neither passed this gate - and because the gate
+    # runs FIRST, the per-audit-flag union below never saw them at all. Measured: the combined form
+    # satisfied the row, the identical coverage split across two ACEs did not.
+    #
+    # The effect was a false red on a correctly configured domain - "object auditing is not configured",
+    # a failed verdict, and remediation advice to rewrite a SACL on the domain root that was already
+    # right. Excluding these two bits here does not weaken anything: which audit types are actually
+    # delivered is still proven per required flag from AuditFlagsValue further down, where an ACE set
+    # that provides Success but not Failure still fails.
+    $auditTypeFlags = 0x40 -bor 0x80
+    $expectedStructuralAceFlags = ([int] $Expected.AceFlagsValue) -band (-bnot $auditTypeFlags)
+
+    # Identity, scope and inheritance decide whether an ACE is EVIDENCE for this expected row. What it
+    # actually audits is unioned afterwards, because a SACL may legitimately spread one requirement
+    # across several ACEs.
+    $qualifying = @($Applied | Where-Object {
+            $appliedClass = [string] $_.InheritedObjectAceType
+            $appliedCoversEveryClass = ([string]::IsNullOrWhiteSpace($appliedClass) -or $appliedClass -eq $emptyGuid)
+
+            # An ACE restricted to a single property or property set does not satisfy a requirement
+            # for unrestricted auditing.
+            #
+            # ObjectAceType names the property, property SET, or extended right the ACE applies to;
+            # when it is set, the ACE audits ONLY that. It was never examined, so a single audit ACE
+            # scoped to Personal-Information - or to one attribute such as userPrincipalName -
+            # satisfied every object-auditing row, and the report stated directory object auditing was
+            # configured while almost nothing Defender for Identity needs was actually being audited.
+            #
+            # That is the most expensive shape of wrong answer this tool produces: the customer
+            # believes they have detection coverage they do not have, and no other part of the report
+            # contradicts it. The ObjectAceFlags bit is tested as well as the GUID because a zeroed
+            # GUID with the flag clear means "no restriction", which is exactly what is required.
+            $appliedObjectAce = [string] $_.ObjectAceType
+            # Read directly rather than through PSObject.Properties[...]: an applied ACE may arrive as
+            # a PSCustomObject, a hashtable, or a real System.DirectoryServices ACE, and indexing the
+            # property collection by name throws "Cannot index into a null array" on some of those.
+            # An absent flag is simply $null here, which is the same answer as "no restriction".
+            $objectAceFlagsRaw = $_.ObjectAceFlags
+            $objectAceTypePresent = $false
+            if ($null -ne $objectAceFlagsRaw) {
+                $flagsNumber = 0
+                if ([int]::TryParse(([string] $objectAceFlagsRaw), [ref] $flagsNumber)) {
+                    $objectAceTypePresent = (($flagsNumber -band 1) -eq 1)
+                } else {
+                    # The enum spells the bit as ObjectAceTypePresent.
+                    $objectAceTypePresent = (([string] $objectAceFlagsRaw) -match 'ObjectAceTypePresent')
+                }
+            }
+            # A GUID on its own is enough to treat the ACE as restricted even when the flags could not
+            # be read: erring towards "this ACE is narrower than required" keeps an unverifiable SACL
+            # out of the configured column, which is the safe direction for a detection-coverage check.
+            $appliedCoversEveryProperty = -not (
+                (-not [string]::IsNullOrWhiteSpace($appliedObjectAce)) -and $appliedObjectAce -ne $emptyGuid -and
+                ($objectAceTypePresent -or $null -eq $objectAceFlagsRaw))
+
+            $appliedNarrowing = ([int] $_.AceFlagsValue) -band $narrowingFlags
+
+            ($Expected.SecurityIdentifier -eq $_.SecurityIdentifier) -and
+            ((([int] $_.AceFlagsValue) -band $expectedStructuralAceFlags) -eq $expectedStructuralAceFlags) -and
+            (($appliedNarrowing -band (-bnot $expectedNarrowing)) -eq 0) -and
+            ($appliedCoversEveryClass -or [string]::Equals($appliedClass, $wantedClass, [StringComparison]::OrdinalIgnoreCase)) -and
+            $appliedCoversEveryProperty })
+
+    if ($qualifying.Count -eq 0) { return $false }
+
+    # Success and Failure are routinely written as two separate ACEs - it is what the Windows
+    # "Auditing" tab produces when an administrator adds a Success entry and a Failure entry, and what
+    # dsacls reports back. Testing each ACE ALONE meant neither half satisfied an expected
+    # Success+Failure row, so a correctly configured domain was reported as "Exchange auditing is not
+    # configured", failed the verdict, and was handed remediation advice to rewrite a SACL that was
+    # already right.
+    #
+    # Unioned PER AUDIT FLAG, not across all of them at once. A flat union would credit Success from
+    # one ACE and Failure from another and then apply the combined access mask to both, so an ACE
+    # auditing mask 32 on Success plus an ACE auditing mask 16 on Failure would satisfy a requirement
+    # for mask 32 on BOTH - which the SACL does not do. Each required flag has to stand on its own
+    # evidence.
+    [int] $expectedMask = [int] $Expected.AccessMask
+    [int] $expectedAudit = [int] $Expected.AuditFlagsValue
+
+    $requiredAuditBits = @(for ($bit = 1; $bit -le 0x80; $bit = $bit -shl 1) {
+            if (($expectedAudit -band $bit) -eq $bit) { $bit }
+        })
+    # An expected row asking for no audit flag at all still has to be matched on its access mask.
+    if ($requiredAuditBits.Count -eq 0) { $requiredAuditBits = @(0) }
+
+    foreach ($auditBit in $requiredAuditBits) {
+        $unionMask = 0
+        foreach ($ace in $qualifying) {
+            if ($auditBit -eq 0 -or ((([int] $ace.AuditFlagsValue) -band $auditBit) -eq $auditBit)) {
+                $unionMask = $unionMask -bor ([int] $ace.AccessMask)
+            }
+        }
+        if (($unionMask -band $expectedMask) -ne $expectedMask) { return $false }
+    }
+
+    $true
 }
 
 function Get-DomainSchemaVersion {
@@ -5003,6 +8325,11 @@ function Get-DomainSchemaVersion {
         69 = 'Windows Server 2012 R2'
         87 = 'Windows Server 2016'
         88 = 'Windows Server 2019 / 2022'
+        # 90 ships with the Windows Server 2025 preview builds and is what a domain prepared before
+        # RTM reports. Without an entry the version rendered blank, which is indistinguishable from
+        # "could not be read" - and the DMSA check at the top of this script already treats >= 90 as
+        # 2025, so the two halves of the script disagreed about the same number.
+        90 = 'Windows Server 2025'
         91 = 'Windows Server 2025'
     }
 
@@ -5025,7 +8352,7 @@ function Get-DomainSchemaVersion {
         $value = $schema.Properties['objectVersion'].Value
         if ($null -ne $value) { $schemaVersion = [int] $value }
     } catch {
-        Write-Warning ('Unable to read the Active Directory schema version of {0}: {1}' -f $Domain, ($_.Exception.Message -replace '[\r\n]+', ' '))
+        Write-mdiWarning ('Unable to read the Active Directory schema version of {0}: {1}' -f $Domain, ($_.Exception.Message -replace '[\r\n]+', ' '))
     } finally {
         # Guarded for the same reason as Get-mdiDsSacl: disposing a lazily bound DirectoryEntry can
         # throw, and a throw inside a finally would discard the whole run at this point.
@@ -5099,18 +8426,24 @@ function Get-mdiDomainControllerReadiness {
     if ([string]::IsNullOrEmpty($DomainController)) {
         Write-mdiVerbose "Searching for Domain Controllers in $Domain"
         $resolved = Resolve-mdiDomainController -Domain $Domain
+        # Records the directory returned but could not name. They are part of the estate and they were
+        # NOT examined, so they are carried into the report as unmeasured population rather than left
+        # as a console warning nobody reads back. Kept out of $DomainController, which is a list of
+        # names to connect to and there is no name to connect to.
+        $unnamedDc = [int] $resolved.Unnamed
         if ($resolved.Servers.Count -eq 0) {
             # A discovery failure is fatal to the whole report: every later check runs per server, so an
             # empty list silently produces a clean-looking report of nothing. It is raised rather than
             # swallowed so the run cannot be mistaken for a completed scan.
-            Write-Warning ('Unable to enumerate the domain controllers of {0} over Active Directory Web Services or LDAP: {1}' -f $Domain, $resolved.Error)
-            Write-Warning 'No domain controller was checked. Verify that this computer can reach a domain controller and that the account running the script is allowed to read the directory.'
+            Write-mdiWarning ('Unable to enumerate the domain controllers of {0} over Active Directory Web Services or LDAP: {1}' -f $Domain, $resolved.Error)
+            Write-mdiWarning 'No domain controller was checked. Verify that this computer can reach a domain controller and that the account running the script is allowed to read the directory.'
             $DomainController = $null
         } else {
             $DomainController = @($resolved.Servers | Select-Object -ExpandProperty Name)
         }
     } else {
         Write-mdiVerbose "Using the provided list of Domain Controller(s)"
+        $unnamedDc = 0
     }
     $dcs = @($DomainController | ForEach-Object {
             $dcName = [string] $_
@@ -5286,19 +8619,40 @@ function Get-mdiDomainControllerReadiness {
                     $dc.Add('Comment', ('Testing stopped early: {0}' -f $_.Exception.Message))
                 }
                 $dc['PartialFailure'] = $true
-                Write-Warning ('Could not finish testing {0}: {1}' -f $dc.FQDN, $_.Exception.Message)
+                Write-mdiWarning ('Could not finish testing {0}: {1}' -f $dc.FQDN, $_.Exception.Message)
             }
 
         } else {
             $dc.Add('Comment', ('Server is not available: {0}' -f $reach.Method))
             $dc['Unreachable'] = $true
-            Write-Warning ('{0} is not available ({1}). If ICMP is blocked by policy, the fallbacks over TCP 135 and WMI also failed, so the server genuinely cannot be tested from here.' -f $dc.FQDN, $reach.Method)
+            Write-mdiWarning ('{0} is not available ({1}). If ICMP is blocked by policy, the fallbacks over TCP 135 and WMI also failed, so the server genuinely cannot be tested from here.' -f $dc.FQDN, $reach.Method)
         }
 
         if (-not $dc.Contains('PartialFailure')) { $dc.Add('PartialFailure', $false) }
         if (-not $dc.Contains('Unreachable')) { $dc.Add('Unreachable', $false) }
         $dc.Add('Details', $details)
         [PSCustomObject]$dc
+    }
+
+    # One row per domain controller record the directory returned but could not name. Without these
+    # the loss was invisible in the report and the score improved for it: a four-record domain with two
+    # nameless records rendered exactly like a two-DC domain, 4/6 = 66%, against the 4/8 = 50% the same
+    # estate scores when all four are merely unreachable. The rows carry the placeholder marker so they
+    # charge an unread check without being counted as machines - the same contract the AD CS and Entra
+    # Connect discovery placeholders use.
+    for ($i = 1; $i -le $unnamedDc; $i++) {
+        [PSCustomObject]@{
+            FQDN           = 'Domain controller (not named) {0} of {1} - {2}' -f $i, $unnamedDc, $Domain
+            Domain         = $Domain
+            SensorHealth   = 'N/A'
+            Comment        = ('A domain controller record in this domain carries neither a DNS host name nor a name, so it could not be ' +
+                'contacted and was NOT checked. {0} of the domain controller records returned by the directory are affected. Repair the ' +
+                'dNSHostName attribute on the affected computer object, or pass -DomainController <name> to check it explicitly.') -f $unnamedDc
+            Unreachable    = $false
+            PartialFailure = $false
+            IsPlaceholder  = $true
+            Details        = [ordered]@{}
+        }
     }
 }
 
@@ -5311,6 +8665,11 @@ function Get-mdiCAReadiness {
         [Parameter(Mandatory = $false)] [switch] $TestSensorV3Readiness
     )
 
+    # Set when the certification-authority discovery query itself fails - a permission denial, an LDAP
+    # error, an unreachable domain. Distinct from "this domain has no certification authorities":
+    # both produce an empty list, but only one of them means the domain was actually checked.
+    $caNotMeasured = $false
+
     if ([string]::IsNullOrEmpty($CAServer)) {
         Write-mdiVerbose "Searching for CA servers in $Domain"
         try {
@@ -5320,11 +8679,14 @@ function Get-mdiCAReadiness {
             $CertPublishersSID = $((Get-ADDomain -Server $Domain).DomainSID.Value + "-517")
             $CAServer = Get-ADGroupMember -Server $Domain -Identity $CertPublishersSID -ErrorAction Stop | Where-Object { $_.objectClass -eq 'computer' }
         } catch {
-            # Warned, not swallowed. A permission or LDAP failure here produced exactly the same
-            # empty result as "this domain has no certification authorities", so a forest could be
-            # reported ready over AD CS servers that were never even enumerated. The domain
-            # controller discovery has always warned; these two were silently different.
-            Write-Warning ('Unable to enumerate the certification authorities of {0}: {1}. AD CS servers in this domain were NOT checked.' -f $Domain, $_.Exception.Message)
+            # Warned AND recorded. Warning alone was not enough: a permission or LDAP failure here
+            # produced exactly the same empty result as "this domain has no certification
+            # authorities", the report rendered the reassuring "No CA servers found", and the run
+            # was still scored READY - so a forest could be reported ready over AD CS servers that
+            # were never even enumerated. The warning scrolls past; the report is what is kept.
+            $caNotMeasured = $true
+            $caDiscoveryError = [string] $_.Exception.Message
+            Write-mdiWarning ('Unable to enumerate the certification authorities of {0}: {1}. AD CS servers in this domain were NOT checked.' -f $Domain, $caDiscoveryError)
             $CAServer = $null
         }
     } else {
@@ -5446,19 +8808,41 @@ function Get-mdiCAReadiness {
                     $ca.Add('Comment', ('Testing stopped early: {0}' -f $_.Exception.Message))
                 }
                 $ca['PartialFailure'] = $true
-                Write-Warning ('Could not finish testing {0}: {1}' -f $ca.FQDN, $_.Exception.Message)
+                Write-mdiWarning ('Could not finish testing {0}: {1}' -f $ca.FQDN, $_.Exception.Message)
             }
 
         } else {
             $ca.Add('Comment', ('Server is not available: {0}' -f $reach.Method))
             $ca['Unreachable'] = $true
-            Write-Warning ('{0} is not available ({1}). If ICMP is blocked by policy, the fallbacks over TCP 135 and WMI also failed, so the server genuinely cannot be tested from here.' -f $ca.FQDN, $reach.Method)
+            Write-mdiWarning ('{0} is not available ({1}). If ICMP is blocked by policy, the fallbacks over TCP 135 and WMI also failed, so the server genuinely cannot be tested from here.' -f $ca.FQDN, $reach.Method)
         }
 
         if (-not $ca.Contains('PartialFailure')) { $ca.Add('PartialFailure', $false) }
         if (-not $ca.Contains('Unreachable')) { $ca.Add('Unreachable', $false) }
         $ca.Add('Details', $details)
         [PSCustomObject]$ca
+    }
+
+    # Discovery failed, so nothing was enumerated and nothing was scanned. Emit a placeholder row
+    # marking the role not-measured ('N/A') for the same reason the Entra Connect path does: an empty
+    # section renders as "No CA servers found", which reads as "there is nothing to check here" - and
+    # for a domain that DOES run AD CS that is a false green in the headline verdict. The 'N/A' marker
+    # is counted as an unread check by the scoring, so the run is reported as not-verified rather than
+    # ready. A domain whose discovery SUCCEEDED and genuinely has no CA never sets this flag and stays
+    # silent, so readiness is unaffected for the common case.
+    if ($caNotMeasured) {
+        [PSCustomObject]@{
+            FQDN           = 'AD CS (not enumerated) - {0}' -f $Domain
+            Domain         = $Domain
+            SensorHealth   = 'N/A'
+            Comment        = 'The certification authorities of this domain could not be enumerated ({0}), so AD CS was NOT checked here. Re-run with sufficient directory read rights, or pass -CAServer <name> to check a known CA.' -f $caDiscoveryError
+            Unreachable    = $false
+            PartialFailure = $false
+            # Not a machine. Without this the row was counted in the server-count KPIs and a
+            # one-server estate reported "across 2 server(s)", "Servers fully ready 1/2".
+            IsPlaceholder  = $true
+            Details        = [ordered]@{}
+        }
     }
 }
 
@@ -5476,6 +8860,11 @@ function Get-mdiEntraConnectReadiness {
     # which must be surfaced as not-measured ('N/A') rather than reported as an empty section that reads
     # like "there is nothing here to check".
     $entraConnectNotMeasured = $false
+    # Sync accounts whose server name could not be READ. Kept as a list object and mutated with .Add
+    # rather than reassigned with +=: the collection below runs in a ForEach-Object script block, and
+    # `$array += x` there binds a NEW local variable in the child scope, so every entry is silently
+    # discarded the moment the block exits.
+    $unreadableSyncAccount = New-Object -TypeName System.Collections.ArrayList
 
     if ([string]::IsNullOrEmpty($EntraConnectServer)) {
         Write-mdiVerbose "Searching for Entra Connect servers in $Domain"
@@ -5520,11 +8909,37 @@ function Get-mdiEntraConnectReadiness {
                         if ($m.Success) { $candidate = $m.Groups[1].Value; break }
                     }
                     if (-not $candidate) {
-                        Write-mdiVerbose ('Could not read the Entra Connect server name from the account description: {0}' -f ($desc -replace '[\r\n]+', ' '))
+                        # A WARNING, not verbose. This is one of the two ways a named Entra Connect
+                        # server silently disappears: the sync account exists, its description does
+                        # not parse, and the server is simply never assessed. Both the not-measured
+                        # flag and the placeholder row below gate on TOTAL loss, so a PARTIAL loss -
+                        # two accounts, one resolvable - fell through both. Measured: the HTML and the
+                        # JSON were byte-for-byte identical between "one Entra Connect server exists"
+                        # and "two named, one never assessed". No row, no issue, no unread charge, no
+                        # verdict change, and the only trace discarded by the default
+                        # $VerbosePreference. The operator is told nothing at all.
+                        #
+                        # It is ALSO charged, and this is the half of the pair where charging is
+                        # right. Nothing here is evidence the server is gone: the account is present,
+                        # its description is present, and only this parser's ability to read a name
+                        # out of it has failed - the documented cause being a non-English directory,
+                        # where the description reads "auf Computer AADC01 konfiguriert". A server
+                        # that exists and was not looked at is the definition of unmeasured, and the
+                        # warning alone let the score RISE for losing it (77% became 87%).
+                        #
+                        # The sibling case below - the description parsed but the computer it names is
+                        # absent from the directory - is deliberately NOT charged: there the directory
+                        # positively answered "no such computer", which is usually a stale sync account
+                        # for a decommissioned host, and charging it would fabricate a permanently
+                        # unclearable failure. Absence of evidence and evidence of absence, kept apart.
+                        Write-mdiWarning ('A directory-synchronization account in {0} names an Entra Connect server that could not be read from its description, so that server was NOT verified. Re-run with -EntraConnectServer <name> to check it. Description: {1}' -f $Domain, ($desc -replace '[\r\n]+', ' '))
+                        [void] $unreadableSyncAccount.Add(([string] $_.sAMAccountName))
                         return
                     }
                     try { (Get-ADComputer -Identity $candidate -Server $Domain -ErrorAction Stop).distinguishedName } catch {
-                        Write-mdiVerbose ('The Entra Connect server {0} named in an account description does not resolve in {1}' -f $candidate, $Domain)
+                        # The second silent path, and the same reasoning as above: named in the
+                        # directory, absent from the report.
+                        Write-mdiWarning ('The Entra Connect server {0} named in a directory-synchronization account does not resolve in {1}, so it was NOT verified. Re-run with -EntraConnectServer <name> if it is still deployed.' -f $candidate, $Domain)
                     }
                 })
 
@@ -5533,10 +8948,15 @@ function Get-mdiEntraConnectReadiness {
             # (present but not verified) instead of omitting it as if the domain had none.
             if ($candidateCount -gt 0 -and @($EntraConnectServer | Where-Object { $_ }).Count -eq 0) {
                 $entraConnectNotMeasured = $true
-                Write-Warning ('Found {0} directory-synchronization account(s) in {1} (Entra Connect appears to be deployed) but could not identify the sync server automatically - this can happen when the account description is in a non-English locale. Entra Connect was NOT verified; re-run with -EntraConnectServer <name> to check it.' -f $candidateCount, $Domain)
+                Write-mdiWarning ('Found {0} directory-synchronization account(s) in {1} (Entra Connect appears to be deployed) but could not identify the sync server automatically - this can happen when the account description is in a non-English locale. Entra Connect was NOT verified; re-run with -EntraConnectServer <name> to check it.' -f $candidateCount, $Domain)
             }
         } catch {
-            Write-Warning ('Unable to enumerate the Entra Connect servers of {0}: {1}. Entra Connect servers in this domain were NOT checked.' -f $Domain, $_.Exception.Message)
+            # Recorded as well as warned, exactly as the CA discovery above. An enumeration failure
+            # and "this domain runs no Entra Connect" both produce an empty list, and only the second
+            # of them means the domain was checked.
+            $entraConnectNotMeasured = $true
+            $entraDiscoveryError = [string] $_.Exception.Message
+            Write-mdiWarning ('Unable to enumerate the Entra Connect servers of {0}: {1}. Entra Connect servers in this domain were NOT checked.' -f $Domain, $entraDiscoveryError)
             $EntraConnectServer = $null
         }
     } else {
@@ -5640,13 +9060,13 @@ function Get-mdiEntraConnectReadiness {
                     $ec.Add('Comment', ('Testing stopped early: {0}' -f $_.Exception.Message))
                 }
                 $ec['PartialFailure'] = $true
-                Write-Warning ('Could not finish testing {0}: {1}' -f $ec.FQDN, $_.Exception.Message)
+                Write-mdiWarning ('Could not finish testing {0}: {1}' -f $ec.FQDN, $_.Exception.Message)
             }
 
         } else {
             $ec.Add('Comment', ('Server is not available: {0}' -f $reach.Method))
             $ec['Unreachable'] = $true
-            Write-Warning ('{0} is not available ({1}). If ICMP is blocked by policy, the fallbacks over TCP 135 and WMI also failed, so the server genuinely cannot be tested from here.' -f $ec.FQDN, $reach.Method)
+            Write-mdiWarning ('{0} is not available ({1}). If ICMP is blocked by policy, the fallbacks over TCP 135 and WMI also failed, so the server genuinely cannot be tested from here.' -f $ec.FQDN, $reach.Method)
         }
 
         if (-not $ec.Contains('PartialFailure')) { $ec.Add('PartialFailure', $false) }
@@ -5661,15 +9081,70 @@ function Get-mdiEntraConnectReadiness {
     # that DOES run Entra Connect is a false green. The 'N/A' marker is counted as an unread check by the
     # scoring, so the run is reported as not-verified rather than ready. A domain that genuinely has no
     # Entra Connect never sets this flag and stays silent (no row, no warning), so readiness is unaffected.
-    if ($entraConnectNotMeasured -and $ecs.Count -eq 0) {
+    # The third clause is what stops this branch swallowing the per-account path below. It fires
+    # only when NOTHING resolved, and it emits ONE row for the whole domain - so an estate that lost
+    # EVERY sync account was charged a single unread check, while an estate that lost all but one was
+    # charged one PER lost account by the elseif underneath. Losing MORE therefore scored HIGHER:
+    # measured at 3 accounts, 2-of-3 lost scored 81% and 3-of-3 lost scored 92%.
+    #
+    # That is precisely the failure the elseif below already documents - "Discovering less of the
+    # estate must never improve the headline" - fixed there for the partial case and missed here for
+    # the total one. When the accounts ARE known but unreadable, the per-account branch owns them,
+    # and the score falls monotonically as more is lost (92 -> 86 -> 81 -> 72), with a 3-of-3 total
+    # loss now costing exactly what three unverified servers cost by any other route.
+    #
+    # The two total-loss shapes that have no accounts to name still belong here and are unchanged:
+    # a directory enumeration that FAILED (no accounts were read at all), and accounts that were
+    # read and parsed cleanly but name computers that no longer exist - which is a decommissioned
+    # host, deliberately not charged.
+    if ($entraConnectNotMeasured -and $ecs.Count -eq 0 -and $unreadableSyncAccount.Count -eq 0) {
+        # Two different causes reach here and the operator needs to be told which one: the sync
+        # account was found but the server name could not be parsed out of it, or the directory
+        # query itself failed. The remedy differs - supply the name, versus fix the permissions.
+        $entraComment = if ($entraDiscoveryError) {
+            'The Entra Connect servers of this domain could not be enumerated ({0}), so Entra Connect was NOT checked here. Re-run with sufficient directory read rights, or pass -EntraConnectServer <name>.' -f $entraDiscoveryError
+        } else {
+            'A directory-synchronization (Entra Connect) account was found in this domain but the sync server could not be identified automatically. Re-run with -EntraConnectServer <name> to verify it.'
+        }
+        $entraFqdn = if ($entraDiscoveryError) {
+            'Entra Connect (not enumerated) - {0}' -f $Domain
+        } else {
+            'Entra Connect (not identified) - {0}' -f $Domain
+        }
         [PSCustomObject]@{
-            FQDN           = 'Entra Connect (not identified) - {0}' -f $Domain
+            FQDN           = $entraFqdn
             Domain         = $Domain
             SensorHealth   = 'N/A'
-            Comment        = 'A directory-synchronization (Entra Connect) account was found in this domain but the sync server could not be identified automatically. Re-run with -EntraConnectServer <name> to verify it.'
+            Comment        = $entraComment
             Unreachable    = $false
             PartialFailure = $false
+            IsPlaceholder  = $true
             Details        = [ordered]@{}
+        }
+    } elseif ($unreadableSyncAccount.Count -gt 0) {
+        # PARTIAL loss. Some sync accounts resolved to a server and were scanned; these did not, and
+        # the block above cannot see them because it fires only when NOTHING resolved. Without a row
+        # per lost account an Entra Connect staging pair that loses one server produced a report
+        # byte-identical to a single-server deployment, and the score ROSE for the loss: the true
+        # two-server estate scores 7/9 = 77%, while the same estate with one server unread scored
+        # 7/8 = 87%. Discovering less of the estate must never improve the headline.
+        #
+        # One row per lost account rather than one row for the group, so the denominator reflects how
+        # many servers were actually missed.
+        foreach ($account in $unreadableSyncAccount) {
+            $accountLabel = if ([string]::IsNullOrWhiteSpace([string] $account)) { 'a directory-synchronization account' } else { [string] $account }
+            [PSCustomObject]@{
+                FQDN           = 'Entra Connect (not identified) {0} - {1}' -f $accountLabel, $Domain
+                Domain         = $Domain
+                SensorHealth   = 'N/A'
+                Comment        = ('The directory-synchronization account {0} names an Entra Connect server that could not be read from its ' +
+                    'description, so that server was NOT checked. This is expected when the directory is not in English. Re-run with ' +
+                    '-EntraConnectServer <name> to verify it.') -f $accountLabel
+                Unreachable    = $false
+                PartialFailure = $false
+                IsPlaceholder  = $true
+                Details        = [ordered]@{}
+            }
         }
     }
 }
@@ -5680,6 +9155,50 @@ function ConvertTo-mdiHtmlEncoded {
     $Text -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;'
 }
 
+function ConvertTo-mdiTableCellEncoded {
+    <#
+        A string encoded exactly the way ConvertTo-Html -Fragment encodes a table cell.
+
+        The per-row badges ("not reachable", "partial results") are applied by matching the generated
+        markup for a server's FQDN and substituting a richer row. That match is only correct if the
+        key is encoded the same way the markup was. ConvertTo-mdiHtmlEncoded escapes only & < > " -
+        it is written for attribute values built by hand - while ConvertTo-Html emits NUMERIC entities
+        for the apostrophe and for every non-ASCII character. So a domain controller called
+        o'brien-dc, dc-muenchen with an umlaut, or anything outside ASCII never matched its own row:
+        the class, the badge and the tooltip were all silently dropped and an unreachable server
+        rendered as an ordinary scanned one. A false green, and one that only appears in estates
+        whose naming is not plain ASCII - which is most of them outside English-speaking countries.
+
+        HttpUtility.HtmlEncode is what ConvertTo-Html uses internally; verified character by character
+        against it. The fallback reproduces the same output if System.Web cannot be loaded.
+    #>
+    param ([Parameter(Mandatory = $false)] [AllowNull()] [string] $Text)
+
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    try {
+        Add-Type -AssemblyName System.Web -ErrorAction Stop
+        return [Web.HttpUtility]::HtmlEncode($Text)
+    } catch {
+        $builder = New-Object -TypeName System.Text.StringBuilder
+        foreach ($character in $Text.ToCharArray()) {
+            switch ($character) {
+                '&' { [void] $builder.Append('&amp;') }
+                '<' { [void] $builder.Append('&lt;') }
+                '>' { [void] $builder.Append('&gt;') }
+                '"' { [void] $builder.Append('&quot;') }
+                default {
+                    if ([int] $character -gt 159 -or [int] $character -eq 39) {
+                        [void] $builder.Append('&#').Append([int] $character).Append(';')
+                    } else {
+                        [void] $builder.Append($character)
+                    }
+                }
+            }
+        }
+        return $builder.ToString()
+    }
+}
+
 function ConvertTo-mdiFriendlyName {
     param ([Parameter(Mandatory = $false)] [AllowNull()] [string] $Name)
     if ([string]::IsNullOrEmpty($Name)) { return '' }
@@ -5687,7 +9206,7 @@ function ConvertTo-mdiFriendlyName {
     $text = [regex]::Replace($Name, '(?<=[a-z0-9])([A-Z])', ' $1')
     $text = [regex]::Replace($text, '(?<=[A-Z])([A-Z][a-z])', ' $1')
     foreach ($acronym in @('NTLM', 'LDAP', 'DNS', 'RPC', 'RDP', 'NNR', 'SAM', 'VPN', 'DSA', 'ADFS', 'ADCS', 'CA', 'OS')) {
-        $text = [regex]::Replace($text, '\b' + $acronym + '\b', $acronym, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        $text = [regex]::Replace($text, '\b' + $acronym + '\b', $acronym, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
     }
     $text
 }
@@ -5699,7 +9218,7 @@ function ConvertTo-mdiSvgNumber {
     )
     # SVG and CSS require a dot as the decimal separator. Without an invariant culture the report breaks on
     # machines using a comma as the decimal separator (for example it-IT, de-DE or fr-FR).
-    $Value.ToString('F' + $Decimals, [System.Globalization.CultureInfo]::InvariantCulture)
+    $Value.ToString('F' + $Decimals, [Globalization.CultureInfo]::InvariantCulture)
 }
 
 function New-mdiDonutChart {
@@ -5777,19 +9296,57 @@ function New-mdiBarChart {
     $rows = New-Object -TypeName System.Collections.ArrayList
     [void] $rows.Add('<div class="barchart">')
     foreach ($b in $Bar) {
-        $total = [double] $b.Total
         $value = [double] $b.Value
-        $pct = if ($total -gt 0) { ($value / $total) * 100 } else { 0 }
-        $tone = if ($pct -ge 100) { 'ok' } elseif ($pct -ge 50) { 'warn' } elseif ($pct -gt 0) { 'warn' } else { 'bad' }
-        if ($total -le 0) { $tone = 'na' }
+        # Checks that could not be read are part of the picture, not absent from it. Total counts only
+        # what was MEASURED, so a bar drawn from Value/Total alone answered a different question than
+        # the one the operator is asking: a domain controller where a single check was readable and
+        # passed, and four were unreadable, rendered "1/1 (100%)" as a solid green bar - the most
+        # reassuring row on the page - while the score card on the same page said 20%. Two numbers on
+        # one page, derived from one fact, disagreeing, with the prettier one being wrong.
+        #
+        # Unread is added to the denominator and drawn as its own neutral segment, so the green length
+        # is the share of ALL checks that passed and the grey remainder is visibly unaccounted for.
+        $unread = 0
+        if ($null -ne $b.PSObject.Properties['Unread']) { $unread = [double] $b.Unread }
+        if ($unread -lt 0) { $unread = 0 }
+        $total = [double] $b.Total
+        if ($total -lt 0) { $total = 0 }
+        $denominator = Get-mdiCoverageDenominator -Measured $total -Unread $unread
+
+        $pct = Get-mdiCoveragePercent -Passed $value -Measured $total -Unread $unread
+        $unreadPct = if ($denominator -gt 0) { ($unread / $denominator) * 100 } else { 0 }
+        # A bar can only be "ok" when everything counted was measured AND passed. Without the unread
+        # term a fully unmeasured server reached the 100% branch and was toned green.
+        #
+        # The 'na' rule is the mirror image and matters just as much: when NOTHING was measured the bar
+        # is at 0%, and scoring that as "bad" would paint a solid red bar for a server nobody managed
+        # to ask - inventing a failure out of an absence of evidence. Red is reserved for a bar whose
+        # zero was actually measured.
+        $tone = if ($total -le 0) { 'na' }
+        elseif ($pct -ge 100) { 'ok' }
+        elseif ($pct -gt 0) { 'warn' }
+        else { 'bad' }
+        if ($denominator -le 0) { $tone = 'na' }
+
         # The format operator is used instead of concatenation: '[int]$value + "/"' would evaluate left to right and
         # try to convert "/" to an integer.
-        $caption = if ($total -gt 0) {
-            '{0}/{1} ({2}%)' -f [int] $value, [int] $total, [int] [math]::Round($pct)
+        $caption = if ($denominator -gt 0) {
+            # Floor, never Round. [math]::Round(99.6) is 100, so 996 of 1000 checks passing rendered as
+            # a flat "100%" next to the very counts that contradict it. The percentage is a summary of
+            # the fraction beside it and must never round up to a clean sweep that did not happen: only
+            # a genuine 100% may display as 100%. The same correction was already applied to the score
+            # card; the bar chart and the trend tooltip were reading Round from their own copies.
+            $base = '{0}/{1} ({2}%)' -f [int] $value, [int] $denominator, [int] [math]::Floor($pct)
+            if ($unread -gt 0) { $base + (' <span class="muted">{0} not read</span>' -f [int] $unread) } else { $base }
         } else { 'n/a' }
+
+        $unreadSegment = if ($unreadPct -gt 0) {
+            '<div class="bar-fill na" style="width:' + (ConvertTo-mdiSvgNumber $unreadPct 1) + '%"></div>'
+        } else { '' }
+
         [void] $rows.Add('<div class="bar-row"><div class="bar-label" title="' + (ConvertTo-mdiHtmlEncoded ([string] $b.Hint)) + '">' +
             (ConvertTo-mdiHtmlEncoded ([string] $b.Label)) + '</div>' +
-            '<div class="bar-track"><div class="bar-fill ' + $tone + '" style="width:' + (ConvertTo-mdiSvgNumber $pct 1) + '%"></div></div>' +
+            '<div class="bar-track"><div class="bar-fill ' + $tone + '" style="width:' + (ConvertTo-mdiSvgNumber $pct 1) + '%"></div>' + $unreadSegment + '</div>' +
             '<div class="bar-value">' + $caption + '</div></div>')
     }
     [void] $rows.Add('</div>')
@@ -5815,7 +9372,7 @@ function Copy-mdiDetails {
     param ([Parameter(Mandatory = $false)] [AllowNull()] [object] $Details)
 
     if ($null -eq $Details) { return $null }
-    if ($Details -is [System.Collections.IDictionary]) {
+    if ($Details -is [Collections.IDictionary]) {
         $clone = [ordered]@{}
         foreach ($key in @($Details.Keys)) { $clone[$key] = $Details[$key] }
         return $clone
@@ -5830,7 +9387,7 @@ function Get-mdiDetailEntry {
     param ([Parameter(Mandatory = $false)] [AllowNull()] [object] $Details)
 
     if ($null -eq $Details) { return @() }
-    if ($Details -is [System.Collections.IDictionary]) {
+    if ($Details -is [Collections.IDictionary]) {
         return @(foreach ($key in @($Details.Keys)) { [PSCustomObject]@{ Name = [string] $key; Value = $Details[$key] } })
     }
     @($Details.PSObject.Properties | ForEach-Object { [PSCustomObject]@{ Name = $_.Name; Value = $_.Value } })
@@ -5842,7 +9399,7 @@ function Set-mdiDetailEntry {
         [Parameter(Mandatory = $true)] [string] $Name,
         [Parameter(Mandatory = $false)] [AllowNull()] [object] $Value
     )
-    if ($Details -is [System.Collections.IDictionary]) {
+    if ($Details -is [Collections.IDictionary]) {
         $Details[$Name] = $Value
     } else {
         Add-Member -InputObject $Details -MemberType NoteProperty -Name $Name -Value $Value -Force
@@ -5855,7 +9412,7 @@ function Test-mdiDetailEntry {
         [Parameter(Mandatory = $true)] [string] $Name
     )
     if ($null -eq $Details) { return $false }
-    if ($Details -is [System.Collections.IDictionary]) { return $Details.Contains($Name) }
+    if ($Details -is [Collections.IDictionary]) { return $Details.Contains($Name) }
     $null -ne $Details.PSObject.Properties[$Name]
 }
 
@@ -5869,13 +9426,45 @@ function Get-mdiDetailValue {
         [Parameter(Mandatory = $true)] [string] $Name
     )
     if ($null -eq $Details) { return $null }
-    if ($Details -is [System.Collections.IDictionary]) {
+    if ($Details -is [Collections.IDictionary]) {
         if ($Details.Contains($Name)) { return $Details[$Name] }
         return $null
     }
     $prop = $Details.PSObject.Properties[$Name]
     if ($null -ne $prop) { return $prop.Value }
     $null
+}
+
+function Get-mdiCheckDetailRank {
+    <#
+        How much authority one role's DETAIL text has over the merged explanation of a check.
+
+        The merged VALUE is decided by Merge-mdiCheckValue, which ranks $false (measured bad) above
+        'N/A' (not measured) above $true (measured good). The detail has to follow the SAME order, or
+        the status and its own explanation contradict each other on one row.
+
+        They did. The detail merge tested only "did the incoming role measure a FAILURE", so an
+        UNREAD role could not displace a passing role's text. On a host that is both a domain
+        controller and a CA, where the DC pass read the clock and the CA pass could not, the value
+        merged pessimistically to 'N/A' while the detail kept the DC's success - and the real rendered
+        row read:
+
+            Within tolerance: Not tested | Skew: -3 s | Detail: Clock is within 3 second(s) of this computer
+
+        "Not tested" beside the measurement it says was never taken, and the honest "could not be
+        read" sentence - the only actionable text there is - discarded. Both hunters working this file
+        found it independently.
+
+        Returned as a rank rather than a pair of booleans so the two merges cannot drift apart again.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $Value
+    )
+
+    $state = ConvertTo-mdiBoolean $Value
+    if ($state -eq $false) { return 2 }
+    if ($null -eq $state) { return 1 }
+    0
 }
 
 function Merge-mdiCheckValue {
@@ -5897,9 +9486,78 @@ function Merge-mdiCheckValue {
     )
     $firstFalse = ($First -is [bool]) -and (-not $First)
     $secondFalse = ($Second -is [bool]) -and (-not $Second)
+    # A value that is not a real boolean is parsed rather than tested for truthiness. A check stored as
+    # the STRING 'False' - which a JSON round trip through another tool, a hand-edited report or an
+    # older version can produce - is truthy in PowerShell, so it merged as a PASS and a role that had
+    # measured the check as failing was silently upgraded to healthy.
+    if (-not $firstFalse -and $First -isnot [bool]) { $firstFalse = ((ConvertTo-mdiBoolean $First) -eq $false) }
+    if (-not $secondFalse -and $Second -isnot [bool]) { $secondFalse = ((ConvertTo-mdiBoolean $Second) -eq $false) }
     if ($firstFalse -or $secondFalse) { return $false }
-    if (([string] $First -eq 'N/A') -or ([string] $Second -eq 'N/A')) { return 'N/A' }
+
+    # Anything that is neither a boolean nor parseable as one is NOT a measurement, and the only
+    # honest answer for a value nobody can interpret is "not measured". Only the literal 'N/A' used to
+    # count as unmeasured, so an empty string, a null, a stray number or any other text merged as a
+    # PASS - the single most dangerous default available, and one that disagrees with
+    # ConvertTo-mdiBoolean, which already calls all of those unmeasured.
+    $firstUnknown = ($First -isnot [bool]) -and ($null -eq (ConvertTo-mdiBoolean $First))
+    $secondUnknown = ($Second -isnot [bool]) -and ($null -eq (ConvertTo-mdiBoolean $Second))
+    if ($firstUnknown -or $secondUnknown) { return 'N/A' }
     $true
+}
+
+function Get-mdiRequirementRank {
+    <#
+        How strong an obligation a probe's Requirement expresses, so two roles that describe the same
+        probe differently merge to the stronger one instead of to whichever was read first.
+
+            3  Required / All   every one must pass, and a measured failure blocks the verdict
+            2  AtLeastOne       one of the group must succeed (the NNR methods)
+            1  Recommended      reported, never blocking
+            0  Optional or unrecognised
+
+        Ranked rather than compared as text because the values are an ordered scale, and because an
+        unrecognised value must sort BELOW a real one rather than winning by accident.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Requirement
+    )
+    switch ([string] $Requirement) {
+        'Required' { 3 }
+        'All' { 3 }
+        'AtLeastOne' { 2 }
+        'Recommended' { 1 }
+        default { 0 }
+    }
+}
+
+function Get-mdiPortRecordRank {
+    <#
+        How much evidence a probe record carries, so two roles' copies of the same probe can be merged
+        without the answer depending on which role was read first.
+
+            3  measured failure       - the strongest evidence there is, and the one that must survive
+            2  measured success       - a real probe of this host-to-target path
+            1  never measured         - no evidence either way
+            0  not applicable         - explicitly does not apply, carries no evidence at all
+
+        A failure outranks a success so a port blocked under either role still blocks the run. A success
+        outranks "never measured" deliberately: the two roles issue INDEPENDENT live probes from the same
+        host, so one role failing to run a probe does not cast doubt on the other role having actually
+        completed it. Ranking the other way turned a port measured open into an unknown and kept the run
+        out of READY over a gap that was not there - a false red, and this tool's false reds are acted on
+        against production directories. This is deliberately the opposite of Merge-mdiCheckValue, where
+        two roles read the SAME registry value or descriptor and a read that failed in one of them really
+        does mean the value is not reliably known.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $Record
+    )
+    if ($null -eq $Record) { return -1 }
+    if ($Record.Applicable -eq $false) { return 0 }
+    if (($Record.Applicable -ne $true) -or ([string] $Record.Detail -match $script:mdiPortNotTestedPattern)) { return 1 }
+    if ($Record.Success -eq $false) { return 3 }
+    if ($Record.Success -eq $true) { return 2 }
+    1
 }
 
 function Merge-mdiRequiredPortsDetails {
@@ -5907,7 +9565,7 @@ function Merge-mdiRequiredPortsDetails {
         Deep-merge two roles' RequiredPortsDetails so a blocked probe measured under EITHER role
         survives. Results is the union of both roles' probe records, de-duplicated on the identity of
         the probe (Id/Protocol/Port/Target/TargetIP); when two records for the same probe disagree the
-        FAILURE wins. FailedRequired and NnrFailedTargets are the union of both roles' lists.
+        one carrying the most evidence wins, as ranked by Get-mdiPortRecordRank.
 
         A fresh PSCustomObject is returned so neither role's original detail object is mutated. The
         record objects themselves are shared by reference and are never written to.
@@ -5928,23 +9586,238 @@ function Merge-mdiRequiredPortsDetails {
         if (-not $byId.Contains($id)) {
             $byId[$id] = $rec
             [void] $order.Add($id)
-        } elseif (($byId[$id].Success -ne $false) -and ($rec.Success -eq $false)) {
-            # Same probe measured twice and this copy failed: the failure replaces the pass. The reverse
-            # (a pass arriving after a stored failure) leaves the failure in place, so the outcome is the
-            # same whichever role is merged first.
+        } elseif ((Get-mdiPortRecordRank -Record $rec) -gt (Get-mdiPortRecordRank -Record $byId[$id])) {
+            # The stored copy carries less evidence than this one, so this one replaces it. Comparing
+            # rank rather than only looking at Success is what makes the merge order-independent: the
+            # previous rule replaced a stored record only when the incoming one had FAILED, so whichever
+            # non-failing copy happened to arrive first survived and a port measured open in one role
+            # read as untested purely because the other role was merged first.
+            $byId[$id] = $rec
+        } elseif ((Get-mdiPortRecordRank -Record $rec) -eq (Get-mdiPortRecordRank -Record $byId[$id]) -and
+            (Get-mdiRequirementRank -Requirement $rec.Requirement) -gt (Get-mdiRequirementRank -Requirement $byId[$id].Requirement)) {
+            # Same evidence, stronger obligation. Requirement is not part of the identity above - the
+            # same probe to the same target is one record whatever each role called it - and it was not
+            # ranked either, so a tie was settled by whichever role happened to be read first. The same
+            # two facts therefore produced 'Failed' in one order and nothing at all in the other: a
+            # probe both roles measured as refused counted as a REQUIRED failure only if the role that
+            # called it Required was merged first. The stronger obligation wins, so the answer no
+            # longer depends on discovery order.
+            $byId[$id] = $rec
+        } elseif ((Get-mdiPortRecordRank -Record $rec) -eq (Get-mdiPortRecordRank -Record $byId[$id]) -and
+            (Get-mdiRequirementRank -Requirement $rec.Requirement) -eq (Get-mdiRequirementRank -Requirement $byId[$id].Requirement) -and
+            ([string]::CompareOrdinal([string] $rec.Detail, [string] $byId[$id].Detail) -lt 0)) {
+            # Same evidence and the same obligation, but a different explanation: two roles probed the
+            # same path and both failed, one reporting "Connection refused" and the other "Connection
+            # timed out". Either is a truthful account of a failure, so the verdict is the same - but
+            # WHICH one appeared depended on the order the roles were discovered in, so the same estate
+            # scanned twice produced two different reports. That is not cosmetic: the baseline/trend
+            # comparison diffs this text, so an estate that had not changed showed a change.
+            #
+            # Settled by an ordinal comparison of the detail. The choice is arbitrary, deliberately so -
+            # what matters is that it is a property of the two records rather than of the order they
+            # arrived in, which is what makes the merge fully commutative.
             $byId[$id] = $rec
         }
     }
-    $mergedResults = @(foreach ($id in $order) { $byId[$id] })
-    $mergedFailed = @(@(@($First.FailedRequired) + @($Second.FailedRequired)) | Where-Object { $_ } | Select-Object -Unique)
-    $mergedNnr = @(@(@($First.NnrFailedTargets) + @($Second.NnrFailedTargets)) | Where-Object { $_ } | Select-Object -Unique)
-    $probedFrom = if ($First.PSObject.Properties['ProbedFrom'] -and $First.ProbedFrom) { $First.ProbedFrom } else { $Second.ProbedFrom }
+    # Ordered by a property of the RECORDS, not by which role happened to be discovered first. $order
+    # preserved first-seen order, so the merged Results - and therefore the issue list built from them
+    # and the advisory block in the generated remediation script - came out in a different sequence
+    # depending on merge order. The same estate scanned twice produced two byte-different remediation
+    # scripts, which the baseline/trend comparison reports as a change that did not happen.
+    # Port is sorted numerically: as a string, 443 sorts before 53.
+    $mergedResults = @(@(foreach ($id in $order) { $byId[$id] }) |
+            Sort-Object -Property @{ Expression = { [string] $_.Server } },
+        @{ Expression = { [string] $_.Group } },
+        @{ Expression = { [string] $_.Id } },
+        @{ Expression = { [string] $_.Protocol } },
+        @{ Expression = { [int] ($_.Port -as [int]) } },
+        @{ Expression = { [string] $_.Target } },
+        @{ Expression = { [string] $_.TargetIP } })
+    # Sorted, not first-seen. Select-Object -Unique preserves the order the values arrived in, so the
+    # merged lists - and therefore the failed-port list, the issue list built from it and the
+    # generated remediation script - came out in a different order depending on which role was
+    # discovered first. The same estate scanned twice produced two byte-different scripts, and the
+    # baseline/trend comparison diffs this text, so an estate that had not changed showed a change.
+    $mergedFailed = @(@(@($First.FailedRequired) + @($Second.FailedRequired)) | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+    $mergedNnr = @(@(@($First.NnrFailedTargets) + @($Second.NnrFailedTargets)) | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+    # ProbedFrom is decided by WHICH DIRECTION was measured, not by which role merged first. The two
+    # are not interchangeable: 'Sensor server (outbound)' is the direction MDI actually requires,
+    # while the inbound fallback measures the reverse path and is reported elsewhere as "not tested in
+    # the required direction". Taking whichever arrived first meant the same two measurements produced
+    # opposite claims about what had been probed, and the losing direction vanished from the report.
+    # The required direction wins whenever it is present.
+    $probedFromValues = @($First.ProbedFrom, $Second.ProbedFrom | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })
+    $probedFrom = if (@($probedFromValues | Where-Object { [string] $_ -eq 'Sensor server (outbound)' }).Count -gt 0) {
+        'Sensor server (outbound)'
+    } elseif ($probedFromValues.Count -gt 0) {
+        @($probedFromValues | Sort-Object)[0]
+    } else {
+        $null
+    }
 
     [PSCustomObject]@{
         ProbedFrom       = $probedFrom
         FailedRequired   = $mergedFailed
         NnrFailedTargets = $mergedNnr
         Results          = $mergedResults
+    }
+}
+
+function Merge-mdiSensorV3Check {
+    <#
+        Merge ONE v3.x readiness check measured under two roles of the same host.
+
+        Same tri-state contract as Merge-mdiCheckValue, which decides the Status: a check that FAILED
+        under either role is failed for the merged server, and a check unread under either role is
+        unread. The Detail then has to come from the role that DROVE that merged Status, ranked by
+        Get-mdiCheckDetailRank, or the row contradicts its own explanation - the exact defect
+        Get-mdiCheckDetailRank was written for one level up.
+
+        Measured is DERIVED from the winning Detail with the producer's own rule
+        (Measured = -not ($Detail -like 'Not tested*')), not merged separately, so the invariant that
+        holds on a produced check still holds on a merged one. Two surfaces of the same fact were free
+        to disagree otherwise.
+
+        Remediable is pessimistic in the "do not invent work" direction: a check that is architectural
+        under either role - a member server, an operating system too old for the v3.x sensor - is
+        architectural for the merged server, because that is a property of the machine and no role
+        looking at it can make it actionable.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $First,
+        [Parameter(Mandatory = $false)] [AllowNull()] $Second
+    )
+    if ($null -eq $First) { return $Second }
+    if ($null -eq $Second) { return $First }
+
+    $status = Merge-mdiCheckValue -First $First.Status -Second $Second.Status
+
+    $firstRank = Get-mdiCheckDetailRank -Value $First.Status
+    $secondRank = Get-mdiCheckDetailRank -Value $Second.Status
+    # Equal standing and two different truthful explanations is settled by an ordinal comparison,
+    # exactly as Merge-mdiRequiredPortsDetails settles the identical tie. The choice is arbitrary on
+    # purpose: what matters is that it is a property of the two values rather than of the order they
+    # arrived in, which is what makes the merge commutative.
+    $winner = if ($secondRank -gt $firstRank) { $Second }
+    elseif ($firstRank -gt $secondRank) { $First }
+    elseif ([string]::CompareOrdinal([string] $Second.Detail, [string] $First.Detail) -lt 0) { $Second }
+    else { $First }
+
+    $firstReq = Get-mdiRequirementRank -Requirement $First.Requirement
+    $secondReq = Get-mdiRequirementRank -Requirement $Second.Requirement
+    $requirement = if ($secondReq -gt $firstReq) { $Second.Requirement }
+    elseif ($firstReq -gt $secondReq) { $First.Requirement }
+    elseif ([string]::CompareOrdinal([string] $Second.Requirement, [string] $First.Requirement) -lt 0) { $Second.Requirement }
+    else { $First.Requirement }
+
+    $detail = [string] $winner.Detail
+    [PSCustomObject]@{
+        Name        = [string] $(if ([string]::IsNullOrEmpty([string] $First.Name)) { $Second.Name } else { $First.Name })
+        Requirement = $requirement
+        Status      = $status
+        Detail      = $detail
+        Remediable  = (($First.Remediable -ne $false) -and ($Second.Remediable -ne $false))
+        Measured    = -not ($detail -like 'Not tested*')
+    }
+}
+
+function Merge-mdiSensorV3ReadyDetails {
+    <#
+        Deep-merge two roles' SensorV3ReadyDetails, the way RequiredPortsDetails is already deep-merged
+        next door.
+
+        The outer detail merge in Merge-mdiServerByFqdn replaces a details blob WHOLESALE, ranked on
+        the single top-level value the blob is named after - for SensorV3ReadyDetails that is
+        $srv.SensorV3Ready. The nested Checks / Blockers / ActionableBlockers / UnknownChecks arrays
+        were never consulted, and on an equal rank the tie-break compared the STRINGIFIED blob, in
+        which every one of those arrays renders as the literal text "System.Object[]".
+
+        So on a host that is both a domain controller and a certification authority, where each pass
+        measured a DIFFERENT v3.x blocker, both passes reported SensorV3Ready = $false (equal rank),
+        the two stringified blobs were character-for-character identical, the comparison returned 0,
+        the stored copy won - and the other role's measured blocker was deleted from the report, the
+        issue list and the generated remediation script. Reversing the discovery order deleted the
+        other one, which contradicts this merge's own documented promise that the result is identical
+        whichever order the roles are merged in.
+
+        Checks are unioned BY NAME and merged per check (Merge-mdiSensorV3Check), then Blockers,
+        ActionableBlockers and UnknownChecks are RECOMPUTED from the merged checks with the producer's
+        own rules, so the derived lists cannot drift from the checks they are supposed to summarise.
+        That is the "one computation per fact" rule: the alternative, unioning the stored lists, would
+        let a blocker survive on a check the merge had just resolved to a pass.
+
+        When neither side carries any Checks - a report written by an earlier version, or by another
+        tool - there is nothing to recompute from, so the stored lists are unioned instead of being
+        wiped. Losing a finding is far worse than carrying a stale one.
+
+        Checks come out sorted by name rather than in first-seen order. First-seen order is a property
+        of which role was discovered first, and the baseline/trend comparison diffs this text, so an
+        estate that had not changed showed a change. This is the same reason Merge-mdiRequiredPortsDetails
+        sorts its merged records.
+
+        A fresh PSCustomObject is returned so neither role's original detail object is mutated.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $First,
+        [Parameter(Mandatory = $false)] [AllowNull()] $Second,
+        [Parameter(Mandatory = $false)] [int] $FirstRank = -1,
+        [Parameter(Mandatory = $false)] [int] $SecondRank = -1
+    )
+    if ($null -eq $First) { return $Second }
+    if ($null -eq $Second) { return $First }
+
+    $byName = [ordered]@{}
+    foreach ($check in @(@($First.Checks) + @($Second.Checks))) {
+        if ($null -eq $check) { continue }
+        $key = ([string] $check.Name).Trim().ToLowerInvariant()
+        if (-not $byName.Contains($key)) { $byName[$key] = $check; continue }
+        $byName[$key] = Merge-mdiSensorV3Check -First $byName[$key] -Second $check
+    }
+    $mergedChecks = @(@(foreach ($key in $byName.Keys) { $byName[$key] }) |
+            Sort-Object -Property @{ Expression = { [string] $_.Name } })
+
+    # Which role's SCALAR facts to keep. Both roles looked at the same machine, so the role with more
+    # authority over the v3.x verdict also has the more authoritative account of the sensor state.
+    $scalarWinner = if ($SecondRank -gt $FirstRank) { $Second }
+    elseif ($FirstRank -gt $SecondRank) { $First }
+    elseif ([string]::CompareOrdinal([string] $Second.SensorState, [string] $First.SensorState) -lt 0) { $Second }
+    else { $First }
+    $scalarLoser = if ($scalarWinner -eq $First) { $Second } else { $First }
+
+    # A version that was read beats one that was not: this is a fact about the machine that one pass
+    # simply failed to collect, not two passes disagreeing.
+    $v2Version = if (-not [string]::IsNullOrWhiteSpace([string] $scalarWinner.SensorV2Version)) { $scalarWinner.SensorV2Version }
+    else { $scalarLoser.SensorV2Version }
+
+    if ($mergedChecks.Count -gt 0) {
+        # The producer's own rules, kept literally in step with Get-mdiSensorV3Readiness.
+        $blockers = @($mergedChecks | Where-Object { $_.Requirement -eq 'Required' -and $_.Status -eq $false })
+        $unknowns = @($mergedChecks | Where-Object { $_.Requirement -eq 'Required' -and $_.Measured -ne $true })
+        $blockerMessages = @(foreach ($blocker in $blockers) { [string] $blocker.Name + ': ' + [string] $blocker.Detail })
+        $architectural = @($blockers | Where-Object { -not $_.Remediable })
+        $actionableBlockers = @(
+            if ($architectural.Count -eq 0) {
+                foreach ($blocker in $blockers) { [string] $blocker.Name + ': ' + [string] $blocker.Detail }
+            }
+        )
+        $unknownChecks = @(foreach ($unknown in $unknowns) { [string] $unknown.Name })
+    } else {
+        $blockerMessages = @(@(@($First.Blockers) + @($Second.Blockers)) | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+        $actionableBlockers = @(@(@($First.ActionableBlockers) + @($Second.ActionableBlockers)) | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+        $unknownChecks = @(@(@($First.UnknownChecks) + @($Second.UnknownChecks)) | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+    }
+
+    [PSCustomObject]@{
+        SensorState        = $scalarWinner.SensorState
+        SensorV2Version    = $v2Version
+        # Pessimistic: eligible for the in-place migration only if BOTH passes said so. Anything else
+        # - a disagreement, or a value neither role expressed as a real boolean - is not the positive
+        # assertion this field exists to make.
+        MigrationEligible  = (($First.MigrationEligible -eq $true) -and ($Second.MigrationEligible -eq $true))
+        Blockers           = $blockerMessages
+        ActionableBlockers = $actionableBlockers
+        UnknownChecks      = $unknownChecks
+        Checks             = $mergedChecks
     }
 }
 
@@ -5972,11 +9845,42 @@ function Merge-mdiServerByFqdn {
 
     $merged = New-Object -TypeName System.Collections.ArrayList
     $byName = @{}
+    # The AUTHORITY rank of the role that contributed each detail entry, on the same tri-state scale
+    # Merge-mdiCheckValue uses: measured-failure beats unread beats measured-pass. A detail is the
+    # explanation of a check, and the merged check is pessimistic, so the explanation has to come from
+    # the role that drove the merged value or the two contradict each other on the same row.
+    $detailRankSource = @{}
+    # Which keys had a role that could NOT be reached. Recorded per ROLE rather than being folded
+    # into the merged row, because the two facts are different: the HOST may well be reachable - the
+    # domain controller pass reached it - while one ROLE was never examined on it.
+    $unreachableRole = @{}
     foreach ($srv in $Server) {
         if ($null -eq $srv) { continue }
         $key = [string] $srv.FQDN
         if ([string]::IsNullOrWhiteSpace($key)) { [void] $merged.Add($srv); continue }
-        $key = $key.ToLowerInvariant()
+        # The trailing dot of a fully qualified DNS name is trimmed before the key is built.
+        # "dc1.contoso.com" and "dc1.contoso.com." are the same host - the second is simply written in
+        # absolute form, which is what a PTR lookup and some directory attributes return - but they
+        # keyed differently, so one physical server was counted twice and its two halves could carry
+        # different verdicts. The healthy-looking half then appeared in the ready count.
+        # Surrounding whitespace is trimmed as well as the trailing dot. Whitespace is not part of a
+        # DNS name: a directory attribute read with a stray leading space, an operator-supplied
+        # -NnrTargetComputer with a trailing one, or a name split out of a comma-separated list all
+        # produce a spelling that keyed differently from the same host discovered elsewhere. One
+        # physical server was then counted TWICE, its two halves carried different verdicts, and the
+        # healthy-looking half was added to the ready count - so discovering a server under a second
+        # spelling made the readiness percentage go UP.
+        $key = $key.Trim().TrimEnd('.').Trim().ToLowerInvariant()
+        # Trimming can empty the key: a name of "." or ".." is nothing but dots. Those are not the same
+        # host as each other, and an empty key would merge every one of them into a single row, so a
+        # name that trims away is kept separate rather than being given a shared key.
+        if ($key -eq '') { [void] $merged.Add($srv); continue }
+
+        # Recorded HERE, before the first-role branch below, which continues out of the loop and so
+        # never reaches the Unreachable/PartialFailure merge at the bottom. Recording it only there
+        # meant the flag was missed whenever the unreachable role happened to be the FIRST one
+        # discovered for a host, which is half the orderings.
+        if ($srv.Unreachable -eq $true) { $unreachableRole[$key] = $true }
 
         if (-not $byName.ContainsKey($key)) {
             # Copied so the merge cannot mutate the per-role tables, which still show every role.
@@ -5985,6 +9889,14 @@ function Merge-mdiServerByFqdn {
             $copy = $srv.PSObject.Copy()
             if ($null -ne $srv.Details) {
                 $copy.Details = Copy-mdiDetails -Details $srv.Details
+                # Record the authority of THIS role's details. The first role takes this branch and
+                # never reaches the merge path below, so without this the rank was never set for it
+                # and any later role overwrote its explanation - two roles then produced different
+                # details depending on discovery order, which is the same order-dependence this is
+                # meant to remove.
+                foreach ($entry in (Get-mdiDetailEntry -Details $srv.Details)) {
+                    $detailRankSource[($key + '|' + $entry.Name)] = Get-mdiCheckDetailRank -Value $srv.($entry.Name -replace 'Details$', '')
+                }
             }
             $byName[$key] = $copy
             [void] $merged.Add($copy)
@@ -6006,11 +9918,19 @@ function Merge-mdiServerByFqdn {
             # stays unmeasured: the two roles look at the same machine, so one of them failing to read
             # a setting means that setting is not reliably known, and claiming the reading that did
             # succeed would be the same false confidence this merge exists to remove. Informational
-            # fields (names, versions, addresses) keep the first role's value. A check is any
-            # non-informational property that is a bool or 'N/A' in either role.
+            # fields (names, versions, addresses) keep the first role's value.
+            #
+            # What counts as a check is decided by ConvertTo-mdiBoolean, not by the raw type. The gate
+            # used to require a real [bool] or the literal 'N/A' on one side, so when BOTH roles stored
+            # the check as a string - which a JSON round trip or an older version produces - the merge
+            # was skipped entirely and degraded to first-key-wins. Roles are discovered in the order
+            # domain controller, certificate authority, Entra Connect, so a host holding two roles kept
+            # whichever value the DC pass happened to write: 'True' then 'False' merged to True, and a
+            # measured failure vanished from the score, the issue list and the verdict. Reversing the
+            # order gave the opposite answer, which is how it was caught.
             if ($name -notin $script:mdiInformationalProperty) {
-                $isCheck = ($existing.Value -is [bool]) -or ([string] $existing.Value -eq 'N/A') -or
-                    ($prop.Value -is [bool]) -or ([string] $prop.Value -eq 'N/A')
+                $isCheck = ($null -ne (ConvertTo-mdiBoolean $existing.Value)) -or ([string] $existing.Value -eq 'N/A') -or
+                    ($null -ne (ConvertTo-mdiBoolean $prop.Value)) -or ([string] $prop.Value -eq 'N/A')
                 if ($isCheck) {
                     $target.$name = Merge-mdiCheckValue -First $existing.Value -Second $prop.Value
                 }
@@ -6023,14 +9943,76 @@ function Merge-mdiServerByFqdn {
         if ($null -ne $srv.Details) {
             if ($null -eq $target.Details) {
                 Add-Member -InputObject $target -MemberType NoteProperty -Name 'Details' -Value (Copy-mdiDetails -Details $srv.Details) -Force
+                foreach ($entry in (Get-mdiDetailEntry -Details $srv.Details)) {
+                    $detailRankSource[($key + '|' + $entry.Name)] = Get-mdiCheckDetailRank -Value $srv.($entry.Name -replace 'Details$', '')
+                }
             } else {
                 foreach ($entry in (Get-mdiDetailEntry -Details $srv.Details)) {
+                    $detailKey = $key + '|' + $entry.Name
+                    # A detail entry is named after its check - SensorHealthDetails explains
+                    # SensorHealth - so the failing role can be identified without hard-coding a map.
+                    #
+                    # Ranked on the SAME tri-state Merge-mdiCheckValue uses, not on "did it fail".
+                    # Testing only for failure meant an UNREAD role could not displace a PASSING
+                    # role's text, so the merged status read "Not tested" beside an explanation
+                    # describing a successful measurement.
+                    $incomingRank = Get-mdiCheckDetailRank -Value $srv.($entry.Name -replace 'Details$', '')
+                    $storedRank = [int] $detailRankSource[$detailKey]
                     if (-not (Test-mdiDetailEntry -Details $target.Details -Name $entry.Name)) {
                         Set-mdiDetailEntry -Details $target.Details -Name $entry.Name -Value $entry.Value
+                        $detailRankSource[$detailKey] = $incomingRank
                     } elseif ($entry.Name -eq 'RequiredPortsDetails') {
                         $existingDetails = Get-mdiDetailValue -Details $target.Details -Name 'RequiredPortsDetails'
                         Set-mdiDetailEntry -Details $target.Details -Name 'RequiredPortsDetails' -Value (
                             Merge-mdiRequiredPortsDetails -First $existingDetails -Second $entry.Value)
+                    } elseif ($entry.Name -eq 'SensorV3ReadyDetails') {
+                        # Deep-merged for the same reason RequiredPortsDetails is: this blob carries
+                        # NESTED evidence - the per-check results and the blockers derived from them -
+                        # and the rank comparison below can only see the single top-level
+                        # SensorV3Ready value the blob is named after. Two roles that each measured a
+                        # DIFFERENT v3.x blocker both report $false, tie on rank, and stringify
+                        # identically (every nested array renders as "System.Object[]"), so the
+                        # tie-break could not tell them apart and one role's measured blocker was
+                        # dropped - a different one depending on which role was discovered first.
+                        $existingV3 = Get-mdiDetailValue -Details $target.Details -Name 'SensorV3ReadyDetails'
+                        Set-mdiDetailEntry -Details $target.Details -Name 'SensorV3ReadyDetails' -Value (
+                            Merge-mdiSensorV3ReadyDetails -First $existingV3 -Second $entry.Value `
+                                -FirstRank $storedRank -SecondRank $incomingRank)
+                        # The merged blob speaks for both roles now, so its authority is the stronger
+                        # of the two. Leaving the stored rank behind would let a third role displace
+                        # the merged result on a rank the merge has already absorbed.
+                        if ($incomingRank -gt $storedRank) { $detailRankSource[$detailKey] = $incomingRank }
+                    } elseif ($incomingRank -gt $storedRank) {
+                        # The stored detail came from a role with LESS to say about this check than
+                        # this one has. First-role-wins kept the healthy explanation beside the
+                        # pessimistically merged value, so a domain controller that also holds the CA
+                        # role reported "Sensor Health: False" while its detail row said the service
+                        # was Running - the check and its own explanation contradicting each other on
+                        # the same page - and the sentence naming the stopped service, the only
+                        # actionable text there is, was dropped. Reversing the discovery order
+                        # produced the correct detail, so the report depended on the order the roles
+                        # happened to be found in.
+                        Set-mdiDetailEntry -Details $target.Details -Name $entry.Name -Value $entry.Value
+                        $detailRankSource[$detailKey] = $incomingRank
+                    } elseif ($incomingRank -eq $storedRank) {
+                        # BOTH roles have equal standing on this check and each wrote its own
+                        # explanation - "the service is stopped" against "the service is disabled".
+                        # Either is a truthful account, so the verdict is the same whichever survives,
+                        # but WHICH one survived depended on discovery order and the same estate
+                        # scanned twice produced two different reports. The baseline trend diffs this
+                        # text, so an estate that had not changed showed a change.
+                        #
+                        # Settled by an ordinal comparison of the explanation, exactly as
+                        # Merge-mdiRequiredPortsDetails settles the identical tie between two measured
+                        # port failures. The choice is arbitrary on purpose - what matters is that it
+                        # is a property of the two values rather than of the order they arrived in,
+                        # which is what makes the merge commutative.
+                        $storedValue = Get-mdiDetailValue -Details $target.Details -Name $entry.Name
+                        $storedKey = [string] $(if ($null -ne $storedValue.Detail) { $storedValue.Detail } else { $storedValue })
+                        $incomingKey = [string] $(if ($null -ne $entry.Value.Detail) { $entry.Value.Detail } else { $entry.Value })
+                        if ([string]::CompareOrdinal($incomingKey, $storedKey) -lt 0) {
+                            Set-mdiDetailEntry -Details $target.Details -Name $entry.Name -Value $entry.Value
+                        }
                     }
                 }
             }
@@ -6047,7 +10029,698 @@ function Merge-mdiServerByFqdn {
     # there were none. Emitting normally and letting each caller wrap is correct for all three cases:
     # nothing, one, and many. This is the same comma-operator trap that already shipped once in this
     # file, in Get-mdiIssueList.
+    # A role that could not be reached examined NOTHING on this host, and merging Unreachable
+    # optimistically ("reached by any role means reached") threw that fact away. On the most
+    # ordinary small-estate topology there is - the certification authority installed ON a domain
+    # controller - the CA pass timed out, contributed no CAAuditing and no AdvancedAuditingCA
+    # properties at all, and the DC pass then cleared Unreachable. The CA checks did not fail and
+    # were not counted as unread: they simply left the denominator, so the score went UP and the
+    # report read "All prerequisites met" at 100% (12 of 12) with zero issues, while the JSON for
+    # the same run still carried Unreachable = true and the comment "Server is not available:
+    # ICMP, TCP 135, WMI". A standalone unreachable CA was charged correctly, so the defect
+    # appeared only when the roles shared a host - and the existing role-merge test could not see
+    # it because its fixture sets PartialFailure, which masks the condition.
+    #
+    # The host stays REACHABLE - that is what the domain controller pass measured, and overwriting
+    # it would be inventing a different lie - but the run is marked a PARTIAL failure, which is
+    # exactly what PartialFailure means and what the unread-check accounting already keys off: a
+    # partial server with no named unread check is charged one, so the checks the role never ran
+    # can no longer inflate the percentage by leaving the sum.
+    foreach ($key in @($unreachableRole.Keys)) {
+        if (-not $byName.ContainsKey($key)) { continue }
+        $row = $byName[$key]
+        if ($row.Unreachable -eq $true) { continue }
+        if ($null -eq $row.PSObject.Properties['PartialFailure']) {
+            Add-Member -InputObject $row -MemberType NoteProperty -Name 'PartialFailure' -Value $true -Force
+        } else {
+            $row.PartialFailure = $true
+        }
+    }
+
     $merged.ToArray()
+}
+
+function Get-mdiEffectivePortState {
+    <#
+        What the PORT MEASUREMENT says about a server, independent of the per-server RequiredPorts
+        summary flag. The two are the same fact stored twice and they were free to disagree: a server
+        whose summary read $true while a required probe had been measured as blocked scored a full
+        green bar and was counted in "servers ready", because the score is built from the boolean
+        properties and never looked at the detail records. That is the worst output this tool can
+        produce - it is the exact check the tool exists to perform, reported as passing while the
+        measurement underneath it says the port is shut.
+
+        Returns 'Failed' when something was measured shut, 'Unread' when a required probe or an entire
+        NNR target was never measured (nothing was observed shut, so it is a gap to re-measure and must
+        NOT be dressed up as a failure), and $null when the measurement agrees with a passing summary
+        or there is no measurement to judge.
+    #>
+    param (
+        [Parameter(Mandatory = $true)] [object] $Server
+    )
+
+    $records = @(Get-mdiPortResultRecord -Server @($Server))
+    if ($records.Count -eq 0) { return $null }
+
+    $blocking = @(Get-mdiBlockingPortFailure -Record $records)
+    if (@($blocking | Where-Object { [string] $_.BlockingKind -in @('Required', 'NnrMeasured') }).Count -gt 0) {
+        return 'Failed'
+    }
+    if (@($blocking | Where-Object { [string] $_.BlockingKind -eq 'NnrUntested' }).Count -gt 0) {
+        return 'Unread'
+    }
+    # A mandatory probe that never ran is not a failure and not a pass. Shared with the issue list and
+    # the verdict, so the score, the findings table and the exit code cannot disagree about which
+    # probes were actually measured.
+    $unmeasuredRequired = @(Get-mdiUnmeasuredRequiredProbe -Record $records)
+    if ($unmeasuredRequired.Count -gt 0) { return 'Unread' }
+
+    $null
+}
+
+function Get-mdiEffectivePortCheckValue {
+    <#
+        The value the RequiredPorts check should carry for a server once the MEASUREMENT is taken into
+        account, or $null when the measurement has nothing to add.
+
+        Returns $false when a required probe or an NNR target was measured as blocked, and 'N/A' when
+        one was never measured. Every consumer - the per-server score, the per-check pass rates and the
+        issue list - reads this one function, so the Overview cannot disagree with the verdict about
+        whether a server's ports are in order.
+    #>
+    param (
+        [Parameter(Mandatory = $true)] [object] $Server
+    )
+
+    switch (Get-mdiEffectivePortState -Server $Server) {
+        'Failed' { $false }
+        'Unread' { 'N/A' }
+        default { $null }
+    }
+}
+
+function Get-mdiEffectiveCheckProperty {
+    <#
+        The readiness checks for a server as name/value pairs, with the RequiredPorts check resolved
+        against the actual port MEASUREMENT rather than against the summary flag alone.
+
+        The summary flag and the detail records are the same fact stored twice. Reading only the flag
+        let a server whose RequiredPorts summary said $true - or which carried no summary at all, which
+        is what a scan interrupted before the summary was written produces - score a full green bar
+        while its own detail records showed a required port measured shut.
+
+        RequiredPorts is emitted here with its effective tri-state value ($true, $false, or the string
+        'N/A' for "not measured"), so it appears exactly once however it was stored. Every consumer -
+        the per-server score, the per-check pass rates, the KPI counts - reads this one function, so
+        they cannot disagree with each other or with the verdict.
+    #>
+    param (
+        [Parameter(Mandatory = $true)] [object] $Server
+    )
+
+    $pairs = New-Object -TypeName System.Collections.ArrayList
+    foreach ($prop in (Get-mdiCheckProperty -Server $Server)) {
+        if ($prop.Name -eq $script:mdiRequiredPortsCheckName) { continue }
+        [void] $pairs.Add([PSCustomObject]@{ Name = $prop.Name; Value = $prop.Value })
+    }
+
+    # The summary as stored, normalised. It may be a real boolean, the string 'True' or 'False' from a
+    # JSON round trip or an older version, the string 'N/A', or absent entirely. Reading the raw value
+    # here was a false green: a string 'False' is neither [bool] nor 'N/A', so $effective came out
+    # $null and the check was emitted ZERO times - no score entry, no CheckTotals entry, and no column
+    # in the report at all. The server then scored a clean 1 of 1 and counted as fully ready with its
+    # only failing check simply absent. Get-mdiCheckProperty already normalises; this did not, so the
+    # two disagreed about whether the check even existed.
+    $summaryProperty = $Server.PSObject.Properties[$script:mdiRequiredPortsCheckName]
+    $rawSummary = if ($summaryProperty) { $summaryProperty.Value } else { $null }
+    $summary = ConvertTo-mdiBoolean $rawSummary
+    $summaryIsUnread = ($null -eq $summary) -and ([string] $rawSummary -eq 'N/A')
+    $measured = Get-mdiEffectivePortCheckValue -Server $Server
+
+    $effective = if ($null -ne $measured) {
+        # The measurement only ever overrides a summary that claims success or says nothing. A summary
+        # already reading false is not overstating anything and is left as the failure it is - checked
+        # against the NORMALISED value, so a stored 'False' is protected exactly like a real $false.
+        if ($summary -eq $false) { $false } else { $measured }
+    } elseif ($null -ne $summary) {
+        $summary
+    } elseif ($summaryIsUnread) {
+        'N/A'
+    } else {
+        $null
+    }
+    if ($null -ne $effective) {
+        [void] $pairs.Add([PSCustomObject]@{ Name = $script:mdiRequiredPortsCheckName; Value = $effective })
+    }
+
+    $pairs.ToArray()
+}
+
+#region Single source of truth
+
+<#
+    One definition per fact.
+
+    Roughly half of every defect found in this tool had the same shape: a fact - the coverage
+    percentage, whether a server is ready, which required probes were actually measured - computed
+    independently in two or three places, which then drifted apart. The bar chart read 100% beside a
+    score card reading 20%. The trend pill said "no change" under a line that had fallen 64 points.
+    The NNR KPI said 1/1 resolvable while the verdict raised a blocking finding for the same records.
+
+    Every one of those was fixed individually, and the next one appeared somewhere else, because
+    fixing an instance leaves the shape intact. The functions below exist so the shape cannot recur:
+    each fact is computed in exactly one place and every surface reads it from there. A disagreement
+    between two surfaces stops being a bug that has to be found and becomes something that cannot be
+    expressed.
+#>
+
+function Get-mdiCoverageCount {
+    <#
+        A count from a report or history entry, coerced safely.
+
+        [int] throws on a value larger than Int32 and on a non-numeric string, and both shapes reach
+        here: a hand-edited baseline, a JSON round-trip that produced strings, or a corrupted history.
+        The helpers below must never throw over a number - the trend and the score card are drawn from
+        them, and losing the whole report because one history entry was malformed is far worse than
+        the wrong bar. Anything that will not parse counts as zero, which is the conservative reading:
+        an unparseable count is not evidence of a passing check.
+
+        [double] is the parse target because it accepts the full range and does not overflow.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)] [AllowNull()] $Value
+    )
+
+    $parsed = 0.0
+    if ($null -eq $Value) { return [double] 0 }
+    if ($Value -is [bool]) { return [double] 0 }
+    # Parsed with the INVARIANT culture. These counts arrive from a JSON round-trip or a baseline
+    # history file, which are written invariantly - but TryParse without a culture uses the OPERATOR'S
+    # culture, and in de-DE or fr-FR "1.5" parses as fifteen while "1,5" parses as one-and-a-half.
+    # A German administrator reading a history written on an English host would silently get counts
+    # ten times too large, and the score built from them would be nonsense rather than obviously wrong.
+    if (-not [double]::TryParse([string] $Value, [Globalization.NumberStyles]::Float,
+            [Globalization.CultureInfo]::InvariantCulture, [ref] $parsed)) { return [double] 0 }
+    if ([double]::IsNaN($parsed) -or [double]::IsInfinity($parsed)) { return [double] 0 }
+    if ($parsed -lt 0) { return [double] 0 }
+    $parsed
+}
+
+function Get-mdiWholeNumberText {
+    <#
+        A count rendered for display, without an [int] cast.
+
+        [int] THROWS on a value beyond Int32, and these counts are rendered inside the trend tooltip
+        and the delta caption - so one corrupted history entry took down the whole chart, and with it
+        the whole report. Measured: an unread count of three billion threw
+        "Value was either too large or too small for an Int32" out of New-mdiTrendChart.
+    #>
+    [CmdletBinding()]
+    param ([Parameter(Mandatory = $true)] [AllowNull()] $Value)
+    [string] [math]::Floor((Get-mdiCoverageCount -Value $Value))
+}
+function Get-mdiCoveragePercent {
+    <#
+        The readiness percentage. THE denominator rule, in one place.
+
+        Checks that could not be read belong in the denominator. Leaving them out answers a different
+        question - "of the things I managed to look at, how many passed" - and presents the answer as
+        though it described the estate. A domain controller with one readable passing check and four
+        unreadable ones is not 100% ready, and it was rendered as a full green bar directly above a
+        score card that said 20%.
+
+        This formula was duplicated six times: the trend plot, the two halves of the trend delta, the
+        two bar-chart segments and the score card. Five of them were corrected in one pass and the
+        sixth - the delta - was missed, which is precisely how the "-> 0 pt vs previous run" pill came
+        to sit under a line that had fallen from 80% to 16%.
+
+        Returns a raw double. Callers floor it for display: [math]::Round is banker's rounding, so
+        996 of 1000 renders as a flat "100%" next to the counts that contradict it, and only a genuine
+        100% may ever be shown as 100%.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)] [AllowNull()] $Passed,
+        [Parameter(Mandatory = $true)] [AllowNull()] $Measured,
+        [Parameter(Mandatory = $false)] [AllowNull()] $Unread = 0
+    )
+
+    # Coerced through one helper rather than [int], which THROWS on a value beyond Int32 and on a
+    # non-numeric string. Measured: an unread count of 3,000,000,000 silently became 0 and the
+    # function reported 100% - a perfect score produced from a number that says the opposite.
+    $p = Get-mdiCoverageCount -Value $Passed
+    $m = Get-mdiCoverageCount -Value $Measured
+    $u = Get-mdiCoverageCount -Value $Unread
+
+    $denominator = $m + $u
+    if ($denominator -le 0) { return [double] 0 }
+    # Passed cannot exceed the population it is drawn from; a history entry claiming otherwise plotted
+    # above the top of the chart and produced a delta of minus one hundred and fifty points.
+    if ($p -gt $denominator) { $p = $denominator }
+    ($p / $denominator) * 100
+}
+
+function Get-mdiCoverageDenominator {
+    <#
+        The population a readiness percentage is a fraction OF: measured plus unread.
+
+        Separate from the percentage because several callers need to display the denominator beside
+        the percentage - "8/50, 40 not read" - and a label computed from a different total than the
+        percentage beside it is the same defect in miniature. It shipped exactly once, as
+        "16% (8/10)".
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)] [AllowNull()] $Measured,
+        [Parameter(Mandatory = $false)] [AllowNull()] $Unread = 0
+    )
+
+    $m = Get-mdiCoverageCount -Value $Measured
+    $u = Get-mdiCoverageCount -Value $Unread
+    $m + $u
+}
+
+function Test-mdiServerIsReady {
+    <#
+        Whether one server's score counts as READY.
+
+        Ready means every check was measured AND every measured check passed. An unread check is not
+        a pass: a server with one passing check and five that could not be read was counted 1/1 ready
+        on the overview while the verdict correctly failed the run.
+
+        Written twice - once in the overview, once in the baseline history that feeds the trend - so
+        the number written permanently into the history could disagree with the page it came from.
+        The trend is what gets reported upward, which makes that the more expensive copy.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)] [AllowNull()] $Score
+    )
+
+    if ($null -eq $Score) { return $false }
+
+    # Every field must be PRESENT, numeric, and NON-NEGATIVE. A score object missing Failed or Unread
+    # - an older report, a hand-edited baseline, a JSON round-trip that dropped a null - previously
+    # satisfied "Failed -eq 0 -and Unread -eq 0" because $null equals 0 in PowerShell, so a server
+    # whose failures were unknown was reported READY.
+    #
+    # Negative and non-finite values are rejected outright rather than clamped. Get-mdiCoverageCount
+    # floors them to zero, which is the right answer for a PERCENTAGE - a nonsense count contributes
+    # nothing - but it is the wrong answer here, because zero failures is precisely the condition that
+    # makes a server ready. Measured: Failed = -1 and Failed = 'NaN' both reported READY. A corrupted
+    # count must never be able to certify a domain controller as compliant; it is unreadable, and
+    # unreadable is not ready.
+    foreach ($field in 'Total', 'Failed', 'Unread') {
+        if ($null -eq $Score.PSObject.Properties[$field]) { return $false }
+        $raw = $Score.$field
+        if ($null -eq $raw -or $raw -is [bool]) { return $false }
+        $parsed = 0.0
+        # Invariant, for the same reason as Get-mdiCoverageCount: a score read back from a baseline
+        # or a JSON round-trip must not be reinterpreted through the operator's decimal separator.
+        if (-not [double]::TryParse([string] $raw, [Globalization.NumberStyles]::Float,
+                [Globalization.CultureInfo]::InvariantCulture, [ref] $parsed)) { return $false }
+        if ([double]::IsNaN($parsed) -or [double]::IsInfinity($parsed)) { return $false }
+        if ($parsed -lt 0) { return $false }
+    }
+
+    ([double] $Score.Total -gt 0) -and ([double] $Score.Failed -eq 0) -and ([double] $Score.Unread -eq 0)
+}
+
+function Test-mdiCheckFailed {
+    <#
+        Whether a readiness check property records a MEASURED FAILURE, as opposed to a pass or a
+        measurement nobody took.
+
+        The gates that consume this decide whether to emit REMEDIATION - registry writes, auditpol,
+        powercfg, service restarts against a production domain controller - and whether to raise a
+        confirmed finding. The stated invariant at every one of those sites is that remediation must
+        never be generated for a check that was not measured, because rewriting a setting whose
+        current value is unknown is exactly the change this tool must not invent.
+
+        They were each written as '-eq $false', which was chosen deliberately over '-not $_.X' and is
+        correct for the two unmeasured shapes the script itself produces: 'N/A' -eq $false is FALSE
+        and $null -eq $false is FALSE, so neither reaches the generator.
+
+        It does not hold for a NUMBER. PowerShell coerces the right operand to the left operand's
+        type, so 0 -eq $false compares 0 against [int] $false, which is 0, and the comparison is TRUE.
+        Measured: a server whose NtlmAuditing, PowerSettings and TimeSync were the integer 0 produced
+        a generated script byte-for-byte as actionable as a genuinely failing server - NTLM registry
+        values, a power scheme change and a w32tm resync for three settings that were never read. A
+        number is not a measurement of a tri-state and must reach neither the generator nor the
+        issue list.
+
+        The STRING 'False' is still a failure. A report that has passed through another tool comes
+        back with its booleans as strings, and that is a measurement someone took - the same reason
+        Test-mdiServerIsUnreachable normalises rather than tests truthiness. Only a real boolean and
+        the explicit string forms count; everything else is unmeasured.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $Value
+    )
+
+    if ($null -eq $Value) { return $false }
+    if ($Value -is [bool]) { return (-not $Value) }
+    # Numbers - and the char/decimal family that compare numerically against a bool - are not a
+    # measurement of this tri-state, whatever they equal.
+    if ($Value -is [ValueType]) { return $false }
+    if ($Value -is [string]) { return ($Value.Trim() -eq 'False') }
+    $false
+}
+
+function Test-mdiProbeWasMeasured {
+    <#
+        Whether a port/NNR probe record carries a MEASUREMENT, as opposed to being a record of a probe
+        that never ran.
+
+        A probe was measured when it applied (Applicable is $true) and its detail is not one of the
+        "never ran" markers. Applicable $null is NOT measured: it is the tri-state "we do not know
+        whether this probe applied", and treating it as measured is what turns an absence of evidence
+        into a red bar.
+
+        This predicate was written out longhand at four separate sites - the blocking-failure layer,
+        the NNR resolvable/untested split, the port Open/Blocked/Untested split, and the "could not be
+        tested" table - which is four chances for them to drift. They already had: the overview's name
+        resolution bar chart counted every record as measured, so two probes that were never run drew
+        a solid red "0/1 (0%)" bar directly underneath a KPI on the same page reading "1 target(s)
+        could not be tested", and a detail matrix reading "Not tested" for the same two probes. A
+        false red on the most-read surface in the report, contradicted twice on its own page.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $Record
+    )
+
+    if ($null -eq $Record) { return $false }
+    # Success must be a REAL boolean, not merely present. Get-mdiPortResultRecord normalises anything
+    # unrecognised - '', 'Unknown', a stray number, a value mangled by another tool's JSON handling -
+    # to $null, and downstream the record was still counted as measured because only Applicable and
+    # Detail were consulted. "-not $_.Success" then turned that $null into a MEASURED BLOCKED PORT:
+    # a Network finding, a failed verdict, and an operator sent to open a firewall port on a probe
+    # that never produced a result. By this script's own reckoning that is the most expensive wrong
+    # answer it can give. Nothing was observed shut, so it belongs on the unmeasured path instead.
+    if (-not ($Record.Success -is [bool])) { return $false }
+    ($Record.Applicable -eq $true) -and ([string] $Record.Detail -notmatch $script:mdiPortNotTestedPattern)
+}
+
+function Get-mdiUnmeasuredRequiredProbe {
+    <#
+        Mandatory probes that never actually ran.
+
+        A required port that could not be probed is neither open nor blocked. Counting it as blocked
+        sends an operator to open a firewall port on evidence that does not exist; counting it as open
+        lets a run be declared ready on a measurement nobody took.
+
+        This filter was written three times - the effective port state, the issue list and the verdict
+        - which is three chances for the score, the findings table and the exit code to disagree about
+        the same probes. They are the three surfaces an operator actually acts on.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)] [AllowNull()] [AllowEmptyCollection()] $Record
+    )
+
+    # A mandatory probe belongs here whenever it applied but was not actually MEASURED. Routed through
+    # the shared predicate so this population is exactly the complement of the measured one: a record
+    # whose Success normalised to $null used to fall through both filters - counted as a measured
+    # failure by the blocking layer and not counted here at all - so a probe that produced no result
+    # was reported as a blocked port rather than as a gap to re-measure.
+    @($Record | Where-Object {
+            $_.Requirement -in @('Required', 'All') -and $_.Applicable -ne $false -and
+            -not (Test-mdiProbeWasMeasured -Record $_)
+        })
+}
+
+#endregion
+
+function Test-mdiServerIsUnreachable {
+    <#
+        Whether a server was actually MISSED, from its status flag.
+
+        Normalised rather than tested for bare truthiness. Unreachable survives a JSON round trip
+        through another tool, a hand-edited report or an older version as the STRING 'False', and
+        every non-empty string is truthy in PowerShell - so a server explicitly RECORDED AS REACHED
+        was moved into the unreachable population. Its checks vanished from the statistics, a
+        Connectivity finding was raised against it, and the verdict flipped from ready to not ready:
+        a false red produced by nothing more than the report having passed through another tool.
+        '0' did the same.
+
+        Written once and shared, because the statistics, the verdict, the issue list, the HTML row and
+        the remediation generator each decided this separately. They disagreed the moment the flag was
+        anything but a real boolean - the statistics counted a server as reached while the verdict
+        counted the same server as missed, which is the two-surfaces-of-one-fact failure this codebase
+        keeps producing.
+
+        Only a value that normalises to $true means unreachable. A value that cannot be parsed at all
+        is not evidence the server was missed, so it stays in the measured population where its own
+        tri-state checks can speak for themselves. That is the conservative direction: wrongly calling
+        a reached server unreachable DELETES real measurements, while wrongly calling an unreachable
+        server reached leaves its checks reading 'N/A' and counted as unread.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $Server
+    )
+
+    if ($null -eq $Server) { return $false }
+    $value = $Server.Unreachable
+    $normalised = ConvertTo-mdiBoolean $value
+    if ($null -ne $normalised) { return $normalised }
+    # A report that writes status flags as numbers rather than booleans still means something by
+    # them: zero is reached, anything else is not.
+    if ($value -is [int] -or $value -is [long] -or $value -is [double]) { return ([double] $value -ne 0) }
+    $false
+}
+
+function Test-mdiServerIsPlaceholder {
+    <#
+        Whether a row in the server collections is a DISCOVERY PLACEHOLDER rather than a real server.
+
+        Two producers emit a row for a role they could not enumerate - Get-mdiCAReadiness when the
+        certification authorities of a domain cannot be listed, and Get-mdiEntraConnectReadiness when
+        the sync server cannot be identified. The row exists so the role is reported as not-measured
+        instead of rendering as "nothing to check here", and that part works: its 'N/A' marker is
+        charged as an unread check.
+
+        But nothing distinguished it from a machine. It was counted in the server-count KPIs, so a
+        one-server estate whose AD CS enumeration was denied reported "across 2 server(s)" and
+        "Servers fully ready 1/2" - a second server that does not exist, and a ratio that can never
+        reach 2/2. The genuinely unreachable server, which is the same class of gap, was already
+        excluded from those counts via Kind = 'Unmeasured', so the two surfaces of one idea disagreed.
+
+        Decided from an explicit flag set by the producers rather than by matching the FQDN text,
+        because the display name is prose ("AD CS (not enumerated) - contoso.com") and a real server
+        may legitimately be named anything. Normalised rather than tested for bare truthiness, for
+        the reason given on Test-mdiServerIsUnreachable: the flag survives a JSON round trip as the
+        STRING 'False', and every non-empty string is truthy in PowerShell.
+
+        Conservative direction: only a value that normalises to $true makes a row a placeholder. A
+        report from an older version carries no flag at all, and its rows keep counting as the
+        servers they are.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $Server
+    )
+
+    if ($null -eq $Server) { return $false }
+    $normalised = ConvertTo-mdiBoolean $Server.IsPlaceholder
+    if ($null -ne $normalised) { return $normalised }
+    $false
+}
+
+function Get-mdiUnexaminedDomain {
+    <#
+        The domains that were in scope but produced no servers - THE definition, in one place.
+
+        This comparison was written out three times: in the statistics (to charge an unread check), in
+        the issue list (to raise a finding) and in the verdict (to refuse READY). Three copies of one
+        rule is how the copies drift, and this one had already drifted in a way nothing caught: all
+        three compared with -notin, which is case-insensitive for strings, while the scope list itself
+        was de-duplicated with Select-Object -Unique, which is ORDINAL. So "contoso.com" and
+        "CONTOSO.COM" survived as two entries in scope, and a trailing dot - "contoso.com." - which
+        DNS treats as the same name, survived as a third.
+
+        The consequences ran in both directions. A spelling that no server matched was charged as an
+        unexamined domain, so a run lost readiness over a domain that HAD been scanned under its other
+        spelling; and the same estate could be enumerated twice, doubling every count in the report.
+
+        Comparison is case-insensitive and ignores a trailing dot, which is what DNS itself does. The
+        names are RETURNED in their original spelling so the operator sees what they typed.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)] [AllowNull()] $ScopedDomain,
+        [Parameter(Mandatory = $true)] [AllowNull()] $Server,
+        [Parameter(Mandatory = $false)] [AllowNull()] $DomainControllerServer = $null
+    )
+
+    $normalise = { param($n) ([string] $n).Trim().TrimEnd('.') }
+    $scoped = @($ScopedDomain | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })
+    if ($scoped.Count -eq 0) { return @() }
+
+    $examined = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($srv in @($Server | Where-Object { $_ })) {
+        $d = & $normalise $srv.Domain
+        if (-not [string]::IsNullOrWhiteSpace($d)) { [void] $examined.Add($d) }
+    }
+    # A domain counts as examined only when a DOMAIN CONTROLLER from it was scanned. Callers used to
+    # pass the merged union of all three role lists, so a certification authority or an Entra Connect
+    # server was enough to mark its domain covered - and a child domain whose domain-controller
+    # discovery returned NOTHING came back fully examined, with no discovery finding and a verdict of
+    # READY, because a CA in that domain had been reached. This tool exists to report domain
+    # controller readiness; a CA server says nothing about whether that domain's controllers are
+    # ready, and reporting an estate ready without having looked at a whole domain's controllers is
+    # the largest false green it can produce.
+    #
+    # DomainControllerServer is what decides coverage when the caller supplies it. Server is still
+    # accepted so a caller that genuinely means "any server" keeps working, and a report that carries
+    # no domain-controller list at all falls back to it rather than declaring every domain missing.
+    # Whether ANY server at all was seen, captured BEFORE coverage is narrowed to domain controllers.
+    # This is what distinguishes "nothing was found anywhere" (a different and more serious failure,
+    # already reported as an empty scan) from "servers were found but not one of them was a domain
+    # controller" - which is the case this function has to catch.
+    $anyServerSeen = $examined.Count -gt 0
+    if ($null -ne $DomainControllerServer) {
+        $dcDomains = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($dc in @($DomainControllerServer | Where-Object { $_ })) {
+            $d = & $normalise $dc.Domain
+            if (-not [string]::IsNullOrWhiteSpace($d)) { [void] $dcDomains.Add($d) }
+        }
+        # Assigned UNCONDITIONALLY. It used to be guarded by "if ($dcDomains.Count -gt 0)", which
+        # defeated the rule directly above in the one case that matters most: when domain-controller
+        # discovery returned NOTHING AT ALL, the guard did not fire, coverage fell back to the
+        # all-roles set, and the certification authorities' own domains marked every scoped domain
+        # examined. Measured on the shipped functions - two domains in scope, ZERO domain controllers
+        # discovered in either, one CA reached in each - the report read "2 server(s) across 2
+        # domain(s)", "Overall check score 100%, 10 of 10 checks passed", hero verdict "All
+        # prerequisites met", verdict Ready with 0 issues and exit code 0, while the domain controller
+        # table on the same page said there were none. A forest whose controllers were never looked at
+        # was certified ready.
+        $examined = $dcDomains
+    }
+    # A scan that produced no servers anywhere is the empty-scan case, reported separately; naming
+    # every domain here would bury it under per-domain noise. Gated on whether any server was seen
+    # rather than on the (now possibly empty) domain-controller set, so total domain-controller loss
+    # is still reported.
+    if (-not $anyServerSeen) { return @() }
+
+    # De-duplicated on the way out as well: two spellings of one missing domain are one finding.
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    @(foreach ($s in $scoped) {
+            $n = & $normalise $s
+            if ([string]::IsNullOrWhiteSpace($n)) { continue }
+            if ($examined.Contains($n)) { continue }
+            if ($seen.Add($n)) { $s }
+        })
+}
+
+function Get-mdiDomainCheckState {
+    <#
+        The per-domain directory checks as name/value triples, with the same tri-state meaning the
+        server checks carry: $true passed, $false measured failure, $null not measured.
+
+        These live on the REPORT rather than on any server object, and the score never looked at them.
+        The consequence was the worst kind of disagreement this tool can produce: a domain whose object
+        auditing was measured as not configured left every server check passing, so the score card read
+        "100% - 9 of 9 checks passed" with an ok tone, the readiness donut drew a solid green ring, and
+        the "servers fully ready" card said 1/1 "All checks passed" - while the verdict was NOT READY
+        and the issue list carried a High finding for the same run. The console line was truthful. The
+        two surfaces an operator actually looks at first were not, and they were the reassuring ones.
+
+        Built from the same list, in the same order, with the same legacy fallback and the same
+        pass rule (Test-mdiDomainCheckPassed) that Get-mdiIssueList and Test-mdiReadinessResult use, so
+        the score cannot drift from the findings table or the exit code.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $ReportData
+    )
+
+    if ($null -eq $ReportData) { return @() }
+
+    # The same legacy fallback the verdict and the issue list use: a report written before
+    # DomainAuditing existed carries the four values directly on the report instead.
+    $audited = @($ReportData.DomainAuditing | Where-Object { $_ })
+    if ($audited.Count -eq 0) {
+        $audited = @([PSCustomObject]@{
+                Domain           = $ReportData.Domain
+                AdfsAuditing     = $ReportData.DomainAdfsAuditing
+                ObjectAuditing   = $ReportData.DomainObjectAuditing
+                ExchangeAuditing = $ReportData.DomainExchangeAuditing
+                DeletedObjects   = $ReportData.DomainDeletedObjects
+            })
+    }
+
+    @(foreach ($domain in $audited) {
+            foreach ($check in @(Get-mdiDomainCheckDefinition -Domain $domain)) {
+                # A check whose result object is absent altogether is not part of this report at all -
+                # a legacy report, or a role that was never examined - and counting it would charge a
+                # scan for something it was never asked to do. Only checks the report actually carries
+                # are scored.
+                if ($null -eq $check.Result) { continue }
+
+                # Asked of nothing, so scored as nothing. Test-mdiDomainCheckPassed already returns
+                # true for this state so the verdict and the issue list leave it alone, but counting
+                # it as a PASSED check here would report a check that asserted nothing as one that
+                # succeeded - which is the same false green from the other direction.
+                if (Test-mdiDomainCheckNotAsserted -Result $check.Result) { continue }
+
+                $state = if ([string] $check.Value -eq 'False') { $false }
+                elseif ($check.Measured -eq $false) { $null }
+                elseif (Test-mdiDomainCheckPassed -Result $check.Result -Value $check.Value -RoleMayBeAbsent:([bool] $check.RoleMayBeAbsent)) { $true }
+                else { $null }
+
+                [PSCustomObject]@{ Domain = [string] $domain.Domain; Name = [string] $check.Name; Value = $state }
+            }
+        })
+}
+
+function Get-mdiDomainCheckDefinition {
+    <#
+        The four domain-level checks, their values, and whether 'N/A' is a legitimate answer for each.
+
+        ONE definition. This table was written out twice - once for the check state that feeds the
+        score, once for the issue list - and the two copies disagreed about a single flag: Deleted
+        Objects carried RoleMayBeAbsent = $true in the scoring copy and $false in the issue list. So a
+        domain whose Deleted Objects permission returned 'N/A' was scored as a PASSED check while the
+        issue list simultaneously reported it unverified: the console read "1 issue(s) found: 7/7
+        checks passed" and the score card read 100%, over a finding saying the check produced no
+        usable result. The verdict, which is a third reader of the same fact, agreed with the issue
+        list - so the scoring copy was the outlier, and the flag is $false here.
+
+        RoleMayBeAbsent is only true where the ROLE itself may genuinely not exist in the domain:
+        AD FS and Exchange. Every domain has a Deleted Objects container, so 'N/A' there is a gap in
+        the measurement, never a legitimate answer.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)] [AllowNull()] $Domain
+    )
+
+    # Measured used to be read ONLY from the row-level companion property. When that companion is
+    # absent - the legacy row shape the shipped fallback path still produces - it came back $null,
+    # every downstream test of the form "$check.Measured -eq $false" was therefore false, and the
+    # check was treated as MEASURED. An isExchangeAuditingOk of 'N/A' carrying Measured = $false ON
+    # THE RESULT OBJECT ITSELF then fell into the role-absent branch: scored as PASSED, the unread
+    # count dropped from 1 to 0, the issue disappeared, the verdict flipped from NOT READY to READY,
+    # and the cell asserted "Not applicable: this role was not found in this domain" about a SACL that
+    # had simply not been readable. The identical fact in the modern shape scores unread and renders
+    # "Not tested".
+    #
+    # The companion still wins when it is present, so nothing that sets it changes behaviour. The
+    # result object is consulted only as the fallback it was always meant to be, and a shape carrying
+    # neither still yields $null - the pre-existing "no information either way" case.
+    $resolveMeasured = {
+        param($Companion, $Result)
+        if ($null -ne $Companion) { return [bool] $Companion }
+        if ($null -ne $Result -and $null -ne $Result.PSObject.Properties['Measured']) { return [bool] $Result.Measured }
+        return $null
+    }
+
+    @(
+        @{ Name = 'Object auditing'; Result = $Domain.ObjectAuditing; Value = $Domain.ObjectAuditing.isObjectAuditingOk; Measured = (& $resolveMeasured $Domain.ObjectAuditingMeasured $Domain.ObjectAuditing); RoleMayBeAbsent = $false },
+        @{ Name = 'Exchange auditing'; Result = $Domain.ExchangeAuditing; Value = $Domain.ExchangeAuditing.isExchangeAuditingOk; Measured = (& $resolveMeasured $Domain.ExchangeAuditingMeasured $Domain.ExchangeAuditing); RoleMayBeAbsent = $true },
+        @{ Name = 'AD FS auditing'; Result = $Domain.AdfsAuditing; Value = $Domain.AdfsAuditing.isAdfsAuditingOk; Measured = (& $resolveMeasured $Domain.AdfsAuditingMeasured $Domain.AdfsAuditing); RoleMayBeAbsent = $true },
+        @{ Name = 'Deleted Objects container permission'; Result = $Domain.DeletedObjects; Value = $Domain.DeletedObjects.isDeletedObjectsPermissionOk; Measured = (& $resolveMeasured $Domain.DeletedObjectsMeasured $Domain.DeletedObjects); RoleMayBeAbsent = $false }
+    )
 }
 
 function Get-mdiReportStatistics {
@@ -6065,35 +10738,218 @@ function Get-mdiReportStatistics {
                 Where-Object { $_ }))
     # Reachability is decided by the explicit flag, not by whether a Comment exists. A server that was
     # reached and then failed one check part way through also carries a Comment, and counting it as
-    # unreachable discarded every result it had already produced.
-    $reachable = @($allServers | Where-Object { -not $_.Unreachable })
-    $unreachable = @($allServers | Where-Object { $_.Unreachable })
+    # unreachable discarded every result it had already produced. The flag itself is normalised by
+    # Test-mdiServerIsUnreachable, which is shared with the verdict so the two cannot disagree.
+    $reachable = @($allServers | Where-Object { -not (Test-mdiServerIsUnreachable -Server $_) })
+    $unreachable = @($allServers | Where-Object { Test-mdiServerIsUnreachable -Server $_ })
+    # The SERVER-COUNT populations exclude discovery placeholders. A placeholder stays in the score
+    # (its unread check is the whole point of emitting it) and stays in ReachableList (the issue list
+    # reports its Comment), but it is not a machine and counting it as one made three headline numbers
+    # lie at once on a one-server estate whose AD CS enumeration was denied: "Servers scanned 2",
+    # "Servers fully ready 1/2" - a ratio that can never be reached - and a console reading "across 2
+    # server(s)". The equivalent unreachable-server gap was already kept out of these counts, so the
+    # two surfaces of one idea disagreed.
+    #
+    # TotalServers can now fall to zero on a run that produced only placeholders, which is correct:
+    # nothing was actually examined, and the empty-scan banner and exit code are the honest result.
+    $realServers = @($allServers | Where-Object { -not (Test-mdiServerIsPlaceholder -Server $_) })
+    $reachableReal = @($reachable | Where-Object { -not (Test-mdiServerIsPlaceholder -Server $_) })
 
     # Every boolean property on a server object is a readiness check, so the score works for domain controllers,
     # CA servers and Entra Connect servers alike without hard-coding the individual check names.
     $serverScores = @(foreach ($srv in $reachable) {
-            $bools = Get-mdiCheckProperty -Server $srv
-            $passed = @($bools | Where-Object { $_.Value }).Count
+            # The measurement is applied here, so the score cannot disagree with the verdict about
+            # whether a server's required ports are in order.
+            $bools = @(Get-mdiEffectiveCheckProperty -Server $srv)
+            $passed = @($bools | Where-Object { $_.Value -eq $true }).Count
             # Checks that returned 'N/A' were not measured. They are counted separately so the report can
             # say how much of the estate it actually managed to look at: a run where almost nothing was
             # readable produced a perfect "5/5 checks passed" headline, which is the most misleading
             # output this tool can produce.
-            $unread = Get-mdiUnreadCheckCount -Server $srv
+            #
+            # RequiredPorts is excluded from the stored-property count and taken from the effective view
+            # instead, so a summary of 'N/A' that the measurement has since resolved is not counted twice.
+            $unread = Get-mdiUnreadCheckCount -Server $srv -ExcludeName $script:mdiRequiredPortsCheckName
+            $unread += @($bools | Where-Object { [string] $_.Value -eq 'N/A' }).Count
+            $measuredChecks = @($bools | Where-Object { $_.Value -is [bool] })
+            $total = $measuredChecks.Count
+
+            # A discovery placeholder carries no check properties at all, so everything above charged
+            # it nothing: Passed 0, Total 0, Unread 0 - a row that lands on NEITHER side of the score.
+            # The note below has always claimed "its unread check is unaffected, so the check score
+            # still charges the gap", and that was simply not true. Measured: a one-server estate
+            # whose AD CS role could not be enumerated rendered "Overall check score 100%" with an
+            # 'ok' GREEN badge and a solid green donut, directly beside a High finding saying the role
+            # could not be enumerated, under a verdict of NOT READY.
+            #
+            # Charged one unread, exactly as an unreachable server, an unexamined domain and an
+            # incomplete forest discovery already are, and for the same reason: not looked at is not
+            # passed. Guarded on having measured nothing, so a placeholder that did carry a readable
+            # check is not charged twice.
+            $isPlaceholder = Test-mdiServerIsPlaceholder -Server $srv
+            if ($isPlaceholder -and $total -eq 0 -and $unread -eq 0) { $unread = 1 }
+
             [PSCustomObject]@{
                 FQDN     = [string] $srv.FQDN
                 Passed   = $passed
-                Total    = $bools.Count
-                Failed   = $bools.Count - $passed
+                Total    = $total
+                Failed   = $total - $passed
                 Unread   = $unread
+                # Discriminates a REAL server from the synthetic rows appended below. The check
+                # aggregates want every row; the server-count KPIs want only the real ones, and
+                # counting a placeholder as a server broke the overview's own stated invariant
+                # (ready + attention + unmeasured = reachable) and rendered "2/2 servers fully
+                # ready" in green over an estate with an unexamined domain.
+                #
+                # A discovery placeholder emitted by a PRODUCER - an AD CS or Entra Connect role
+                # that could not be enumerated - reaches this loop inside the real server
+                # collections rather than being appended below, and so was classified 'Server'
+                # here: a one-server estate whose CA enumeration was denied reported "across 2
+                # server(s)" and "Servers fully ready 1/2". It is the same unmeasured population as
+                # the rows below, so it carries the same Kind.
+                Kind     = $(if ($isPlaceholder) { 'Unmeasured' } else { 'Server' })
             }
         })
 
+    # A domain that was in scope but produced NO servers was never examined, and a domain that
+    # contributes no servers contributes no checks either - so it was absent from the numerator AND
+    # from the denominator, and the coverage percentage read a confident 100% over a domain nobody had
+    # looked at. The verdict already refused to call such a run READY, so the headline number and the
+    # verdict directly contradicted each other; of the two, the percentage is what gets screenshotted.
+    #
+    # Charging one unread per unexamined domain puts it in the denominator, which is the same
+    # treatment an unreadable check gets and for the same reason: not measured is not passed.
+    # One definition of "in scope but never examined", shared with the issue list and the verdict.
+    # The domain-controller list is WRAPPED for the same reason it is in the verdict: $ReportData is
+    # declared [object[]], so member enumeration over the one-element wrapper collapses an EMPTY
+    # DomainControllers array to $null, and the helper then falls back to "any server" - letting a
+    # certification authority mark its domain covered on a run that discovered no controllers at all.
+    $serverScores = @($serverScores) + @(
+        Get-mdiUnexaminedDomain -ScopedDomain $ReportData.DomainsInScope -Server $allServers -DomainControllerServer @($ReportData.DomainControllers) |
+            ForEach-Object {
+                [PSCustomObject]@{
+                    FQDN   = 'Domain not examined - {0}' -f $_
+                    Passed = 0
+                    Total  = 0
+                    Failed = 0
+                    Unread = 1
+                    Kind   = 'Unmeasured'
+                }
+            })
+
+    # A server that never answered is unmeasured population, and it was absent from the numerator
+    # AND the denominator - so LOSING a server improved the headline. Measured: four domain
+    # controllers, one reachable and passing its three checks, rendered "Overall check score 100%,
+    # 3 of 3 checks passed" in green with a solid green readiness donut, directly beside a red
+    # "3 not reachable" card, above an Issues table with three findings, under a verdict of NOT
+    # READY. Five surfaces on one page, and the two that get screenshotted were the wrong two.
+    #
+    # Charged exactly as an unexamined domain is, and for the same reason: not reached is not
+    # passed. One unread per unreachable server puts it in the denominator and gives it the grey
+    # "not read" arc in the donut, which is the honest picture.
+    $serverScores = @($serverScores) + @(
+        foreach ($srv in $unreachable) {
+            [PSCustomObject]@{
+                FQDN   = [string] $srv.FQDN
+                Passed = 0
+                Total  = 0
+                Failed = 0
+                Unread = 1
+                Kind   = 'Unmeasured'
+            }
+        })
+
+    # An incomplete forest discovery is unmeasured SCOPE. When the domains could not be enumerated the
+    # run examined whatever it could reach and cannot even name what it missed - so unlike an
+    # unexamined domain there is nothing to list, and the gap was absent from the numerator AND the
+    # denominator. The console read "1 issue(s) found: 7/7 checks passed" and the score card 100%,
+    # beside a High finding saying the forest domains could not be enumerated and a NOT READY verdict.
+    # Charged one unread, the same treatment an unexamined domain and an unreachable server already
+    # get, and for the same reason: not looked at is not passed.
+    if ($null -ne $ReportData.ForestDiscovery -and
+        $null -ne $ReportData.ForestDiscovery.PSObject.Properties['Complete'] -and
+        (ConvertTo-mdiBoolean $ReportData.ForestDiscovery.Complete) -ne $true) {
+        $serverScores = @($serverScores) + @([PSCustomObject]@{
+                FQDN   = 'Forest not fully enumerated'
+                Passed = 0
+                Total  = 0
+                Failed = 0
+                Unread = 1
+                Kind   = 'Unmeasured'
+            })
+    }
+
+    # The chart is built in TWO passes, from the SAME definition of "unread" the per-server score uses.
+    #
+    # Counting only what each server reports made Total the number of servers the check could be READ
+    # on: a prerequisite readable on one server out of four, and passing there, rendered a full-width
+    # green "1/1 (100%)" bar while the score card on the same page counted three unread checks. And
+    # testing the value's type inside the loop cannot fix it, because Get-mdiCheckProperty drops any
+    # value that does not parse to a boolean - an 'N/A' check is ABSENT from its output, so a check
+    # unread on EVERY server disappeared from the chart altogether while the score still charged it.
+    #
+    # First pass collects, per server, the checks it measured and the checks it could not read, and
+    # unions the names. Second pass fills in every server against every name. The two totals now
+    # reconcile by construction rather than by two functions happening to agree.
     $checkTotals = @{}
-    foreach ($srv in $reachable) {
-        foreach ($prop in (Get-mdiCheckProperty -Server $srv)) {
-            if (-not $checkTotals.ContainsKey($prop.Name)) { $checkTotals[$prop.Name] = @{ Pass = 0; Total = 0 } }
-            $checkTotals[$prop.Name].Total++
-            if ($prop.Value) { $checkTotals[$prop.Name].Pass++ }
+    $allCheckName = New-Object 'System.Collections.Generic.HashSet[string]'
+    # Built from ALL servers, not just the reachable ones. Iterating $reachable meant an unreachable
+    # server left BOTH sides of every bar, so losing servers made the chart GREENER: measured with 49
+    # of 50 domain controllers unreachable, every bar rendered a solid green "1/1 (100%)" beside a
+    # score card reading "12%, 7 of 56 checks passed, 49 not measured" on the same page. The identical
+    # estate with those 49 servers REACHABLE but unreadable rendered "1/50 (2%), 49 not read" in warn -
+    # so the same fact, one server measured out of fifty, was drawn two completely different ways
+    # depending only on WHY the other forty-nine were not measured, and the unreachable case - the
+    # more serious one - was the one that looked perfect.
+    #
+    # An unreachable server contributes through exactly the same paths as any other: its non-boolean
+    # check properties fall into $unreadName below, and a server carrying no check properties at all
+    # is still "absent entirely" and charged to neither side, which is what keeps a certification
+    # authority from being charged for domain-controller-only checks.
+    $serverChecks = @(foreach ($srv in $allServers) {
+            $measured = @{}
+            foreach ($prop in @(Get-mdiEffectiveCheckProperty -Server $srv)) {
+                if ($prop.Value -isnot [bool]) { continue }
+                $measured[[string] $prop.Name] = $prop.Value
+                [void] $allCheckName.Add([string] $prop.Name)
+            }
+            # RequiredPorts is excluded for the same reason the score excludes it: the measurement has
+            # already resolved it above, so counting the stored summary as well would double-count.
+            $unreadName = New-Object 'System.Collections.Generic.HashSet[string]'
+            foreach ($name in @(Get-mdiUnreadCheckName -Server $srv -ExcludeName $script:mdiRequiredPortsCheckName)) {
+                if ($measured.ContainsKey($name)) { continue }
+                [void] $unreadName.Add($name)
+                [void] $allCheckName.Add($name)
+            }
+            foreach ($prop in @(Get-mdiEffectiveCheckProperty -Server $srv)) {
+                if ($prop.Value -is [bool]) { continue }
+                [void] $unreadName.Add([string] $prop.Name)
+                [void] $allCheckName.Add([string] $prop.Name)
+            }
+            # A scan that stopped part way never added the checks it did not reach, so they cannot be
+            # named. The score charges one unread for that; naming it here lets the chart show the
+            # same fact instead of silently disagreeing with the score by one. An unreachable server
+            # is the same situation in its strongest form - nothing at all was read - so it is named
+            # the same way rather than vanishing from the chart.
+            if ($unreadName.Count -eq 0 -and
+                ($srv.PartialFailure -eq $true -or (Test-mdiServerIsUnreachable -Server $srv))) {
+                [void] $unreadName.Add($script:mdiIncompleteScanCheckName)
+                [void] $allCheckName.Add($script:mdiIncompleteScanCheckName)
+            }
+            [PSCustomObject]@{ Measured = $measured; Unread = $unreadName }
+        })
+
+    foreach ($name in $allCheckName) {
+        $checkTotals[$name] = @{ Pass = 0; Total = 0; Unread = 0 }
+        foreach ($entry in $serverChecks) {
+            if ($entry.Measured.ContainsKey($name)) {
+                $checkTotals[$name].Total++
+                if ($entry.Measured[$name]) { $checkTotals[$name].Pass++ }
+            } elseif ($entry.Unread.Contains($name)) {
+                $checkTotals[$name].Unread++
+            }
+            # Absent entirely on this server: not counted either way. A certification authority
+            # legitimately carries fewer checks than a domain controller.
         }
     }
 
@@ -6113,10 +10969,84 @@ function Get-mdiReportStatistics {
     # address as far as the sensor is concerned - it resolves whatever source address it observed - so
     # counting it once per name let a host with one working NIC and one blocked NIC score as fully
     # resolvable, which is precisely the shape of the alert this tool is meant to explain.
-    $nnrTargets = @($nnrRecords | Group-Object -Property Server, Target, TargetIP)
+    # Grouped with an explicit key, the same way Get-mdiBlockingPortFailure builds one. Group-Object
+    # collapses ALL null or empty key values into a single shared group, so two records that should be
+    # distinct - a success and a failure that merely happen to share an empty Target or TargetIP -
+    # merged, and the success then covered the failure. The KPI read "1 of 1 resolvable" while the
+    # verdict raised a blocking finding for the same two records: the two views of one fact disagreeing,
+    # with the headline number being the one that looked clean. A record with any empty key is given a
+    # unique key and judged alone, which is the conservative choice.
+    $nnrKeySeparator = [string][char]31
+    $nnrTargets = @($nnrRecords | Group-Object -Property {
+            $keys = @($_.Server, $_.Target, $_.TargetIP)
+            if (@($keys | Where-Object { [string]::IsNullOrWhiteSpace([string] $_) }).Count -gt 0) {
+                [guid]::NewGuid().ToString()
+            } else {
+                ($keys | ForEach-Object { [string] $_ }) -join $nnrKeySeparator
+            }
+        })
+    # Split three ways, not two. A target is only "not resolvable" when at least one method was
+    # actually MEASURED and every measured method failed. A target whose every method was never run
+    # was previously lumped in with the failures, so the KPI rendered a red "0/1" captioned "Lowers
+    # the name resolution rate" - a measured-sounding indictment of a firewall that nobody had
+    # observed - while the issue table on the same page correctly said name resolution "could not be
+    # tested". The blocking-failure layer already draws exactly this distinction (NnrMeasured versus
+    # NnrUntested); the statistics did not, so the two views of one fact disagreed and the headline
+    # was the pessimistic one. The same not-tested pattern is used here so they cannot drift apart.
+    $nnrMeasuredIn = {
+        param($grp)
+        @($grp | Where-Object { Test-mdiProbeWasMeasured -Record $_ })
+    }
     $nnrResolvable = @($nnrTargets | Where-Object { @($_.Group | Where-Object { $_.Success }).Count -gt 0 })
+    $nnrUntested = @($nnrTargets | Where-Object {
+            @($_.Group | Where-Object { $_.Success }).Count -eq 0 -and
+            @(& $nnrMeasuredIn $_.Group).Count -eq 0
+        })
+
+    # How many distinct HOSTS name resolution was probed against, regardless of how many sensors
+    # probed each one. Identified by target name where there is one and by address otherwise, so a
+    # target recorded only as an IP still counts once rather than being discarded.
+    $nnrDistinctTarget = @($nnrRecords | ForEach-Object {
+            $t = [string] $_.Target
+            if ([string]::IsNullOrWhiteSpace($t)) { $t = [string] $_.TargetIP }
+            $t
+        } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+
+    # The same question the NNR card answers, asked of the ORDINARY port probes: was the estate
+    # probed, or a sample of it? -MaxLdapTargetsPerDomain defaults to 2, so on any domain with more
+    # than two domain controllers the default run probes a SAMPLE - and the card read "Required ports
+    # open 8/8, No required port blocked" with nothing saying so. That is the same illusion the NNR
+    # card was corrected for: a green ratio over a fraction of the estate, on the surface an operator
+    # reads first after an alert about blocked traffic.
+    $portDistinctTarget = @($portRecords | Where-Object { [string] $_.Group -ne 'NNR' } | ForEach-Object {
+            $t = [string] $_.Target
+            if ([string]::IsNullOrWhiteSpace($t)) { $t = [string] $_.TargetIP }
+            $t
+        } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    # Drawn from the reachable domain controllers, which is the population the LDAP target list is
+    # selected from. An unreachable DC is already reported as unreachable and must not also be
+    # counted as a host the ports probe declined to visit.
+    $portCandidateHost = @(@($ReportData.DomainControllers) | Where-Object { $_ -and -not (Test-mdiServerIsUnreachable -Server $_) } |
+            ForEach-Object { [string] $_.FQDN } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
 
     $v3Servers = @($reachable | Where-Object { $_.Details.SensorV3ReadyDetails })
+    # A reachable server that produced NO v3 detail at all was absent from BOTH sides of the ratio and
+    # vanished from the card. The shipped partial-failure path stops before the v3 read, so LOSING a
+    # server earlier turned an amber "1 could not be evaluated" into a green "1 eligible for in-place
+    # migration" - rendering identically to a clean one-server estate. That is the same "losing a
+    # server improves the headline" shape already fixed for the overall check score, and it is fixed
+    # the same way: the server is UNEVALUATED, not absent. Placeholders are excluded because they are
+    # already counted as unmeasured population in their own right.
+    # NOTE: reachable-but-detail-less servers only. An UNREACHABLE server is deliberately NOT charged
+    # here - see SensorCardsLostServerNotHidden.Tests.ps1, which pins that boundary: an unreachable
+    # server is already reported by the unreachable KPI, the issue list and the verdict, and charging
+    # it to this card as well would report one gap on two surfaces. The "Sensors healthy" card takes
+    # the opposite view and does count it, so the two cards currently disagree about the same server;
+    # that inconsistency is raised for a decision rather than settled unilaterally here.
+    $v3NoDetail = @($reachable | Where-Object { -not $_.Details.SensorV3ReadyDetails -and -not (Test-mdiServerIsPlaceholder -Server $_) })
+    # Domain-level directory checks, resolved once through the same enumerator the issue list and the
+    # verdict use, so the score describes the same population they judge.
+    $domainCheckState = @(Get-mdiDomainCheckState -ReportData $ReportData)
 
     # "Not tested" is not "blocked". The detail table deliberately excludes probes that could not run, so
     # counting them as blocked made the KPI report required ports as blocked while the detail page listed
@@ -6128,11 +11058,19 @@ function Get-mdiReportStatistics {
     # falls through to PortsUntested - it must never be scored as Open (never a pass) or Blocked
     # (nothing was observed to be blocked; sending an operator to open a port that was never probed is
     # the most expensive wrong answer this tool can give).
-    $portTested = @($portRecords | Where-Object { $_.Applicable -eq $true -and [string] $_.Detail -notmatch $portNotTestedPattern })
+    $portTested = @($portRecords | Where-Object { Test-mdiProbeWasMeasured -Record $_ })
 
     [PSCustomObject]@{
-        TotalServers      = $allServers.Count
-        ReachableServers  = $reachable.Count
+        TotalServers      = $realServers.Count
+        # Servers whose scan STOPPED PART WAY. Their remaining checks were never run, so they are
+        # absent rather than false - and on a small estate the handful that did complete can be a
+        # clean sweep of passes over a scan that gave up after the first check. The verdict already
+        # refuses READY on this, but the exit code could not see it and reported the run as an
+        # ordinary issue count, so a pipeline could not tell "the estate has one problem" from "the
+        # scan did not finish". Counted here so the verdict, the console and the exit code all read
+        # one number.
+        PartialScanCount  = @($realServers | Where-Object { $_.PartialFailure -eq $true }).Count
+        ReachableServers  = $reachableReal.Count
         UnreachableCount  = $unreachable.Count
         # Filtered rather than wrapped bare: @($null).Count is 1, not 0, so a report with no
         # DomainsInScope (a null property on a legacy or partial report) counted as "1 domain in
@@ -6144,9 +11082,12 @@ function Get-mdiReportStatistics {
         # against an empty pipeline returns an object whose .Sum is $null, and $null interpolates as
         # an empty string - so a run that reached no servers printed "issue(s) found: / checks passed"
         # with the numbers simply missing.
-        ChecksPassed      = [int] ($serverScores | Measure-Object -Property Passed -Sum).Sum
-        ChecksTotal       = [int] ($serverScores | Measure-Object -Property Total -Sum).Sum
-        ChecksUnread      = [int] ($serverScores | Measure-Object -Property Unread -Sum).Sum
+        # Domain-level directory checks are part of readiness - they fail the verdict - so they are part
+        # of the score too. Left out, a domain measured as having no object auditing produced a solid
+        # green "100%, 9 of 9 checks passed" beside a NOT READY verdict and a High finding.
+        ChecksPassed      = [int] ($serverScores | Measure-Object -Property Passed -Sum).Sum + @($domainCheckState | Where-Object { $_.Value -eq $true }).Count
+        ChecksTotal       = [int] ($serverScores | Measure-Object -Property Total -Sum).Sum + @($domainCheckState | Where-Object { $_.Value -is [bool] }).Count
+        ChecksUnread      = [int] ($serverScores | Measure-Object -Property Unread -Sum).Sum + @($domainCheckState | Where-Object { $null -eq $_.Value }).Count
         CheckTotals       = $checkTotals
         PortsTotal        = $portRecords.Count
         PortsOpen         = @($portTested | Where-Object { $_.Success }).Count
@@ -6159,22 +11100,111 @@ function Get-mdiReportStatistics {
         # PortsRequiredTested - PortsRequiredOpen equals PortsRequiredFail exactly.
         PortsRequiredOpen   = @($portTested | Where-Object { $_.Success -and $_.Requirement -eq 'Required' }).Count
         PortsRequiredTested = @($portTested | Where-Object { $_.Requirement -eq 'Required' }).Count
-        PortsUntested     = @($portRecords | Where-Object { $_.Applicable -ne $true -or [string] $_.Detail -match $portNotTestedPattern }).Count
+        PortsUntested     = @($portRecords | Where-Object { -not (Test-mdiProbeWasMeasured -Record $_) }).Count
+        # Required-only unmeasured count, for the same reason PortsRequiredOpen/PortsRequiredTested
+        # exist. PortsUntested counts every Requirement class, so the "Required ports open" sub-label
+        # built from it described Optional, Recommended and NNR probes as though they were required:
+        # a card reading "2/2" carried "1 probe(s) could not be tested" when the single unmeasured
+        # probe was Optional and every required probe had in fact been measured open. Worse, the
+        # sentence was WORD FOR WORD the one shown when a genuinely required probe was unmeasurable,
+        # so the two cases were indistinguishable, and the count could exceed the headline
+        # denominator outright ("1/1" over "2 probe(s) could not be tested").
+        # Routed through the shared Get-mdiUnmeasuredRequiredProbe rather than an inline filter, so the
+        # card describes exactly the population the verdict and the issue list charge - including
+        # Requirement = 'All' probes, which an inline "-eq 'Required'" silently drops.
+        PortsRequiredUntested = @(Get-mdiUnmeasuredRequiredProbe -Record $portRecords).Count
         NnrTargetCount    = $nnrTargets.Count
         NnrResolvable     = $nnrResolvable.Count
+        NnrUntested       = $nnrUntested.Count
         NnrRecords        = $nnrRecords
         # 'N/A' is a non-empty string and therefore truthy, so a server whose prerequisites could not be
         # read was counted as ready. That inflated the KPI to a green "12/12" while the sensor v3.x tab
         # showed "Not tested" for the same servers, and the wrong number was written into the baseline
         # history where it permanently distorts the trend. Servers that were not evaluated are excluded
         # from the denominator too, so the ratio compares like with like.
-        V3Evaluated       = @($v3Servers | Where-Object { [string] $_.SensorV3Ready -ne 'N/A' }).Count
-        V3Ready           = @($v3Servers | Where-Object { $_.SensorV3Ready -eq $true }).Count
-        V3MigrationReady  = @($v3Servers | Where-Object { $_.Details.SensorV3ReadyDetails.MigrationEligible }).Count
+        #
+        # Normalised rather than compared against the literal 'N/A'. A SensorV3Ready of $null, '' or a
+        # word this script does not recognise is not a measurement either, and excluding only the exact
+        # string 'N/A' counted those as evaluated-and-not-ready: the denominator grew while the
+        # numerator did not, so the KPI fell for servers nobody had actually assessed.
+        V3Evaluated       = @($v3Servers | Where-Object { $null -ne (ConvertTo-mdiBoolean $_.SensorV3Ready) }).Count
+        # Servers carrying v3 detail whose readiness could NOT be determined. Without this the card
+        # divided by the evaluated population alone, so two servers nobody could assess vanished from
+        # both sides and the KPI read a green "1/1" over a v3 tab saying "Not determined" three times.
+        V3Unevaluated     = @($v3Servers | Where-Object { $null -eq (ConvertTo-mdiBoolean $_.SensorV3Ready) }).Count + $v3NoDetail.Count
+        V3Ready           = @($v3Servers | Where-Object { (ConvertTo-mdiBoolean $_.SensorV3Ready) -eq $true }).Count
+        # Compared to $true, never tested for truthiness. MigrationEligible can hold the STRING 'False'
+        # or 'N/A' when the underlying readiness was not measured, and both are non-empty strings and
+        # therefore truthy in PowerShell - so a server that was never evaluated counted as eligible.
+        # That produced a KPI reading "3 eligible" out of 2 servers evaluated, which is the kind of
+        # arithmetic that tells an operator the page is wrong without telling them which half.
+        V3MigrationReady  = @($v3Servers | Where-Object { $_.Details.SensorV3ReadyDetails.MigrationEligible -eq $true }).Count
+        # The population the NNR target list was drawn FROM, so the report can say whether it probed
+        # the estate or a sample of it. Domain controllers only: the NNR sample is drawn from the DC
+        # inventory unless -NnrTargetComputer names specific hosts, and in that case the operator chose
+        # the list and no sampling claim should be made - hence the count matching the distinct target
+        # count and the disclosure staying silent.
+        NnrCandidateCount = $(if (@($ReportData.NnrTargetComputer | Where-Object { $_ }).Count -gt 0) {
+                $nnrDistinctTarget.Count
+            } else {
+                @(@($ReportData.DomainControllers) | Where-Object { $_ -and -not (Test-mdiServerIsUnreachable -Server $_) } |
+                        ForEach-Object { [string] $_.FQDN } | Select-Object -Unique).Count
+            })
+        # DISTINCT targets, which is not NnrTargetCount. That counts (sensor, target) PAIRS - fifty
+        # domain controllers each probing five peers is 250 - because a target resolvable from one
+        # sensor and not from another is two different facts and the KPI must show both. For deciding
+        # whether the estate was sampled the only relevant number is how many distinct hosts were
+        # probed at all, and comparing the estate size against the pair count made the test read
+        # "50 > 250 is false, therefore nothing was sampled" on exactly the large forests where the
+        # sampling matters most.
+        NnrDistinctTargetCount = $nnrDistinctTarget.Count
+        PortCandidateHostCount = $portCandidateHost.Count
+        PortDistinctTargetCount = $portDistinctTarget.Count
         Servers           = $allServers
         ReachableList     = $reachable
         UnreachableList   = $unreachable
     }
+}
+
+function ConvertTo-mdiRecordObject {
+    <#
+        Any dictionary shape turned into a PSCustomObject whose properties are the ENTRIES.
+
+        Casting with [PSCustomObject] is not enough. PowerShell only special-cases Hashtable and
+        OrderedDictionary; hand a cast any other IDictionary - Generic.Dictionary[string,object],
+        SortedDictionary, ListDictionary, HybridDictionary - and it produces an object whose
+        properties are the dictionary's own .NET members (Comparer, Count, Keys, Values, IsReadOnly),
+        with every entry lost. A required port measured as refused then arrives with no Requirement,
+        so it is not counted as a required failure and the server stays in the ready count.
+
+        Copying the keys works for every IDictionary, which is the point: the shape that reaches
+        here comes from whatever produced the report, not from this script.
+    #>
+    param ([Parameter(Mandatory = $false)] [AllowNull()] [object] $Value)
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [Collections.IDictionary]) {
+        $bag = [ordered]@{}
+        # Enumerated rather than read through $Value.Keys. PowerShell resolves a property name against
+        # a dictionary's ENTRIES first, so a record carrying an entry actually called 'Keys' returned
+        # that entry's value instead of the key collection - the conversion then produced one nonsense
+        # property and dropped Port, Requirement, Success and Detail. A required port measured as
+        # refused came back with no Requirement and raised no issue at all.
+        foreach ($entry in $Value.GetEnumerator()) {
+            $name = [string] $entry.Key
+            if ([string]::IsNullOrEmpty($name)) { continue }
+            # A handful of names are reserved on PSObject and make the cast below throw outright,
+            # killing the whole report rather than losing one record. They cannot be represented as
+            # properties, so they are carried under a prefixed name instead of being dropped silently.
+            if ($name -in @('PSObject', 'PSBase', 'PSAdapted', 'PSExtended', 'PSTypeNames', 'pstypenames')) {
+                $bag['_' + $name] = $entry.Value
+                continue
+            }
+            $bag[$name] = $entry.Value
+        }
+        return [PSCustomObject] $bag
+    }
+    $Value
 }
 
 function Get-mdiPortResultRecord {
@@ -6185,8 +11215,36 @@ function Get-mdiPortResultRecord {
     @(foreach ($srv in $Server) {
             $portDetails = $srv.Details.RequiredPortsDetails
             if ($null -eq $portDetails) { continue }
-            foreach ($result in @($portDetails.Results)) {
-                $result | Select-Object -Property *, @{N = 'Server'; E = { $srv.FQDN } }
+            foreach ($portResult in @($portDetails.Results)) {
+                # Success and Applicable are normalised to real booleans here, at the single point every
+                # consumer of these records goes through. Downstream they are tested for truthiness -
+                # "Where-Object { $_.Success }" and "-not $_.Success" - and in PowerShell EVERY non-empty
+                # string is truthy, so a record carrying the STRING 'False' counted as a port that was
+                # open: ports blocked fell to zero, no blocking record was raised and the whole run
+                # verdict came back ready. A live scan writes real booleans, but a report that has been
+                # through a JSON round trip in another tool, edited by hand, or produced by an older
+                # version does not necessarily, and this is the one comparison in the script where
+                # getting it wrong turns a blocked port into a clean bill of health.
+                # No GetNewClosure: Select-Object evaluates these expressions during the pipeline, which
+                # runs inside this iteration, so $portResult and $srv already hold the current values.
+                # Verified with three servers of three records each - every record keeps its own triple.
+                #
+                # A record arriving as a DICTIONARY is converted to an object first. Select-Object
+                # -Property * over an IDictionary enumerates the .NET members of the hashtable itself -
+                # Keys, Values, Count, IsReadOnly - not the entries inside it, so Requirement, Detail
+                # and Port were silently emptied. The consequence was a false green in the worst place:
+                # a required port measured as refused came back with no Requirement, so it counted as
+                # blocked in the port tally but not as a REQUIRED failure, the server stayed in the
+                # ready count, no issue was raised and the verdict read ready. ConvertFrom-Json in
+                # Windows PowerShell 5.1 produces objects, but another tool's JSON, a hand-edited
+                # report or an older version can hand back dictionaries, and this normaliser exists
+                # precisely to absorb that.
+                $record = ConvertTo-mdiRecordObject -Value $portResult
+                $record | Select-Object -Property * -ExcludeProperty Success, Applicable, Server |
+                    Select-Object -Property *,
+                    @{ N = 'Success'; E = { ConvertTo-mdiBoolean $record.Success } },
+                    @{ N = 'Applicable'; E = { ConvertTo-mdiBoolean $record.Applicable } },
+                    @{ N = 'Server'; E = { $srv.FQDN } }
             }
         })
 }
@@ -6224,9 +11282,11 @@ function Get-mdiBlockingPortFailure {
     )
 
     $applicable = @($Record | Where-Object { $_.Applicable -ne $false })
-    $measured = @($applicable | Where-Object {
-            $_.Applicable -eq $true -and [string] $_.Detail -notmatch $script:mdiPortNotTestedPattern
-        })
+    # Measured means the probe ran AND produced a real result. Routed through the shared predicate so
+    # this cannot drift from the statistics and the "could not be tested" table: a record whose
+    # Success normalised to $null was previously counted here as a measured failure, because
+    # "-not $null" is $true, and a port nobody managed to probe was reported as blocked.
+    $measured = @($applicable | Where-Object { Test-mdiProbeWasMeasured -Record $_ })
 
     $blocking = New-Object -TypeName System.Collections.ArrayList
 
@@ -6250,10 +11310,13 @@ function Get-mdiBlockingPortFailure {
                     ($keys | ForEach-Object { [string] $_ }) -join $groupKeySeparator
                 }
             })) {
-        $groupMeasured = @($group.Group | Where-Object {
-                $_.Applicable -eq $true -and [string] $_.Detail -notmatch $script:mdiPortNotTestedPattern
-            })
-        if (@($groupMeasured | Where-Object { $_.Success }).Count -gt 0) { continue }
+        # The shared predicate again, not a sixth longhand copy. This one still tested only Applicable
+        # and the Detail text, so an NNR method whose Success normalised to $null counted as MEASURED
+        # here - and since it was not a success, the group was classified 'NnrMeasured': "no NNR method
+        # could resolve X", a name-resolution failure that may justify a firewall change. Nothing had
+        # been observed. The statistics on the same page called the identical group NnrUntested.
+        $groupMeasured = @($group.Group | Where-Object { Test-mdiProbeWasMeasured -Record $_ })
+        if (@($groupMeasured | Where-Object { $_.Success -eq $true }).Count -gt 0) { continue }
         if ($groupMeasured.Count -gt 0) {
             # At least one method was measured and every measured method failed: name resolution was
             # observed to fail. One representative per target keeps the finding to one line per target.
@@ -6307,31 +11370,38 @@ function Get-mdiIssueList {
         }
         foreach ($domain in $auditedDomains) {
             $domainName = [string] $domain.Domain
-            foreach ($check in @(
-                    @{ Name = 'Object auditing'; Value = $domain.ObjectAuditing.isObjectAuditingOk; Measured = $domain.ObjectAuditingMeasured },
-                    @{ Name = 'Exchange auditing'; Value = $domain.ExchangeAuditing.isExchangeAuditingOk; Measured = $domain.ExchangeAuditingMeasured },
-                    @{ Name = 'AD FS auditing'; Value = $domain.AdfsAuditing.isAdfsAuditingOk; Measured = $domain.AdfsAuditingMeasured },
-                    @{ Name = 'Deleted Objects container permission'; Value = $domain.DeletedObjects.isDeletedObjectsPermissionOk; Measured = $domain.DeletedObjectsMeasured }
-                )) {
+            foreach ($check in @(Get-mdiDomainCheckDefinition -Domain $domain)) {
                 if ([string] $check.Value -eq 'False') {
                     [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = $domainName; Area = 'Directory auditing'
-                            Issue = ('{0} is not configured on this domain' -f $check.Name)
+                            Issue = Get-mdiDomainCheckIssueText -CheckName $check.Name
                         })
                 } elseif ($check.Measured -eq $false) {
                     [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = $domainName; Area = 'Directory auditing'
-                            Issue = ('{0} could not be read on this domain, so it is unverified' -f $check.Name)
+                            Issue = Get-mdiDomainCheckIssueText -CheckName $check.Name -Unverified
                         })
-                }
-            }
+                } elseif (-not (Test-mdiDomainCheckPassed -Result $check.Result -Value $check.Value -RoleMayBeAbsent:([bool] $check.RoleMayBeAbsent))) {
+                    # Neither a measured failure nor an explicit "could not read", but still not a
+                    # measurement: $null, '', 0, 1 or a word like 'Unknown'. The verdict now refuses to
+                    # call these a pass, so the issue list has to name them or the run comes back NOT
+                    # READY with nothing in the table to act on.
+                    [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = $domainName; Area = 'Directory auditing'
+                            Issue = ('{0} returned no usable result on this domain, so it is unverified' -f $check.Name)
+                        })
+                }            }
         }
 
-        # A -Forest run that fell back to a single domain examined none of the others.
+        # A -Forest run that fell back to a single domain examined none of the others. A Complete value
+        # that is not a measurement at all is treated the same way: it does not prove enumeration
+        # finished, and the verdict no longer accepts it either.
         if ($null -ne $ReportData.ForestDiscovery -and
             $null -ne $ReportData.ForestDiscovery.PSObject.Properties['Complete'] -and
-            [string] $ReportData.ForestDiscovery.Complete -eq 'False') {
+            (ConvertTo-mdiBoolean $ReportData.ForestDiscovery.Complete) -ne $true) {
+            $reason = if ([string]::IsNullOrWhiteSpace([string] $ReportData.ForestDiscovery.Error)) {
+                'forest discovery did not report whether it completed'
+            } else { [string] $ReportData.ForestDiscovery.Error }
             [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $ReportData.Forest; Area = 'Forest discovery'
                     Issue = ('The forest domains could not be enumerated, so only {0} was examined: {1}' -f
-                        [string] $ReportData.Domain, [string] $ReportData.ForestDiscovery.Error)
+                        [string] $ReportData.Domain, $reason)
                 })
         }
 
@@ -6340,15 +11410,53 @@ function Get-mdiIssueList {
         # report written before servers carried a Domain property, but it also silenced the total
         # failure case, leaving the verdict at "not ready" with an empty issues table and nothing for
         # the operator to act on.
-        $scoped = @($ReportData.DomainsInScope | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })
-        $represented = @(@($Statistics.Servers) | ForEach-Object { [string] $_.Domain } |
-                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
-        if ($represented.Count -gt 0 -or [int] $Statistics.TotalServers -eq 0) {
-            foreach ($missing in @($scoped | Where-Object { $_ -notin $represented })) {
-                [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $missing; Area = 'Discovery'
-                        Issue = 'No server could be enumerated in this domain, so none of it was examined'
-                    })
-            }
+        # One definition of "in scope but never examined", shared with the statistics and the verdict,
+        # so the three views cannot drift apart - and case-insensitive, trailing-dot-insensitive, which
+        # the three hand-written copies were not.
+        $unexamined = if ([int] $Statistics.TotalServers -eq 0) {
+            # Nothing was enumerated ANYWHERE, so every domain in scope is unexamined. The shared
+            # helper deliberately returns nothing in that case - it is the far more serious empty-scan
+            # failure, reported separately - but the issue list is exactly where the operator needs the
+            # domains named, otherwise the verdict sits at "not ready" over an empty table.
+            @($ReportData.DomainsInScope | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })
+        } else {
+            Get-mdiUnexaminedDomain -ScopedDomain $ReportData.DomainsInScope -Server $Statistics.Servers -DomainControllerServer @($ReportData.DomainControllers)
+        }
+        foreach ($missing in $unexamined) {
+            [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $missing; Area = 'Discovery'
+                    # Worded for what is actually true. Coverage is decided on DOMAIN CONTROLLERS, so
+                    # this fires for a domain that produced none - even when a certification authority
+                    # or an Entra Connect server in it WAS reached. Saying "no server" there would be
+                    # contradicted by the server table on the same page.
+                    Issue = 'No domain controller could be enumerated in this domain, so its controllers were not examined'
+                })
+        }
+
+        # A domain that contributed no LDAP probe target was never included in the shared port plan, so
+        # no sensor was ever asked whether it can reach that domain's controllers. Main already warns
+        # "it will be reported as unverified rather than ready" and records the domains for exactly this
+        # purpose - but nothing read the field, so the promise was never kept: the run reached READY,
+        # the issue list was empty and -FailOnIssues exited 0 over an unmeasured sensor-to-domain path.
+        # This is a GAP, not an observed failure, so it is filed under 'Not measured' alongside the
+        # untested required probes rather than being charged as a blocked port.
+        $alreadyUnexamined = @($unexamined | ForEach-Object { ([string] $_).Trim().TrimEnd('.') })
+        foreach ($gapDomain in @($ReportData.LdapPlanGapDomains | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })) {
+            # A domain that produced no servers at all is already named above; repeating it here would
+            # give the operator two lines for one hole.
+            $normalised = ([string] $gapDomain).Trim().TrimEnd('.')
+            if ($alreadyUnexamined -contains $normalised) { continue }
+            [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = $normalised; Area = 'Not measured'
+                    Issue = 'No LDAP probe target could be built for this domain, so no sensor was asked whether it can reach its domain controllers'
+                })
+        }
+
+        # Same shape for the Network Name Resolution targets the operator named by hand: a host that
+        # resolved to no address was dropped from the probe plan, and without this the run answered
+        # "can the sensor resolve this workstation?" with silence.
+        foreach ($nnrTarget in @($ReportData.NnrUnresolvedTargets | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })) {
+            [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = ([string] $nnrTarget).Trim(); Area = 'Not measured'
+                    Issue = 'This Network Name Resolution target could not be resolved to an address, so no sensor was asked to resolve it'
+                })
         }
     }
 
@@ -6367,6 +11475,30 @@ function Get-mdiIssueList {
             })
     }
     foreach ($srv in $Statistics.ReachableList) {
+        # A discovery placeholder is not a server, and the generic unread-check loop below described
+        # it as one: an AD CS role whose enumeration was denied produced "Sensor Health could not be
+        # read on this server, so its state is unknown", sending the operator to look at a sensor on
+        # a machine that does not exist. The row already carries the real cause in its Comment - the
+        # directory read that failed, and the -CAServer / -EntraConnectServer switch that works
+        # around it - so that is what is reported, once, and the generic per-property lines are
+        # skipped for this row.
+        if (Test-mdiServerIsPlaceholder -Server $srv) {
+            # The Comment carries the real cause, but it is not guaranteed to be there: a producer
+            # that had nothing to say, or a report that has been through a JSON round trip, leaves it
+            # empty - and this branch then added a HIGH severity finding with NO TEXT AT ALL. The
+            # issues table rendered a row with a server name and a blank cell, and because the
+            # 'continue' below suppresses the generic per-property lines, nothing else in the report
+            # described the gap either. A finding the operator cannot act on is worse than no finding,
+            # because it still fails the run.
+            $placeholderIssue = ([string] $srv.Comment).Trim()
+            if ([string]::IsNullOrEmpty($placeholderIssue)) {
+                $placeholderIssue = 'This role could not be enumerated, so nothing on it was checked. Name the server explicitly with -CAServer or -EntraConnectServer to have it verified.'
+            }
+            [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Discovery'
+                    Issue = $placeholderIssue
+                })
+            continue
+        }
         # A server whose testing stopped early is reported. Its remaining checks were never run, so
         # they are absent rather than false and nothing else in this list would mention it - the run
         # was not ready and the reader had no way to see why.
@@ -6386,6 +11518,14 @@ function Get-mdiIssueList {
         foreach ($prop in @(Get-mdiCheckProperty -Server $srv | Where-Object { -not $_.Value })) {
             if ($prop.Name -eq 'RequiredPorts' -and $hasPortDetail) { continue }
             if ($prop.Name -eq 'SensorV3Ready' -and $hasV3Detail) { continue }
+            # A check with its own dedicated finding further down is skipped here. The generic line
+            # says "Time Sync check failed"; the dedicated one says "Clock skew is 12 minutes" - the
+            # same fact twice, and the generic wording carries no detail anyone can act on. Worse, the
+            # remediation generator maps the dedicated finding to a scripted fix and cannot map the
+            # generic duplicate to anything, so it listed it under "findings that need manual
+            # attention" immediately after generating the automatic fix for it.
+            if ($prop.Name -eq 'TimeSync' -and $srv.Details.TimeSyncDetails) { continue }
+            if ($prop.Name -eq 'SensorHealth' -and @($srv.Details.SensorHealthDetails.Issues | Where-Object { $_ }).Count -gt 0) { continue }
             $area = if ($prop.Name -eq 'RequiredPorts') { 'Network' } elseif ($prop.Name -eq 'SensorV3Ready') { 'Sensor v3.x' } else { 'Configuration' }
             $severity = if ($prop.Name -eq 'SensorV3Ready') { 'Medium' } else { 'High' }
             [void] $issues.Add([PSCustomObject]@{ Severity = $severity; Server = [string] $srv.FQDN; Area = $area
@@ -6398,19 +11538,45 @@ function Get-mdiIssueList {
         # produced "not ready" with an issues table that named only the handful of checks that
         # happened to work. An unread check is not a failure to fix; it is a measurement to repeat,
         # and it is labelled that way so nobody reconfigures a setting that was never read.
-        foreach ($prop in @($srv.PSObject.Properties | Where-Object {
-                    $_.Name -notin $script:mdiInformationalProperty -and
-                    $_.Name -notin $script:mdiStatusFlag -and
-                    $_.Value -is [string] -and $_.Value -eq 'N/A'
-                })) {
+        # Derived exactly as Get-mdiReportStatistics derives it (9198-9200), through the SAME shared
+        # helper: the stored properties minus RequiredPorts, plus the EFFECTIVE properties that are
+        # still unreadable. This was written out longhand here - a verbatim copy of the helper's
+        # predicate minus its one '$_.Name -notin $ExcludeName' line - so the two surfaces disagreed
+        # about a single check. A server whose stored RequiredPorts summary reads 'N/A' while its
+        # probe records resolve the measurement to a genuine blocked port produced BOTH "Required
+        # Ports could not be read on this server, so its state is unknown" AND "a required network
+        # probe was measured as blocked" for one fault: two High findings, an exit code of 2 instead
+        # of 1, and a score card reporting ChecksUnread = 0 above an issues table saying the check
+        # was never read. The measurement has resolved it; only the effective view may say otherwise.
+        $unreadNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($name in @(Get-mdiUnreadCheckName -Server $srv -ExcludeName $script:mdiRequiredPortsCheckName)) {
+            [void] $unreadNames.Add([string] $name)
+        }
+        foreach ($prop in @(Get-mdiEffectiveCheckProperty -Server $srv)) {
+            if ([string] $prop.Value -eq 'N/A') { [void] $unreadNames.Add([string] $prop.Name) }
+        }
+        foreach ($name in @($unreadNames)) {
             [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Not measured'
-                    Issue = (ConvertTo-mdiFriendlyName ([string] $prop.Name)) + ' could not be read on this server, so its state is unknown'
+                    Issue = (ConvertTo-mdiFriendlyName ([string] $name)) + ' could not be read on this server, so its state is unknown'
                 })
         }
-        foreach ($blocked in @($portDetails.FailedRequired | Where-Object { $_ })) {
+        # Legacy string lists only. When Results records are present the measurement path below covers
+        # the same blocked probes with better wording and wider coverage, and emitting both listed every
+        # blocked port twice. Reports written by an earlier version carry FailedRequired/NnrFailedTargets
+        # with no Results, and those must still produce their findings - hence the gate rather than a
+        # delete.
+        #
+        # The empties are filtered BEFORE counting. @($null).Count is 1, not 0, so a report whose Results
+        # property is absent - which is exactly the older-version report this gate exists to serve -
+        # counted as HAVING results: the legacy path was skipped, there were no records to drive the
+        # measurement path, and a blocked required port produced no finding on either surface. A required
+        # port silently disappearing is the worst outcome the issue list has, and it only happened on the
+        # reports least likely to be re-run.
+        $hasPortResults = @($portDetails.Results | Where-Object { $_ }).Count -gt 0
+        foreach ($blocked in @(if ($hasPortResults) { @() } else { $portDetails.FailedRequired | Where-Object { $_ } })) {
             [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Network'; Issue = [string] $blocked })
         }
-        foreach ($target in @($portDetails.NnrFailedTargets | Where-Object { $_ })) {
+        foreach ($target in @(if ($hasPortResults) { @() } else { $portDetails.NnrFailedTargets | Where-Object { $_ } })) {
             # A target measured in the wrong direction is reported as unmeasured, not as a failure.
             # The caveat text was already being carried, but the finding still read as a hard "no NNR
             # method could resolve X" in the High severity list - sending the operator to fix name
@@ -6421,7 +11587,7 @@ function Get-mdiIssueList {
                     })
             } else {
                 [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Name resolution'
-                        Issue = 'No NNR method could resolve ' + [string] $target
+                        Issue = Get-mdiNnrIssueText -Target ([string] $target)
                     })
             }
         }
@@ -6429,22 +11595,32 @@ function Get-mdiIssueList {
             [void] $issues.Add([PSCustomObject]@{ Severity = 'Medium'; Server = [string] $srv.FQDN; Area = 'Sensor v3.x'; Issue = [string] $blocker })
         }
 
-        # Internal-consistency guard between the per-server summary flag and the detail records. The two
-        # are the same fact stored twice, and until now the finding list keyed entirely off the summary:
-        # a RequiredPorts flag that read $true while a detail record showed a blocked or unmeasured
-        # REQUIRED probe raised nothing at all, so the statistics could report a blocked port while the
-        # issues table said there was nothing to fix. The guard now runs whenever the summary is NOT a
-        # measured 'False' ($true OR the unread 'N/A'): a 'False' summary already produced
-        # FailedRequired/NnrFailedTargets findings above from the same detail records, so re-emitting
-        # here would double-list them, but an 'N/A' summary only produced a generic "could not be read"
-        # finding that names no specific port - so a port measured as blocked under an 'N/A' summary was
-        # silently dropped. Comparison is written [string] $srv.RequiredPorts -ne 'False' so the tri-state
-        # 'N/A' is not coerced to a boolean. A blocked mandatory probe is a hard failure; an 'AtLeastOne'
-        # (NNR) group with no measured success blocks too, worded as a measured failure or as an unmeasured
-        # gap depending on whether any of its methods actually ran; a required probe the details never
-        # measured is a gap, reported as such.
-        if ([string] $srv.RequiredPorts -ne 'False') {
-            $portResults = @($portDetails.Results)
+        # The findings for network probes are built from the MEASUREMENT, for every server, whatever the
+        # per-server summary flag says. The flag and the detail records are the same fact stored twice
+        # and they were free to disagree.
+        #
+        # This used to be gated on the summary NOT reading 'False', on the assumption that a False
+        # summary had already been fully described by the legacy FailedRequired/NnrFailedTargets string
+        # lists above. It had not: those lists only ever contained probes measured as FAILED, so on a
+        # server whose summary read False - the very servers with a problem - a required probe that was
+        # never measured, and an NNR target whose every method was untested, produced NO finding at all.
+        # The measurement knew about them and the issues table did not mention them. The legacy lists are
+        # now suppressed when Results records exist, so running this path unconditionally lists each
+        # blocked probe exactly once and closes the gap.
+        #
+        # A blocked mandatory probe is a hard failure; an 'AtLeastOne' (NNR) group with no measured
+        # success blocks too, worded as a measured failure or as an unmeasured gap depending on whether
+        # any of its methods actually ran; a required probe the details never measured is a gap,
+        # reported as such and never as a firewall to open.
+        if ($null -ne $portDetails) {
+            # Enriched through Get-mdiPortResultRecord rather than passed raw. The raw records carry no
+            # Server field, and Get-mdiBlockingPortFailure groups an 'AtLeastOne' set by Server, Group,
+            # Target and TargetIP - a null Server made every record its own group, so a name resolution
+            # method that SUCCEEDED could no longer rescue its failing sibling and a ready run still
+            # listed "no NNR method could resolve X", while a group whose methods were all untested
+            # listed the same finding once per method. The verdict never had this because it enriches
+            # first, which is exactly why the two disagreed.
+            $portResults = @(Get-mdiPortResultRecord -Server @($srv))
             foreach ($rec in @(Get-mdiBlockingPortFailure -Record $portResults)) {
                 switch ([string] $rec.BlockingKind) {
                     'NnrUntested' {
@@ -6456,21 +11632,22 @@ function Get-mdiIssueList {
                     }
                     'NnrMeasured' {
                         [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Name resolution'
-                                Issue = 'No NNR method could resolve ' + [string] $rec.Target
+                                Issue = Get-mdiNnrIssueText -Target ([string] $rec.Target)
                             })
                     }
                     default {
+                        # Worded as a plain statement of the measurement. It used to read "...but the
+                        # summary did not flag it", which was accurate only while this path was gated to
+                        # servers whose summary disagreed. It now runs for every server, so on the
+                        # ordinary case - summary False, port measured shut - that sentence accused the
+                        # tool of an inconsistency that was not there.
                         [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Network'
-                                Issue = ('A required network probe was measured as blocked but the summary did not flag it: {0}/{1} to {2}: {3}' -f
-                                    [string] $rec.Protocol, [string] $rec.Port, [string] $rec.Target, [string] $rec.Detail)
+                                Issue = Get-mdiPortIssueText -Record $rec
                             })
                     }
                 }
             }
-            foreach ($rec in @($portResults | Where-Object {
-                        $_.Requirement -in @('Required', 'All') -and $_.Applicable -ne $false -and
-                        ($_.Applicable -ne $true -or [string] $_.Detail -match $script:mdiPortNotTestedPattern)
-                    })) {
+            foreach ($rec in @(Get-mdiUnmeasuredRequiredProbe -Record $portResults)) {
                 [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Not measured'
                         Issue = ('A required network probe could not be measured: {0}/{1} to {2}: {3}' -f
                             [string] $rec.Protocol, [string] $rec.Port, [string] $rec.Target, [string] $rec.Detail)
@@ -6481,7 +11658,7 @@ function Get-mdiIssueList {
         foreach ($sensorIssue in @($srv.Details.SensorHealthDetails.Issues | Where-Object { $_ })) {
             [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Sensor health'; Issue = [string] $sensorIssue })
         }
-        if ($srv.PSObject.Properties['TimeSync'] -and $srv.TimeSync -eq $false) {
+        if ($srv.PSObject.Properties['TimeSync'] -and (Test-mdiCheckFailed -Value $srv.TimeSync)) {
             [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Time sync'
                     Issue = [string] $srv.Details.TimeSyncDetails.Detail
                 })
@@ -6512,7 +11689,15 @@ function Get-mdiOverviewHtml {
     # "Fully ready" requires zero unread checks as well as zero failures. A server with one readable
     # pass and five unread prerequisites was counted as ready (1/1) while the verdict correctly failed
     # the run for unread checks.
-    $readyServers = @($stats.ServerScores | Where-Object { $_.Total -gt 0 -and $_.Failed -eq 0 -and $_.Unread -eq 0 }).Count
+    # Filtered to REAL servers. The synthetic rows appended by Get-mdiReportStatistics - one per
+    # unexamined domain, one per unreachable server - carry unread checks so they land in the score
+    # denominator, but they are not servers and must not be counted as one. They were: two reachable
+    # servers plus one unexamined domain rendered "Servers fully ready 2/2" in green with the
+    # sub-label "1 not measured", which is 2 + 0 + 1 = 3 against a reachable population of 2.
+    # Tested with -ne rather than -eq 'Server' so a score object from an older report or a JSON
+    # round-trip, which carries no Kind at all, keeps counting as the server it is.
+    $realScores = @($stats.ServerScores | Where-Object { $_.Kind -ne 'Unmeasured' })
+    $readyServers = @($realScores | Where-Object { Test-mdiServerIsReady -Score $_ }).Count
     # The two buckets are NOT mutually exclusive: a server with a measured failure can ALSO carry an
     # unread check, and treating "has an unread check" as "not measured" then subtracts a genuine
     # failure from the "need attention" count - so a DC whose required ports are measured blocked but
@@ -6521,16 +11706,53 @@ function Get-mdiOverviewHtml {
     # regardless of unread checks; only a server with NO measured failures and nothing readable (no
     # checks at all, or at least one unread check) is genuinely "not measured". readyServers +
     # needAttention + trulyUnmeasured then account for every reachable server.
-    $needAttention = @($stats.ServerScores | Where-Object { $_.Failed -gt 0 }).Count
-    $trulyUnmeasured = @($stats.ServerScores | Where-Object { $_.Failed -eq 0 -and ($_.Total -eq 0 -or $_.Unread -gt 0) }).Count
+    $needAttention = @($realScores | Where-Object { $_.Failed -gt 0 }).Count
+    $trulyUnmeasured = @($realScores | Where-Object { $_.Failed -eq 0 -and ($_.Total -eq 0 -or $_.Unread -gt 0) }).Count
     $notReady = $stats.ReachableServers - $readyServers
-    $scorePct = if ($stats.ChecksTotal -gt 0) { [int] [math]::Round(($stats.ChecksPassed / $stats.ChecksTotal) * 100) } else { 0 }
+    # Floor, not Round. Rounding 99.6 gave 100, and the card's tone keys off that number, so an estate
+    # with four failing checks out of a thousand was badged 100% in green. Flooring can only ever
+    # understate, and a hundred is now reachable solely by passing every check.
+    #
+    # The denominator counts checks that were ATTEMPTED, not only those that produced a boolean. With
+    # only the measured ones, LOSING a measurement raised the score: one check going from a measured
+    # failure to 'N/A' took the headline from "4 of 5 = 80%, warn" to "4 of 4 = 100%, green" and made
+    # the failing prerequisite bar disappear from the chart entirely. The worse the coverage, the
+    # better the estate looked - which is the single most misleading thing this report can do.
+    #
+    # An unread check therefore counts against the score exactly as a failed one does. It is still
+    # reported separately, because "we could not look" and "we looked and it is wrong" need different
+    # actions from the operator, but neither may be silently removed from the denominator.
+    $scoreDenominator = Get-mdiCoverageDenominator -Measured $stats.ChecksTotal -Unread $stats.ChecksUnread
+    $scorePct = [int] [math]::Floor((Get-mdiCoveragePercent -Passed $stats.ChecksPassed -Measured $stats.ChecksTotal -Unread $stats.ChecksUnread))
+    $allChecksPassed = ($scoreDenominator -gt 0) -and ($stats.ChecksPassed -eq $scoreDenominator)
 
     $sensorServers = @($stats.ReachableList | Where-Object { $_.Details.SensorHealthDetails })
     # Installed is tri-state and 'N/A' is truthy, so a bare truthiness test counted every server that
     # could not be queried as one with a sensor deployed - and the KPI then read "installed but not
     # running" for a machine nobody had reached.
     $sensorInstalled = @($sensorServers | Where-Object { [string] $_.Details.SensorHealthDetails.Installed -eq 'True' })
+    # The third state. Installed is tri-state, and "no sensor is installed" and "we could not read
+    # whether a sensor is installed" are opposite claims: the card asserted "No v2.x sensor installed
+    # yet" - a definite statement of fact about the estate - over servers whose WMI never answered,
+    # while the Sensor health table directly underneath said "Not tested" for the very same rows.
+    # Deploying a sensor is the single most expensive action this report can recommend.
+    $sensorUnreadable = @(@($sensorServers | Where-Object { $null -eq (ConvertTo-mdiBoolean $_.Details.SensorHealthDetails.Installed) }) +
+        # A reachable server that produced no sensor detail AT ALL is the same third state, one step
+        # earlier: the read never happened rather than returning an unreadable value. It was excluded
+        # from $sensorServers entirely, so it vanished from the card and the estate rendered exactly
+        # as though that server did not exist.
+        @($stats.ReachableList | Where-Object { -not $_.Details.SensorHealthDetails -and -not (Test-mdiServerIsPlaceholder -Server $_) }) +
+        # An UNREACHABLE server is that same third state in its strongest form: not a sensor that was
+        # read and found absent, but a machine nobody ever reached. It was excluded from every sensor
+        # population, so it left both sides of the ratio and the card rendered exactly as though the
+        # server did not exist. Measured on the shipped functions: one healthy server plus one
+        # unreachable server produced a GREEN "Sensors healthy 1/1 - All sensor services running",
+        # byte-identical to the same estate with no unreachable server at all - while the identical
+        # estate with that second server PARTIAL correctly rendered warn, "All read sensor services
+        # running, 1 could not be read". Losing a server outright disclosed less than losing it half
+        # way. Placeholders stay excluded here exactly as they are above: they are discovery records,
+        # not machines.
+        @($stats.UnreachableList | Where-Object { -not (Test-mdiServerIsPlaceholder -Server $_) }))
     $sensorHealthy = @($sensorInstalled | Where-Object { $_.SensorHealth -eq $true })
 
     # --- KPI cards ---------------------------------------------------------------------------------------------
@@ -6540,7 +11762,15 @@ function Get-mdiOverviewHtml {
             # Unreachable servers are outside ReachableServers, so a forest where half the estate never
             # answered could still read "8/8 - All checks passed" in green next to a red "action
             # required" banner. A server that was never reached is not a server that passed.
-            Sub = $(if ($stats.UnreachableCount -gt 0 -and $trulyUnmeasured -gt 0) {
+            Sub = $(if ($stats.TotalServers -eq 0) {
+                    # Nothing was examined, so "All checks passed" is the one thing this tile must
+                    # never say. Every branch below counts servers that FAILED, and with no servers
+                    # at all each count is legitimately zero - so the tile fell through to a green
+                    # "All checks passed" beside a red 0% score card, two High findings in the issues
+                    # table, and a NOT READY verdict. A reader who takes one look at the KPI strip is
+                    # told the estate is clean by the run that looked at nothing.
+                    'No server was examined'
+                } elseif ($stats.UnreachableCount -gt 0 -and $trulyUnmeasured -gt 0) {
                     '{0} need attention, {1} not measured, {2} not reachable' -f $needAttention, $trulyUnmeasured, $stats.UnreachableCount
                 } elseif ($stats.UnreachableCount -gt 0) {
                     '{0} need attention, {1} not reachable' -f $notReady, $stats.UnreachableCount
@@ -6548,8 +11778,28 @@ function Get-mdiOverviewHtml {
                     '{0} need attention, {1} not measured' -f $needAttention, $trulyUnmeasured
                 } elseif ($notReady -gt 0) {
                     '{0} need attention' -f $notReady
+                } elseif ($stats.ChecksUnread -gt 0) {
+                    # An ESTATE-level gap is charged to the score but belongs to no single server, so
+                    # every count above it is legitimately zero. $readyServers, $needAttention,
+                    # $trulyUnmeasured and $notReady all derive from $realScores - real servers only -
+                    # while $stats.ChecksUnread also carries the synthetic 'Unmeasured' rows for an
+                    # incomplete forest discovery, a discovery placeholder, and a domain whose
+                    # directory checks could not be read. With one clean controller and any one of
+                    # those three gaps the tile fell through to the branch below and rendered a GREEN
+                    # "1/1 - All checks passed" beside its own score card reading "10 of 11 checks
+                    # passed, 1 not measured", a High finding, and a hero verdict of "Action required".
+                    # Measured on the shipped functions for all three gaps.
+                    #
+                    # The empty-scan case above was already special-cased for exactly this reason. That
+                    # closed the instance where the estate is entirely unexamined and left the ones
+                    # where it is only partly unexamined, which are the harder ones to spot precisely
+                    # because the rest of the page looks healthy.
+                    '{0} not measured' -f $stats.ChecksUnread
                 } else { 'All checks passed' })
-            Tone = $(if ($notReady -gt 0 -or $stats.UnreachableCount -gt 0) { 'bad' } else { 'ok' })
+            # 'warn' rather than 'bad': nothing here FAILED, it was not looked at - the same
+            # distinction the score card already draws. Never 'ok' while a check is unread, because
+            # green on this tile is read as "nothing to do".
+            Tone = $(if ($stats.TotalServers -eq 0) { 'bad' } elseif ($notReady -gt 0 -or $stats.UnreachableCount -gt 0) { 'bad' } elseif ($stats.ChecksUnread -gt 0) { 'warn' } else { 'ok' })
         }
         @{ Label = 'Required ports open'; Value = $(if ($stats.PortsRequiredTested -eq 0) { 'n/a' } else { '{0}/{1}' -f $stats.PortsRequiredOpen, $stats.PortsRequiredTested })
             # Headline and sub-label now describe the SAME population - Requirement = 'Required' probes
@@ -6559,29 +11809,121 @@ function Get-mdiOverviewHtml {
             # Required-only sub-label.
             # "No required port blocked" over a run that probed nothing is untested data shown as a
             # pass. -SkipNetworkPorts zeroes every one of these counters, so 0/0 rendered green.
-            Sub = $(if ($stats.PortsTotal -eq 0) { 'Not evaluated' }
-                elseif ($stats.PortsRequiredFail -gt 0) { '{0} required port(s) blocked' -f $stats.PortsRequiredFail }
-                elseif ($stats.PortsUntested -gt 0) { '{0} probe(s) could not be tested' -f $stats.PortsUntested }
+            Sub = $(
+                # The SAMPLE is stated whenever the estate is bigger than the set actually probed, for
+                # the same reason the NNR card states it: -MaxLdapTargetsPerDomain defaults to 2, so a
+                # domain with more than two controllers is probed as a sample on an ORDINARY run, and
+                # "8/8, no required port blocked" described two hosts out of four with nothing saying
+                # so. The clause costs one sentence and removes the illusion.
+                $portScope = [int] $stats.PortCandidateHostCount
+                $portProbed = [int] $stats.PortDistinctTargetCount
+                $portSample = $(if ($portScope -gt $portProbed -and $portProbed -gt 0) {
+                        ' ({0} of {1} host(s) in scope were probed - raise -MaxLdapTargetsPerDomain to widen it)' -f $portProbed, $portScope
+                    } else { '' })
+                if ($stats.PortsTotal -eq 0) { 'Not evaluated' }
+                elseif ($stats.PortsRequiredFail -gt 0) { '{0} required port(s) blocked{1}' -f $stats.PortsRequiredFail, $portSample }
+                elseif ($stats.PortsRequiredUntested -gt 0) { '{0} required probe(s) could not be tested{1}' -f $stats.PortsRequiredUntested, $portSample }
+                # A non-required probe that was measured shut is worth an amber card, but only if the
+                # card SAYS so. It used to tone warn while still reading "No required port blocked",
+                # which is an amber warning whose own text tells the reader nothing is wrong - and on
+                # the live lab that is the permanent state: 54/54, amber, "No required port blocked",
+                # because four NNR NetBIOS probes and one recommended PTR lookup are shut. The tone and
+                # the sub-label now describe the same fact, so an amber card always names its cause.
+                elseif ($stats.PortsBlocked -gt 0) { '{0} optional or recommended probe(s) blocked{1}' -f $stats.PortsBlocked, $portSample }
+                # Records exist, but NOT ONE of them is a Required probe - so nothing here can support
+                # a statement about required ports. The headline already says 'n/a' (it gates on
+                # PortsRequiredTested), but the sub-label and the tone gated on PortsTotal instead, so
+                # they fell through to "No required port blocked" in GREEN. Reached on a shipped path:
+                # a certification authority probed in the reverse direction emits only NNR records, and
+                # Get-mdiRequiredPorts itself returns isRequiredPortsOk = 'N/A' for exactly that case -
+                # the producer said unknown while the card said all clear.
+                elseif ($stats.PortsRequiredTested -eq 0) { 'No required port was probed, so this was not evaluated{0}' -f $portSample }
+                # Every required probe was measured and open, but something else was not measured. The
+                # card is still amber (PortsUntested drives the tone), so it must name its cause -
+                # otherwise it is an amber card reading "No required port blocked", which tells the
+                # reader nothing is wrong. The class is stated so this is never confused with the
+                # required-probe branch above.
+                elseif ($stats.PortsUntested -gt 0) { 'No required port blocked; {0} optional or recommended probe(s) could not be tested{1}' -f $stats.PortsUntested, $portSample }
+                elseif ($portSample) { 'No required port blocked among those probed{0}' -f $portSample }
                 else { 'No required port blocked' })
-            Tone = $(if ($stats.PortsTotal -eq 0) { 'na' } elseif ($stats.PortsRequiredFail -gt 0) { 'bad' } elseif ($stats.PortsUntested -gt 0) { 'warn' } elseif ($stats.PortsBlocked -gt 0) { 'warn' } else { 'ok' })
+            Tone = $(if ($stats.PortsTotal -eq 0) { 'na' } elseif ($stats.PortsRequiredFail -gt 0) { 'bad' } elseif ($stats.PortsUntested -gt 0) { 'warn' } elseif ($stats.PortsBlocked -gt 0) { 'warn' } elseif ($stats.PortsRequiredTested -eq 0) { 'na' } else { 'ok' })
         }
         @{ Label = 'NNR resolvable targets'; Value = ('{0}/{1}' -f $stats.NnrResolvable, $stats.NnrTargetCount)
-            Sub = $(if ($stats.NnrTargetCount -eq 0) { 'Not evaluated' } elseif ($stats.NnrResolvable -lt $stats.NnrTargetCount) { 'Lowers the name resolution rate' } else { 'Every target resolvable' })
-            Tone = $(if ($stats.NnrTargetCount -eq 0) { 'na' } elseif ($stats.NnrResolvable -lt $stats.NnrTargetCount) { 'bad' } else { 'ok' })
+            # Three outcomes. A target nobody managed to probe is a gap to re-measure, not a firewall to
+            # open, so it is named as such instead of being folded into "lowers the name resolution
+            # rate" - which is an assertion about observed traffic and was being made about traffic that
+            # was never observed. Only targets that were measured and failed turn this card red.
+            #
+            # The SAMPLE is stated whenever the estate is bigger than the target list. Name resolution
+            # is deliberately probed against a bounded set of peers - -MaxNnrTargets defaults to 5 -
+            # because probing every domain controller from every domain controller grows with the
+            # SQUARE of the estate and never finishes on a large forest. That bound is correct
+            # engineering and wrong reporting: on a 500 domain controller forest this card read
+            # "5/5, every target resolvable" while 1% of the estate had been probed, and the operator
+            # who came here from the XDR alert "low success rate of active name resolution" concluded
+            # the alert was stale. Saying "of 500 in scope" costs one clause and removes the illusion.
+            Sub = $(
+                $nnrUnmeasured = [int] $stats.NnrUntested
+                $nnrFailed = $stats.NnrTargetCount - $stats.NnrResolvable - $nnrUnmeasured
+                $nnrScope = [int] $stats.NnrCandidateCount
+                $nnrProbed = [int] $stats.NnrDistinctTargetCount
+                $nnrSampled = ($nnrScope -gt $nnrProbed -and $nnrProbed -gt 0)
+                $nnrSample = $(if ($nnrSampled) { ' ({0} of {1} hosts in scope were probed - raise -MaxNnrTargets to widen it)' -f $nnrProbed, $nnrScope } else { '' })
+                if ($stats.NnrTargetCount -eq 0) { 'Not evaluated' }
+                elseif ($nnrFailed -gt 0 -and $nnrUnmeasured -gt 0) { '{0} target(s) unresolvable, {1} could not be tested{2}' -f $nnrFailed, $nnrUnmeasured, $nnrSample }
+                elseif ($nnrFailed -gt 0) { 'Lowers the name resolution rate{0}' -f $nnrSample }
+                elseif ($nnrUnmeasured -gt 0) { '{0} target(s) could not be tested{1}' -f $nnrUnmeasured, $nnrSample }
+                elseif ($nnrSampled) { 'Every PROBED target resolvable{0}' -f $nnrSample }
+                else { 'Every target resolvable' })
+            Tone = $(
+                $nnrUnmeasured2 = [int] $stats.NnrUntested
+                $nnrFailed2 = $stats.NnrTargetCount - $stats.NnrResolvable - $nnrUnmeasured2
+                if ($stats.NnrTargetCount -eq 0) { 'na' }
+                elseif ($nnrFailed2 -gt 0) { 'bad' }
+                elseif ($nnrUnmeasured2 -gt 0) { 'warn' }
+                else { 'ok' })
         }
         @{ Label = 'Sensors healthy'
             Value = $(if ($sensorInstalled.Count -eq 0) { 'n/a' } else { '{0}/{1}' -f $sensorHealthy.Count, $sensorInstalled.Count })
-            Sub = $(if ($sensorInstalled.Count -eq 0) { 'No v2.x sensor installed yet' }
-                elseif ($sensorHealthy.Count -lt $sensorInstalled.Count) { '{0} installed but not running' -f ($sensorInstalled.Count - $sensorHealthy.Count) }
+            # "No v2.x sensor installed yet" is only sayable when the absence was actually OBSERVED.
+            # With nothing readable the honest answer is that nobody could tell, and the unreadable
+            # servers are disclosed alongside the healthy count rather than dropped from both sides
+            # of it - the same treatment the ports and NNR cards on this row already give.
+            Sub = $(if ($sensorInstalled.Count -eq 0 -and $sensorUnreadable.Count -gt 0) {
+                    '{0} server(s) could not be read' -f $sensorUnreadable.Count
+                } elseif ($sensorInstalled.Count -eq 0) { 'No v2.x sensor installed yet' }
+                elseif ($sensorHealthy.Count -lt $sensorInstalled.Count -and $sensorUnreadable.Count -gt 0) {
+                    '{0} installed but not running, {1} could not be read' -f ($sensorInstalled.Count - $sensorHealthy.Count), $sensorUnreadable.Count
+                } elseif ($sensorHealthy.Count -lt $sensorInstalled.Count) { '{0} installed but not running' -f ($sensorInstalled.Count - $sensorHealthy.Count) }
+                elseif ($sensorUnreadable.Count -gt 0) { 'All read sensor services running, {0} could not be read' -f $sensorUnreadable.Count }
                 else { 'All sensor services running' })
-            Tone = $(if ($sensorInstalled.Count -eq 0) { 'na' } elseif ($sensorHealthy.Count -lt $sensorInstalled.Count) { 'bad' } else { 'ok' })
+            Tone = $(if ($sensorInstalled.Count -eq 0 -and $sensorUnreadable.Count -gt 0) { 'warn' }
+                elseif ($sensorInstalled.Count -eq 0) { 'na' }
+                elseif ($sensorHealthy.Count -lt $sensorInstalled.Count) { 'bad' }
+                elseif ($sensorUnreadable.Count -gt 0) { 'warn' }
+                else { 'ok' })
         }
         @{ Label = 'Sensor v3.x ready'; Value = ('{0}/{1}' -f $stats.V3Ready, $stats.V3Evaluated)
-            Sub = $(if ($stats.V3Evaluated -eq 0) { 'Not evaluated' } else { '{0} eligible for in-place migration' -f $stats.V3MigrationReady })
-            Tone = $(if ($stats.V3Evaluated -eq 0) { 'na' } elseif ($stats.V3Ready -lt $stats.V3Evaluated) { 'warn' } else { 'ok' })
+            # Servers whose v3 readiness could not be determined are named. They were excluded from
+            # the ratio entirely, so a green "1/1" sat above a v3 tab reading "Not determined" three
+            # times - the reader takes the KPI, not the tab.
+            Sub = $(if ($stats.V3Evaluated -eq 0 -and $stats.V3Unevaluated -gt 0) { '{0} server(s) could not be evaluated' -f $stats.V3Unevaluated }
+                elseif ($stats.V3Evaluated -eq 0) { 'Not evaluated' }
+                elseif ($stats.V3Unevaluated -gt 0) { '{0} eligible for in-place migration, {1} could not be evaluated' -f $stats.V3MigrationReady, $stats.V3Unevaluated }
+                else { '{0} eligible for in-place migration' -f $stats.V3MigrationReady })
+            Tone = $(if ($stats.V3Evaluated -eq 0 -and $stats.V3Unevaluated -gt 0) { 'warn' }
+                elseif ($stats.V3Evaluated -eq 0) { 'na' }
+                elseif ($stats.V3Ready -lt $stats.V3Evaluated) { 'warn' }
+                elseif ($stats.V3Unevaluated -gt 0) { 'warn' }
+                else { 'ok' })
         }
-        @{ Label = 'Overall check score'; Value = ('{0}%' -f $scorePct); Sub = ('{0} of {1} checks passed' -f $stats.ChecksPassed, $stats.ChecksTotal)
-            Tone = $(if ($scorePct -eq 100) { 'ok' } elseif ($scorePct -ge 80) { 'warn' } else { 'bad' })
+        @{ Label = 'Overall check score'; Value = ('{0}%' -f $scorePct)
+            Sub  = $(if ($stats.ChecksUnread -gt 0) {
+                    '{0} of {1} checks passed, {2} not measured' -f $stats.ChecksPassed, $scoreDenominator, $stats.ChecksUnread
+                } else {
+                    '{0} of {1} checks passed' -f $stats.ChecksPassed, $scoreDenominator
+                })
+            Tone = $(if ($allChecksPassed) { 'ok' } elseif ($scorePct -ge 80) { 'warn' } else { 'bad' })
         }
     )
 
@@ -6596,9 +11938,15 @@ function Get-mdiOverviewHtml {
     # --- Charts ------------------------------------------------------------------------------------------------
     [void] $lines.Add('<div class="card-grid">')
 
+    # Unread is a third segment for exactly the reason the port donut below already has one: the arcs
+    # fill the whole circle, so with only Passed and Failed a run where every check passed but most
+    # were never read drew a completely green ring - captioned with a centre value of "20%". A reader
+    # takes the picture, not the caption, and the picture said the estate was clean. The grey arc is
+    # the share of checks nobody could measure, so the ring and the number now describe the same fact.
     $readinessDonut = New-mdiDonutChart -Segment @(
         [PSCustomObject]@{ Label = 'Passed'; Value = $stats.ChecksPassed; Color = 'var(--ok)' }
         [PSCustomObject]@{ Label = 'Failed'; Value = ($stats.ChecksTotal - $stats.ChecksPassed); Color = 'var(--bad)' }
+        [PSCustomObject]@{ Label = 'Not read'; Value = $stats.ChecksUnread; Color = 'var(--na)' }
     ) -CenterValue ('{0}%' -f $scorePct) -CenterLabel 'ready'
     [void] $lines.Add('<section class="card chart-card"><h3>Overall readiness</h3>' + $readinessDonut + '</section>')
 
@@ -6619,11 +11967,24 @@ function Get-mdiOverviewHtml {
     # NNR success rate per method - the chart to read when troubleshooting the name resolution health alert
     if (@($stats.NnrRecords).Count -gt 0) {
         $nnrBars = @(foreach ($grp in ($stats.NnrRecords | Group-Object -Property Name | Sort-Object Name)) {
+                # Measured and never-run are separated here, the same way the KPI above and the detail
+                # matrix below separate them, and for the same reason. Total counted EVERY record, so a
+                # method that was never actually run scored 0 out of the probes that never happened and
+                # was drawn as a solid red "0/1 (0%)" bar - on a page whose own KPI said "1 target(s)
+                # could not be tested" and whose own matrix said "Not tested" for those very probes.
+                # Three renderings of one fact, and the loudest one was the invented failure.
+                #
+                # New-mdiBarChart already knows how to draw this correctly: Unread joins the
+                # denominator as a neutral segment and a bar with nothing measured is toned 'na' rather
+                # than 'bad'. It was simply never handed the number, which is the same omission the
+                # per-check and per-server bars beside it were already fixed for.
+                $measured = @($grp.Group | Where-Object { Test-mdiProbeWasMeasured -Record $_ })
                 [PSCustomObject]@{
-                    Label = ([string] $grp.Name) -replace '^NNR - ', ''
-                    Value = @($grp.Group | Where-Object { $_.Success }).Count
-                    Total = @($grp.Group).Count
-                    Hint  = 'Successful probes across all sensors and targets'
+                    Label  = ([string] $grp.Name) -replace '^NNR - ', ''
+                    Value  = @($measured | Where-Object { $_.Success }).Count
+                    Total  = $measured.Count
+                    Unread = @($grp.Group).Count - $measured.Count
+                    Hint   = 'Successful probes across all sensors and targets'
                 }
             })
         [void] $lines.Add('<section class="card wide chart-card"><h3>Name resolution success rate by method</h3>' +
@@ -6638,6 +11999,7 @@ function Get-mdiOverviewHtml {
                     Label = ConvertTo-mdiFriendlyName ([string] $key)
                     Value = $stats.CheckTotals[$key].Pass
                     Total = $stats.CheckTotals[$key].Total
+                    Unread = $stats.CheckTotals[$key].Unread
                     Hint  = 'Servers passing this check'
                 }
             })
@@ -6648,7 +12010,8 @@ function Get-mdiOverviewHtml {
     # Per-server score
     if (@($stats.ServerScores).Count -gt 0) {
         $serverBars = @(foreach ($score in ($stats.ServerScores | Sort-Object Passed, FQDN)) {
-                [PSCustomObject]@{ Label = $score.FQDN; Value = $score.Passed; Total = $score.Total; Hint = 'Checks passed on this server' }
+                [PSCustomObject]@{ Label = $score.FQDN; Value = $score.Passed; Total = $score.Total
+                    Unread = $score.Unread; Hint = 'Checks passed on this server' }
             })
         [void] $lines.Add('<section class="card wide chart-card"><h3>Readiness by server</h3>' +
             (New-mdiBarChart -Bar $serverBars) + '</section>')
@@ -6669,7 +12032,12 @@ function Get-mdiOverviewHtml {
                 @(Get-mdiCheckProperty -Server $_).Count -eq 0
             })
         if ($unmeasured.Count -gt 0) {
-            [void] $lines.Add('<p class="empty-state">No failing check was found, but ' + $unmeasured.Count +
+            # Styled as a warning, not as a success. This paragraph uses the same .empty-state component
+            # as "No issues were found", which is painted in the report's green success colours - so the
+            # sentence "this is not a clean result" was rendered in exactly the green a reader scans for
+            # to conclude everything is fine. The words said one thing and the colour said the opposite,
+            # and colour wins at a glance.
+            [void] $lines.Add('<p class="empty-state warn">No failing check was found, but ' + $unmeasured.Count +
                 ' server(s) returned no readable results at all, so this is not a clean result. ' +
                 'Check that the account running this script can query those servers over WMI and the remote registry.</p>')
         } else {
@@ -6693,6 +12061,36 @@ function Get-mdiOverviewHtml {
     $lines.ToArray() -join [environment]::NewLine
 }
 
+function Get-mdiStartModeClass {
+    <#
+        The colour a service start mode cell gets, from the SAME rule Get-mdiSensorHealth uses to
+        decide whether to raise a finding: 'Auto' is healthy, anything else is not.
+
+        The table classified only 'Disabled' as red, so a sensor set to start MANUALLY was painted
+        green - on the same row whose Detail column read, in red, "The AATPSensor service start mode
+        is Manual, not Auto; it will not start after a reboot". A green cell is an assertion that the
+        value is fine, and it was contradicting the finding printed beside it, the SensorHealth
+        boolean, the KPI and the verdict. A sensor that stops monitoring the domain controller at the
+        next restart is exactly the state this column exists to show.
+
+        'n/a' and 'Not installed' are not failures - there is no service to have a start mode - so
+        they stay grey rather than red.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $StartMode
+    )
+
+    $value = [string] $StartMode
+    # Cast at the comparison as well as at the assignment. The rule that forbids a bare 'N/A' test is
+    # syntactic on purpose - it cannot see that $value was already stringified two lines up, and the
+    # one time it is allowed to make that judgement is the time a bool slips through and [bool]'N/A'
+    # quietly returns true.
+    if ([string]::IsNullOrWhiteSpace($value) -or [string] $value -eq 'n/a' -or $value -eq 'Not installed') { return 'grey' }
+    if ($value -eq 'Auto') { return 'green' }
+    'red'
+}
+
 function Get-mdiSensorHealthHtml {
     param (
         [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $Server
@@ -6705,20 +12103,26 @@ function Get-mdiSensorHealthHtml {
 
     $lines = New-Object -TypeName System.Collections.ArrayList
     [void] $lines.Add('<div class="table-scroll"><table>')
-    [void] $lines.Add('<tr><th class="left">Server</th><th>Sensor installed</th><th>Sensor service</th><th>Start mode</th><th>Updater service</th><th>Version</th><th class="left">Detail</th></tr>')
+    [void] $lines.Add('<tr><th class="left">Server</th><th>Sensor installed</th><th>Sensor service</th><th>Start mode</th><th>Updater service</th><th>Updater start mode</th><th>Version</th><th class="left">Detail</th></tr>')
     foreach ($srv in ($servers | Sort-Object FQDN)) {
         $health = $srv.Details.SensorHealthDetails
-        # Installed is TRI-STATE: $true, $false, or 'N/A' when the server could not be queried over
-        # WMI at all. [bool] 'N/A' is $TRUE - a non-empty string is truthy - so a server nobody could
-        # reach was rendered as "Sensor installed: Yes" with green styling and empty service columns,
-        # and the KPI counted it as an installed sensor that was not running. Compared as a string so
-        # the three states stay three states.
-        $installedState = [string] $health.Installed
-        $installed = [string] $installedState -eq 'True'
-        $unknownInstall = [string] $installedState -eq 'N/A'
+        # Installed is TRI-STATE: $true, $false, or not measured at all when the server could not be
+        # queried over WMI. [bool] 'N/A' is $TRUE - a non-empty string is truthy - so a server nobody
+        # could reach was rendered as "Sensor installed: Yes" with green styling and empty service
+        # columns, and the KPI counted it as an installed sensor that was not running.
+        #
+        # Normalised through ConvertTo-mdiBoolean rather than compared against the literal 'N/A'.
+        # Only that exact string was treated as unknown, so $null, '' and any word this script does
+        # not recognise fell through to the grey "No - not onboarded yet" row: a reassuring statement
+        # that no sensor is installed, made about a server that was never successfully queried.
+        # ConvertTo-mdiBoolean is the single place that decides what a stored check value means, so
+        # this table now classifies the three states exactly as the score and the verdict do.
+        $installedState = ConvertTo-mdiBoolean $health.Installed
+        $installed = ($installedState -eq $true)
+        $unknownInstall = ($null -eq $installedState)
 
         if ($unknownInstall) {
-            [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="muted-cell">Not tested</td><td class="grey">n/a</td><td class="grey">n/a</td><td class="grey">n/a</td><td class="grey">n/a</td><td class="left">{1}</td></tr>' -f
+            [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="muted-cell">Not tested</td><td class="grey">n/a</td><td class="grey">n/a</td><td class="grey">n/a</td><td class="grey">n/a</td><td class="grey">n/a</td><td class="left">{1}</td></tr>' -f
                     (ConvertTo-mdiHtmlEncoded ([string] $srv.FQDN)), (ConvertTo-mdiHtmlEncoded ([string] $health.Detail))))
             continue
         }
@@ -6731,11 +12135,12 @@ function Get-mdiSensorHealthHtml {
             # "No / not onboarded yet" row hid a failure the verdict and the issue list both raise, so the
             # broken case is shown red here to match them.
             $updaterClass = if ([string] $health.UpdaterService -eq 'Running') { 'green' } elseif ([string] $health.UpdaterService -eq 'Not installed') { 'grey' } else { 'red' }
-            [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="red">No</td><td class="grey">{1}</td><td class="grey">{2}</td><td class="{3}">{4}</td><td class="mono">{5}</td><td class="left red">{6}</td></tr>' -f
+            [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="red">No</td><td class="grey">{1}</td><td class="grey">{2}</td><td class="{3}">{4}</td><td class="{5}">{6}</td><td class="mono">{7}</td><td class="left red">{8}</td></tr>' -f
                     (ConvertTo-mdiHtmlEncoded ([string] $srv.FQDN)),
                     (ConvertTo-mdiHtmlEncoded ([string] $health.SensorService)),
                     (ConvertTo-mdiHtmlEncoded ([string] $health.SensorStartMode)),
                     $updaterClass, (ConvertTo-mdiHtmlEncoded ([string] $health.UpdaterService)),
+                    (Get-mdiStartModeClass -StartMode $health.UpdaterStartMode), (ConvertTo-mdiHtmlEncoded ([string] $health.UpdaterStartMode)),
                     (ConvertTo-mdiHtmlEncoded ([string] $srv.SensorVersion)),
                     (ConvertTo-mdiHtmlEncoded ([string] $health.Detail))))
             continue
@@ -6743,29 +12148,33 @@ function Get-mdiSensorHealthHtml {
 
         if (-not $installed) {
             # A server without a sensor is not a failure: it may simply not be onboarded yet
-            [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="grey">No</td><td class="grey">n/a</td><td class="grey">n/a</td><td class="grey">n/a</td><td class="grey">n/a</td><td class="left">{1}</td></tr>' -f
+            [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="grey">No</td><td class="grey">n/a</td><td class="grey">n/a</td><td class="grey">n/a</td><td class="grey">n/a</td><td class="grey">n/a</td><td class="left">{1}</td></tr>' -f
                     (ConvertTo-mdiHtmlEncoded ([string] $srv.FQDN)), (ConvertTo-mdiHtmlEncoded ([string] $health.Detail))))
             continue
         }
 
         $sensorClass = if ([string] $health.SensorService -eq 'Running') { 'green' } elseif ([string] $health.SensorService -eq 'Not installed') { 'grey' } else { 'red' }
         $updaterClass = if ([string] $health.UpdaterService -eq 'Running') { 'green' } elseif ([string] $health.UpdaterService -eq 'Not installed') { 'grey' } else { 'red' }
-        $startClass = if ([string] $health.SensorStartMode -eq 'Disabled') { 'red' } else { 'green' }
+        $startClass = Get-mdiStartModeClass -StartMode $health.SensorStartMode
+        $updaterStartClass = Get-mdiStartModeClass -StartMode $health.UpdaterStartMode
         $detailClass = if ($srv.SensorHealth -eq $false) { 'red' } else { 'green' }
 
-        [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="green">Yes</td><td class="{1}">{2}</td><td class="{3}">{4}</td><td class="{5}">{6}</td><td class="mono">{7}</td><td class="left {8}">{9}</td></tr>' -f
+        [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="green">Yes</td><td class="{1}">{2}</td><td class="{3}">{4}</td><td class="{5}">{6}</td><td class="{7}">{8}</td><td class="mono">{9}</td><td class="left {10}">{11}</td></tr>' -f
                 (ConvertTo-mdiHtmlEncoded ([string] $srv.FQDN)),
                 $sensorClass, (ConvertTo-mdiHtmlEncoded ([string] $health.SensorService)),
                 $startClass, (ConvertTo-mdiHtmlEncoded ([string] $health.SensorStartMode)),
                 $updaterClass, (ConvertTo-mdiHtmlEncoded ([string] $health.UpdaterService)),
+                $updaterStartClass, (ConvertTo-mdiHtmlEncoded ([string] $health.UpdaterStartMode)),
                 (ConvertTo-mdiHtmlEncoded ([string] $srv.SensorVersion)),
                 $detailClass, (ConvertTo-mdiHtmlEncoded ([string] $health.Detail))))
     }
     [void] $lines.Add('</table></div>')
 
-    # Compared as a string for the same reason: 'N/A' is truthy, so a server that could not be queried
-    # counted as one with a sensor installed.
-    $notInstalled = @($servers | Where-Object { [string] $_.Details.SensorHealthDetails.Installed -eq 'False' })
+    # Normalised for the same reason: 'N/A' is truthy, so a server that could not be queried counted
+    # as one with a sensor installed. Only a value that NORMALISES to $false is evidence that no
+    # sensor is present - an unreadable server is not, and letting it into this population produced
+    # the "nothing to report yet" note on an estate nobody had managed to look at.
+    $notInstalled = @($servers | Where-Object { (ConvertTo-mdiBoolean $_.Details.SensorHealthDetails.Installed) -eq $false })
     if ($notInstalled.Count -eq $servers.Count) {
         [void] $lines.Add('<p class="muted">No Defender for Identity sensor v2.x is installed on any of the scanned servers, so there is nothing to report yet. This check flags sensors that are installed but stopped or disabled, which report no data to the cloud service while still appearing deployed in the portal.</p>')
     }
@@ -6788,11 +12197,21 @@ function Get-mdiTimeSyncHtml {
     [void] $lines.Add('<tr><th class="left">Server</th><th>Within tolerance</th><th>Skew</th><th>Remote clock (UTC)</th><th class="left">Detail</th></tr>')
     foreach ($srv in ($servers | Sort-Object FQDN)) {
         $sync = $srv.Details.TimeSyncDetails
-        $ok = $srv.TimeSync -eq $true
         # A clock that could not be read is not a clock that has drifted. Rendering it red with "No"
         # contradicted the tri-state and sent people to resynchronise a server whose time may be correct.
-        $notTested = [string] $srv.TimeSync -eq 'N/A' -or $null -eq $srv.TimeSync
-        $skew = if ($null -ne $sync.SkewSeconds) { [string] ([int] $sync.SkewSeconds) + ' s' } else { 'n/a' }
+        #
+        # Normalised rather than compared against the literal 'N/A' and $null. An empty string or a
+        # word this script does not recognise is not a measurement either, and both fell through to
+        # the red "No" - a measured-sounding accusation of clock drift built out of a reading nobody
+        # took. ConvertTo-mdiBoolean already classifies '', 'Unknown', 'N/A' and $null identically as
+        # "no usable value", so the table and the score now agree on which servers were measured.
+        $syncState = ConvertTo-mdiBoolean $srv.TimeSync
+        $ok = ($syncState -eq $true)
+        $notTested = ($null -eq $syncState)
+        # [long] for the same reason Get-mdiTimeSync produces one: a skew of more than 68 years does
+        # not fit in an Int32, and re-narrowing it here would throw while BUILDING the report - losing
+        # the whole HTML file rather than one cell.
+        $skew = if ($null -ne $sync.SkewSeconds) { [string] ([long] $sync.SkewSeconds) + ' s' } else { 'n/a' }
         $cellClass = if ($ok) { 'green' } elseif ($notTested) { 'muted-cell' } else { 'red' }
         $cellLabel = if ($ok) { 'Yes' } elseif ($notTested) { 'Not tested' } else { 'No' }
         [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="{1}">{2}</td><td class="{1}">{3}</td><td class="mono">{4}</td><td class="left">{5}</td></tr>' -f
@@ -6823,16 +12242,34 @@ function Get-mdiCapacityHtml {
 
     # The short-sample caveat governs how every number below must be read, so it goes first and
     # is styled as a warning. Left at the bottom as a grey footnote it was routinely missed.
-    $partial = @($servers | Where-Object { $_.Details.CapacityDetails.FullBusyWindow -eq $false })
+    # Three states, not two. FullBusyWindow is a boolean on a server that was SAMPLED; a server whose
+    # capacity could not be read at all - Get-mdiCapacityPlanning's notSized path returns details
+    # carrying only Status and Detail - has no such property, and '$null -eq $false' is FALSE. So a
+    # server nobody sampled fell out of the partial-window population and into the reassuring branch:
+    # the tab printed "Sampled over a full busy window. The sample was long enough to take the highest
+    # rolling 15-minute average" directly above a row reading "Missing core data - Unable to read the
+    # processor information over WMI". A claim about a measurement, over the row saying it never
+    # happened. Reachable from any -CapacityPlanning run where WMI to a domain controller fails.
+    $sampled = @($servers | Where-Object { $_.Details.CapacityDetails.FullBusyWindow -is [bool] })
+    $notSampled = @($servers | Where-Object { $_.Details.CapacityDetails.FullBusyWindow -isnot [bool] })
+    $partial = @($sampled | Where-Object { $_.Details.CapacityDetails.FullBusyWindow -eq $false })
+    # The two facts are INDEPENDENT and both get said. Making them mutually exclusive branches meant
+    # one genuinely short-sampled server suppressed the disclosure for every server that could not be
+    # sampled at all: the tab printed only "This run sampled only 5 second(s) per server" - a claim
+    # about every server - over a row reading "Missing core data / Unable to read the processor
+    # information over WMI". Reachable from any -CapacityPlanning run holding both conditions, which
+    # on a real estate is the common case rather than the corner one.
     if ($partial.Count -gt 0) {
-        $seconds = [int] (@($servers.Details.CapacityDetails.SampleSeconds) | Measure-Object -Maximum).Maximum
+        # Drawn from the SAMPLED servers only. Taken across all of them it read the maximum of a set
+        # containing servers with no SampleSeconds at all.
+        $seconds = [int] (@($sampled.Details.CapacityDetails.SampleSeconds) | Measure-Object -Maximum).Maximum
         # The whole concatenation is parenthesised before -f: the format operator binds tighter than +,
         # so without the parentheses only the last fragment would be formatted and every placeholder in
         # the earlier fragments would render literally as {0}, {1} and so on.
         [void] $lines.Add((('<div class="callout warn"><span class="ico">&#9888;</span><div class="body">' +
                     '<b>Estimate only &mdash; this is not a formal sizing.</b>' +
                     '<p>Microsoft sizes a sensor on the <b>15 busiest minutes of a 24 hour period</b>. This run sampled ' +
-                    'only <b>{0} second(s)</b> per server, so there is no busy window to pick from and the whole sample ' +
+                    'only <b>{0} second(s)</b> per sampled server, so there is no busy window to pick from and the whole sample ' +
                     'was averaged instead. Treat the verdict as a quick check for an obviously undersized server, not as ' +
                     'a sizing decision.</p>' +
                     '<p>Because the busy figure equals the average on a sample this short, the <b>spike test cannot ' +
@@ -6842,7 +12279,21 @@ function Get-mdiCapacityHtml {
                     'a representative busy period, or run the official <a href="{3}">TriSizingTool</a>, which samples ' +
                     'over 24 hours.</p></div></div>') -f
                 $seconds, ([int] $capacity.BusyWindowMinutes * 60), [int] $capacity.BusyWindowMinutes, (ConvertTo-mdiHtmlEncoded ([string] $capacity.OfficialToolUrl))))
-    } else {
+    }
+    if ($notSampled.Count -gt 0) {
+        # Nothing to reassure anybody about: no busy window was observed on these servers at all.
+        # Emitted independently of the partial-sample caveat above - a short sample on one server
+        # says nothing about a server that was never read.
+        [void] $lines.Add((('<div class="callout warn"><span class="ico">&#9888;</span><div class="body">' +
+                    '<b>{0} of {1} server(s) could not be sampled.</b>' +
+                    '<p>Their capacity could not be read, so no busy window was observed for them and no sizing ' +
+                    'verdict can be given &mdash; see the Detail column below. The figures in this table describe ' +
+                    'only the {2} server(s) that were sampled.</p>' +
+                    '<p>For a formal exercise use the official <a href="{3}">TriSizingTool</a>, which samples over ' +
+                    '24 hours.</p></div></div>') -f
+                $notSampled.Count, $servers.Count, $sampled.Count, (ConvertTo-mdiHtmlEncoded ([string] $capacity.OfficialToolUrl))))
+    }
+    if ($partial.Count -eq 0 -and $notSampled.Count -eq 0) {
         [void] $lines.Add((('<div class="callout info"><span class="ico">&#8505;</span><div class="body">' +
                     '<b>Sampled over a full busy window.</b>' +
                     '<p>The sample was long enough to take the highest rolling {0}-minute average, which is the figure ' +
@@ -6961,10 +12412,28 @@ function Get-mdiRequiredPortsHtml {
     $serverHeaders = ($servers | ForEach-Object { '<th>{0}</th>' -f (ConvertTo-mdiHtmlEncoded $_) }) -join ''
     [void] $lines.Add('<tr><th style="text-align:left">Requirement</th><th>Protocol</th><th>Port</th><th>Scope</th>{0}</tr>' -f $serverHeaders)
 
-    foreach ($probeId in @($settings.RequiredPorts.Id)) {
+    # Driven by the ids present in the RESULTS, not only by the ids in the shipped settings. Iterating
+    # the settings alone meant any record whose Id was absent, renamed or unrecognised had no row to
+    # land in and disappeared from the headline matrix altogether - and a blocked REQUIRED port that
+    # nobody can see is worse than one shown in the wrong order. Known ids keep their shipped order so
+    # the table reads the same as before; anything left over is appended rather than dropped.
+    $knownProbeId = @($settings.RequiredPorts.Id)
+    $recordProbeId = @($records | Select-Object -ExpandProperty Id -Unique)
+    $orphanProbeId = @($recordProbeId | Where-Object { $_ -notin $knownProbeId })
+    foreach ($probeId in @($knownProbeId + $orphanProbeId)) {
         $probeRecords = @($records | Where-Object { $_.Id -eq $probeId })
         if ($probeRecords.Count -eq 0) { continue }
+        # An orphan has no shipped definition, so its description is rebuilt from the record itself.
         $probe = @($settings.RequiredPorts | Where-Object { $_.Id -eq $probeId })[0]
+        if ($null -eq $probe) {
+            $probe = [PSCustomObject]@{
+                Notes    = 'This probe has no entry in the shipped port list; the details below come from the scan result itself.'
+                Name     = $(if ([string]::IsNullOrWhiteSpace([string] $probeRecords[0].Name)) { [string] $probeId } else { [string] $probeRecords[0].Name })
+                Protocol = [string] $probeRecords[0].Protocol
+                Port     = [string] $probeRecords[0].Port
+                Scope    = [string] $probeRecords[0].Scope
+            }
+        }
 
         $cells = foreach ($srv in $servers) {
             $srvRecords = @($probeRecords | Where-Object { $_.Server -eq $srv })
@@ -6975,8 +12444,16 @@ function Get-mdiRequiredPortsHtml {
             # as a red "0/1 open" required port here while every other part of the same report
             # correctly omitted it. Red reads as "blocked", and the operator opens a firewall port that
             # was never probed - the most expensive wrong answer this tool can give.
-            $measurable = @($applicable | Where-Object { [string] $_.Detail -notmatch $script:mdiPortNotTestedPattern })
-            $notTested = @($applicable | Where-Object { [string] $_.Detail -match $script:mdiPortNotTestedPattern })
+            # Measured-ness comes from the SHARED predicate, not from a fifth longhand copy of it. This
+            # table re-derived it from Applicable and the Detail text alone, which misses the case
+            # Test-mdiProbeWasMeasured exists to catch: a Success that is not a real boolean. A probe
+            # with Applicable = $true, a plausible Detail and Success = $null was therefore counted as
+            # measurable here, and "-not $_.Success" turned that $null into a FAILURE - a red
+            # "0/1 open" required-port cell, which is the blocked presentation, while the KPI, the
+            # issue list and the verdict on the same page all correctly called it untested. Red means
+            # "open your firewall", so this is the one wrong answer that costs a change request.
+            $measurable = @($applicable | Where-Object { Test-mdiProbeWasMeasured -Record $_ })
+            $notTested = @($applicable | Where-Object { -not (Test-mdiProbeWasMeasured -Record $_) })
             if ($applicable.Count -eq 0) {
                 '<td class="grey" title="{0}">N/A</td>' -f (ConvertTo-mdiHtmlEncoded (@($srvRecords.Detail)[0]))
             } elseif ($measurable.Count -eq 0) {
@@ -6996,7 +12473,14 @@ function Get-mdiRequiredPortsHtml {
                     }
                 } else {
                     # A failed 'at least one of' NNR method is only a warning by itself; the verdict is per target below
-                    $class = if ($probeRecords[0].Requirement -eq 'Required') { 'red' } else { 'amber' }
+                    # The requirement is read from THIS server's own failing records, not from
+                    # $probeRecords[0] - which is the first record across every server in the table.
+                    # A row where one server's probe is Optional and another's is Required took its
+                    # colour from whichever happened to sort first, so a genuinely blocked REQUIRED
+                    # port was painted amber (advisory) because a different server's probe for the
+                    # same port was optional.
+                    $rowRequirement = @($failed.Requirement | Where-Object { $_ }) + @($srvRecords.Requirement | Where-Object { $_ })
+                    $class = if (@($rowRequirement)[0] -eq 'Required') { 'red' } else { 'amber' }
                     $tooltip = (@(foreach ($f in $failed) { [string] $f.Target + ': ' + [string] $f.Detail })) -join ' | '
                     '<td class="{0}" title="{1}">{2}/{3} open</td>' -f $class, (ConvertTo-mdiHtmlEncoded $tooltip), $ok.Count, $measurable.Count
                 }
@@ -7006,7 +12490,7 @@ function Get-mdiRequiredPortsHtml {
         $requirement = @($probeRecords | Select-Object -ExpandProperty Requirement -Unique)[0]
         [void] $lines.Add(('<tr><td style="text-align:left" title="{0}">{1}<br/><small>{2}</small></td><td>{3}</td><td>{4}</td><td>{5}</td>{6}</tr>' -f
                 (ConvertTo-mdiHtmlEncoded $probe.Notes), (ConvertTo-mdiHtmlEncoded $probe.Name), (ConvertTo-mdiHtmlEncoded $requirement),
-                $probe.Protocol, $probe.Port, (ConvertTo-mdiHtmlEncoded $probe.Scope), ($cells -join '')))
+                (ConvertTo-mdiHtmlEncoded $probe.Protocol), (ConvertTo-mdiHtmlEncoded $probe.Port), (ConvertTo-mdiHtmlEncoded $probe.Scope), ($cells -join '')))
     }
     [void] $lines.Add('</table></div>')
 
@@ -7019,7 +12503,8 @@ function Get-mdiRequiredPortsHtml {
         [void] $lines.Add('<p>At least one primary method (NTLM over RPC, NetBIOS, RDP) must succeed for every device the sensor observes. Targets where all methods fail are what lower the <a href="https://aka.ms/mdi/nnr/troubleshooting">active name resolution success rate</a>.</p>')
         [void] $lines.Add('<div class="table-scroll"><table>')
         $nnrHeaders = ($nnrProbes | ForEach-Object {
-                '<th>{0}<br/><small>{1}/{2}</small></th>' -f (ConvertTo-mdiHtmlEncoded ($_.Name -replace '^NNR - ', '')), $_.Protocol, $_.Port
+                '<th>{0}<br/><small>{1}/{2}</small></th>' -f (ConvertTo-mdiHtmlEncoded ($_.Name -replace '^NNR - ', '')),
+                (ConvertTo-mdiHtmlEncoded $_.Protocol), (ConvertTo-mdiHtmlEncoded $_.Port)
             }) -join ''
         [void] $lines.Add('<tr><th style="text-align:left">Sensor server</th><th style="text-align:left">Target</th>{0}<th>Resolvable</th></tr>' -f $nnrHeaders)
 
@@ -7045,17 +12530,23 @@ function Get-mdiRequiredPortsHtml {
                         '<td class="grey">N/A</td>'
                     } elseif ($record.Success) {
                         '<td class="green" title="{0}">Open</td>' -f (ConvertTo-mdiHtmlEncoded $record.Detail)
-                    } elseif ([string] $record.Detail -match $script:mdiPortNotTestedPattern) {
+                    } elseif (-not (Test-mdiProbeWasMeasured -Record $record)) {
                         # The probe did not run, so nothing was observed to be blocked. Calling this
                         # "Blocked" sends people to open a firewall port that may already be open.
+                        # Routed through the shared predicate rather than re-testing the Detail text:
+                        # a record with a plausible Detail but a Success that is not a real boolean
+                        # was never measured either, and fell through to the red "Blocked" cell.
                         '<td class="muted-cell" title="{0}">Not tested</td>' -f (ConvertTo-mdiHtmlEncoded $record.Detail)
                     } else {
                         '<td class="red" title="{0}">Blocked</td>' -f (ConvertTo-mdiHtmlEncoded $record.Detail)
                     }
                 }
-                $primaryOk = @($targetGroup.Group | Where-Object { $_.Group -eq 'NNR' -and $_.Success }).Count -gt 0
+                $primaryOk = @($targetGroup.Group | Where-Object { $_.Group -eq 'NNR' -and $_.Success -eq $true }).Count -gt 0
+                # Whether ANY NNR method against this target produced a measurement. Same predicate as
+                # the cells above and as the verdict, so a target nothing was measured against cannot
+                # read a red "No" here while the KPI on the same page calls it untested.
                 $primaryTested = @($targetGroup.Group | Where-Object {
-                        $_.Group -eq 'NNR' -and [string] $_.Detail -notmatch $script:mdiPortNotTestedPattern
+                        $_.Group -eq 'NNR' -and (Test-mdiProbeWasMeasured -Record $_)
                     }).Count -gt 0
                 $verdict = if ($primaryOk) { '<td class="green">Yes</td>' }
                 elseif (-not $primaryTested) { '<td class="muted-cell">Not tested</td>' }
@@ -7089,30 +12580,31 @@ function Get-mdiRequiredPortsHtml {
     # never probed. Unmeasured records are not failures; they are excluded here and, when the detail
     # carries a "not tested" marker, surface in the muted "could not be tested" table below instead.
     $failures = @($records | Where-Object {
-            $_.Applicable -eq $true -and -not $_.Success -and
-            [string] $_.Detail -notmatch $script:mdiPortNotTestedPattern
+            (Test-mdiProbeWasMeasured -Record $_) -and $_.Success -eq $false
         })
-    # One rule for Applicable = $null, applied everywhere: it is UNTESTED. It is counted in
-    # PortsUntested by the statistics, must never appear in Open, Blocked or the failures table above,
-    # and MUST be listed here. The old filter required the "not tested" detail marker, so a $null
-    # record whose detail merely looked blocked (e.g. "Connection refused") was counted in the
-    # Untested KPI yet appeared in NEITHER table - invisible while inflating a number. This population
-    # now matches PortsUntested exactly: within records that applied (Applicable -ne $false), every
-    # record that was not actually measured (Applicable is $null, or the detail is a "never ran"
-    # marker) belongs here.
+    # One rule for "not measured", applied everywhere: it is UNTESTED. It is counted in PortsUntested
+    # by the statistics, must never appear in Open, Blocked or the failures table above, and MUST be
+    # listed here. The old filter required the "not tested" detail marker, so a $null record whose
+    # detail merely looked blocked (e.g. "Connection refused") was counted in the Untested KPI yet
+    # appeared in NEITHER table - invisible while inflating a number. Both populations now go through
+    # the same shared predicate as the statistics, so the two tables and the KPI cannot disagree about
+    # which probes produced a result.
     $notTested = @($records | Where-Object {
-            $_.Applicable -ne $false -and
-            ($_.Applicable -ne $true -or [string] $_.Detail -match $script:mdiPortNotTestedPattern)
+            $_.Applicable -ne $false -and -not (Test-mdiProbeWasMeasured -Record $_)
         })
     if ($failures.Count -gt 0) {
         [void] $lines.Add('<h4>Ports that need attention</h4>')
         [void] $lines.Add('<div class="table-scroll"><table>')
         [void] $lines.Add('<tr><th style="text-align:left">Sensor server</th><th style="text-align:left">Requirement</th><th>Protocol</th><th>Port</th><th style="text-align:left">Target</th><th style="text-align:left">Result</th></tr>')
-        foreach ($failure in ($failures | Sort-Object Server, Port, Target)) {
+        # Port is cast for the sort. A record whose Port arrived as a STRING - from a JSON round trip,
+        # a hand-edited baseline, or another tool's handling - sorts lexically, so the table read
+        # 10, 135, 3389, 389, 53, 9 instead of 9, 10, 53, 135, 389, 3389. The same cast is already
+        # applied to LatencyMs a few lines below for exactly this reason.
+        foreach ($failure in ($failures | Sort-Object Server, @{ Expression = { [int] ($_.Port -as [int]) } }, Port, Target)) {
             $class = if ($failure.Requirement -eq 'Required') { 'red' } else { 'amber' }
             [void] $lines.Add(('<tr><td style="text-align:left">{0}</td><td style="text-align:left">{1}</td><td>{2}</td><td class="{3}">{4}</td><td style="text-align:left">{5}</td><td style="text-align:left">{6}</td></tr>' -f
-                    (ConvertTo-mdiHtmlEncoded $failure.Server), (ConvertTo-mdiHtmlEncoded $failure.Name), $failure.Protocol,
-                    $class, $failure.Port, (ConvertTo-mdiHtmlEncoded $failure.Target), (ConvertTo-mdiHtmlEncoded $failure.Detail)))
+                    (ConvertTo-mdiHtmlEncoded $failure.Server), (ConvertTo-mdiHtmlEncoded $failure.Name), (ConvertTo-mdiHtmlEncoded $failure.Protocol),
+                    $class, (ConvertTo-mdiHtmlEncoded $failure.Port), (ConvertTo-mdiHtmlEncoded $failure.Target), (ConvertTo-mdiHtmlEncoded $failure.Detail)))
         }
         [void] $lines.Add('</table></div>')
     }
@@ -7125,21 +12617,34 @@ function Get-mdiRequiredPortsHtml {
             'The usual cause is that the account running this script could not reach the server over WMI, or the server was unreachable.</p>')
         [void] $lines.Add('<div class="table-scroll"><table>')
         [void] $lines.Add('<tr><th style="text-align:left">Sensor server</th><th style="text-align:left">Requirement</th><th>Protocol</th><th>Port</th><th style="text-align:left">Target</th><th style="text-align:left">Reason</th></tr>')
-        foreach ($row in ($notTested | Sort-Object Server, Port, Target)) {
+        foreach ($row in ($notTested | Sort-Object Server, @{ Expression = { [int] ($_.Port -as [int]) } }, Port, Target)) {
             [void] $lines.Add(('<tr><td style="text-align:left">{0}</td><td style="text-align:left">{1}</td><td>{2}</td><td class="muted-cell">{3}</td><td style="text-align:left">{4}</td><td style="text-align:left">{5}</td></tr>' -f
-                    (ConvertTo-mdiHtmlEncoded $row.Server), (ConvertTo-mdiHtmlEncoded $row.Name), $row.Protocol,
-                    $row.Port, (ConvertTo-mdiHtmlEncoded $row.Target), (ConvertTo-mdiHtmlEncoded $row.Detail)))
+                    (ConvertTo-mdiHtmlEncoded $row.Server), (ConvertTo-mdiHtmlEncoded $row.Name), (ConvertTo-mdiHtmlEncoded $row.Protocol),
+                    (ConvertTo-mdiHtmlEncoded $row.Port), (ConvertTo-mdiHtmlEncoded $row.Target), (ConvertTo-mdiHtmlEncoded $row.Detail)))
         }
         [void] $lines.Add('</table></div>')
     }
     # Latency separates "blocked" from "reachable but slow", which matters when a sensor sits across a WAN link
     $timed = @($records | Where-Object { $null -ne $_.LatencyMs -and $_.Success })
     if ($timed.Count -gt 0) {
+        # Only the slowest handful earn a row, but until now nothing said so: the lead sentence claimed
+        # every successful probe was listed, and the average was taken over the whole population while
+        # the visible rows were the slow tail, so the stated number could not be reconciled with any row
+        # on screen. A reader cannot tell measured-and-omitted from never-measured unless the omission
+        # is stated, so the count shown, the count measured, and the population the average covers are
+        # now all on the page.
         $slowest = @($timed | Sort-Object { [int] $_.LatencyMs } -Descending | Select-Object -First 10)
         $average = [int] [math]::Round((($timed | Measure-Object -Property LatencyMs -Average).Average))
         [void] $lines.Add('<h4>Probe latency</h4>')
-        [void] $lines.Add('<p class="muted">Round-trip time of each successful probe. Average ' + $average +
-            ' ms. Consistently high values point at a slow or saturated link rather than a blocked port.</p>')
+        if ($slowest.Count -lt $timed.Count) {
+            [void] $lines.Add(('<p class="muted">Round-trip time of the {0} slowest of {1} successful probes. Average {2} ms across all {1} of them. ' -f
+                    $slowest.Count, $timed.Count, $average) +
+                'Consistently high values point at a slow or saturated link rather than a blocked port.</p>')
+        }
+        else {
+            [void] $lines.Add('<p class="muted">Round-trip time of each successful probe. Average ' + $average +
+                ' ms. Consistently high values point at a slow or saturated link rather than a blocked port.</p>')
+        }
         [void] $lines.Add('<div class="table-scroll"><table>')
         [void] $lines.Add('<tr><th style="text-align:left">Sensor server</th><th style="text-align:left">Probe</th><th style="text-align:left">Target</th><th>Latency</th></tr>')
         foreach ($row in $slowest) {
@@ -7186,7 +12691,7 @@ function Get-mdiSensorV3Html {
                 $status = $check.Status
                 if ($status -eq $true) {
                     '<td class="green" title="{0}">Pass</td>' -f (ConvertTo-mdiHtmlEncoded $check.Detail)
-                } elseif ($check.PSObject.Properties['Measured'] -and -not $check.Measured) {
+                } elseif ($check.PSObject.Properties['Measured'] -and $check.Measured -ne $true) {
                     # Distinguished from an informational N/A: this check did not run at all, so calling
                     # it "N/A" understates that the result is missing rather than not applicable.
                     '<td class="muted-cell" title="{0}">Not tested</td>' -f (ConvertTo-mdiHtmlEncoded $check.Detail)
@@ -7210,15 +12715,29 @@ function Get-mdiSensorV3Html {
     [void] $lines.Add('<tr><td style="text-align:left"><b>Current sensor state</b></td><td></td>{0}</tr>' -f $stateCells)
 
     $migrationCells = ($servers | ForEach-Object {
-            if ($_.Details.SensorV3ReadyDetails.MigrationEligible) { '<td class="green">Yes</td>' } else { '<td class="amber">No</td>' }
+            # Three-way, and compared to $true rather than tested for truthiness: the strings
+            # 'False' and 'N/A' are both truthy, so a server whose migration eligibility was
+            # never determined rendered a green "Yes" - advising an in-place migration on the
+            # strength of a measurement that did not happen.
+            if ($_.Details.SensorV3ReadyDetails.MigrationEligible -eq $true) { '<td class="green">Yes</td>' }
+            elseif ($_.Details.SensorV3ReadyDetails.MigrationEligible -eq $false) { '<td class="amber">No</td>' }
+            else { '<td class="na">Not determined</td>' }
         }) -join ''
     [void] $lines.Add('<tr><td style="text-align:left"><b>Eligible for in-place migration</b></td><td></td>{0}</tr>' -f $migrationCells)
 
     $readyCells = ($servers | ForEach-Object {
             # Compared against $true explicitly: 'N/A' is truthy in PowerShell, so a plain if() rendered
             # a server whose checks could not be read as meeting every prerequisite.
-            if ($_.SensorV3Ready -eq $true) { '<td class="green">Yes</td>' }
-            elseif ([string] $_.SensorV3Ready -eq 'N/A') { '<td class="muted-cell" title="The prerequisites could not be read on this server">Not tested</td>' }
+            #
+            # And NORMALISED, not string-compared against 'N/A'. Everything that was neither exactly
+            # $true nor the exact string 'N/A' - $null, '', or an unrecognised word - fell through to a
+            # red "No": a flat statement that the server does not meet the v3.x prerequisites, made
+            # about a server whose prerequisites were never read. Get-mdiReportStatistics already
+            # normalises this same value and excludes those servers from the KPI denominator, so the
+            # two surfaces contradicted each other - a red "No" underneath a headline of "0/0 evaluated".
+            $ready = ConvertTo-mdiBoolean $_.SensorV3Ready
+            if ($ready -eq $true) { '<td class="green">Yes</td>' }
+            elseif ($null -eq $ready) { '<td class="muted-cell" title="The prerequisites could not be read on this server">Not tested</td>' }
             else { '<td class="red">No</td>' }
         }) -join ''
     [void] $lines.Add('<tr><td style="text-align:left"><b>Meets the v3.x prerequisites</b></td><td></td>{0}</tr>' -f $readyCells)
@@ -7319,6 +12838,8 @@ h1,h2,h3,h4{color:var(--heading);margin:0}
 .card-grid .card{margin-bottom:0}
 .card.wide{grid-column:1/-1}
 .section-intro{color:var(--muted);margin:0 0 20px;max-width:100ch;font-size:13.5px}
+.locale-notice{background:var(--warn-bg);border:1px solid var(--warn);border-left-width:4px;border-radius:8px;padding:12px 16px;margin:0 0 18px;font-size:13px;color:var(--warn);max-width:110ch}
+.locale-notice b{display:block;margin-bottom:4px}
 .panel>.card:last-child{margin-bottom:12px}
 
 /* ---------- KPI ---------- */
@@ -7346,8 +12867,8 @@ h1,h2,h3,h4{color:var(--heading);margin:0}
 .barchart{display:flex;flex-direction:column;gap:9px}
 .bar-row{display:grid;grid-template-columns:minmax(140px,240px) minmax(80px,1fr) 108px;gap:14px;align-items:center}
 .bar-label{font-size:12.5px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.bar-track{background:var(--surface-2);border:1px solid var(--border);border-radius:999px;height:16px;overflow:hidden}
-.bar-fill{height:100%;border-radius:999px;transition:width .5s cubic-bezier(.2,.8,.2,1)}
+.bar-track{background:var(--surface-2);border:1px solid var(--border);border-radius:999px;height:16px;overflow:hidden;display:flex}
+.bar-fill{height:100%;flex:0 0 auto;transition:width .5s cubic-bezier(.2,.8,.2,1)}
 .bar-fill.ok{background:linear-gradient(90deg,var(--ok),#4bc47a)}
 .bar-fill.warn{background:linear-gradient(90deg,var(--warn),#e6a15c)}
 .bar-fill.bad{background:linear-gradient(90deg,var(--bad),#e85b66)}
@@ -7416,6 +12937,7 @@ td.left{overflow-wrap:break-word}
 .pill.warn{background:var(--warn-bg);color:var(--warn)}
 .pill.na{background:var(--na-bg);color:var(--na)}
 .empty-state{background:var(--ok-bg);color:var(--ok);border-radius:10px;padding:16px 18px;font-weight:600;margin:0}
+.empty-state.warn{background:var(--warn-bg);color:var(--warn)}
 
 /* ---------- callout ---------- */
 /* Used where a caveat changes how the numbers on the page must be read, so it has to be
@@ -7611,7 +13133,12 @@ function Get-mdiReportScript {
     box.parentNode.appendChild(status);
     box.addEventListener("input", function () {
       var q = box.value.toLowerCase();
-      var scope = box.closest(".panel") || document;
+      // Scoped to the CARD, not the panel. A panel holds several unrelated cards - the domain
+      // controller tab alone carries Domain controllers, Sensor health and Time synchronization - so a
+      // box labelled "Filter domain controllers" was hiding rows in all three, and the CSV export,
+      // which reads the visible rows, wrote those other tables out as headers with no data. The filter
+      // input is emitted inside its own card, so .card is the exact table it names.
+      var scope = box.closest(".card") || box.closest(".panel") || document;
       var total = 0, shown = 0;
       [].slice.call(scope.querySelectorAll("table tr")).forEach(function (row) {
         if (row.getElementsByTagName("th").length) { return; }
@@ -7633,8 +13160,20 @@ function Get-mdiReportScript {
       viewToggle.textContent = view === "classic" ? "Modern view" : "Classic view";
       viewToggle.setAttribute("aria-pressed", String(view === "classic"));
     }
-    // Returning from classic view must restore a single visible panel
-    if (view !== "classic") { activate(currentTab(), false); }
+    if (view === "classic") {
+      // Classic view hides the filter boxes but a filter typed beforehand stays applied, and the rows
+      // it hid are hidden by an inline style the stylesheet cannot reach. The whole report then reads
+      // as healthy because the failing rows are simply gone, with no filter box on screen to explain
+      // why. Switching to classic clears every filter and shows every row.
+      [].slice.call(document.querySelectorAll(".filter input")).forEach(function (box) { box.value = ""; });
+      [].slice.call(document.querySelectorAll(".filter-count")).forEach(function (c) {
+        c.textContent = ""; c.className = "filter-count";
+      });
+      [].slice.call(document.querySelectorAll("table tr")).forEach(function (row) { row.style.display = ""; });
+    } else {
+      // Returning from classic view must restore a single visible panel
+      activate(currentTab(), false);
+    }
   }
   var storedView = null;
   try { storedView = window.localStorage.getItem("mdi-view"); } catch (e) { /* storage can be blocked */ }
@@ -7649,6 +13188,35 @@ function Get-mdiReportScript {
 
   var printBtn = document.getElementById("printBtn");
   if (printBtn) { printBtn.addEventListener("click", function () { window.print(); }); }
+
+  // A filter typed in the modern view survives into the printed page, and the print stylesheet hides
+  // the filter controls - so the PDF omitted the failing rows and removed the only thing on screen that
+  // could have explained the omission. Switching to classic view already clears filters, but printing
+  // directly does not, and Ctrl+P bypasses the button entirely.
+  //
+  // The filter value is stashed and replayed through the box's own input handler rather than the rows
+  // being reset directly, so there is one implementation of "which rows match" and the on-screen state
+  // is exactly restored afterwards, including the "n of m row(s) shown" counters.
+  var printFilterState = [];
+  window.addEventListener("beforeprint", function () {
+    printFilterState = [];
+    [].slice.call(document.querySelectorAll(".filter input")).forEach(function (box) {
+      printFilterState.push({ box: box, value: box.value });
+      if (box.value) {
+        box.value = "";
+        box.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+    });
+  });
+  window.addEventListener("afterprint", function () {
+    printFilterState.forEach(function (saved) {
+      if (saved.value) {
+        saved.box.value = saved.value;
+        saved.box.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+    });
+    printFilterState = [];
+  });
 
   // Export every visible table of the active panel as a single CSV.
   // In classic view all panels are visible, so the whole report is exported.
@@ -7668,10 +13236,11 @@ function Get-mdiReportScript {
           // rows the reader could no longer see was filtered out - evidence with holes in it.
           if (!isClassic && row.style.display === "none") { return; }
           var cells = [].slice.call(row.cells).map(function (cell) {
-            // RFC 4180 quoting only: wrap in double quotes and double any embedded quote. Newlines
-            // inside a quoted field are legal CSV and are preserved - the detail strings in this
-            // report legitimately contain multi-line error text, and collapsing them lost content.
-            var v = (cell.innerText || "");
+          // textContent, not innerText: innerText is what the layout renders, so it is an empty
+          // string for a row hidden by display:none. The classic export deliberately includes rows a
+          // stale filter had hidden, and reading innerText wrote those rows out as a line of empty
+          // commas - the hole in the evidence was still there, just harder to see.
+          var v = (cell.textContent || "");
             // Neutralise spreadsheet formula injection: a value beginning =, +, - or @ is executed as
             // a formula when the CSV is opened in Excel, and these values come from Active Directory
             // and error messages. Prefix with a tab so the cell is treated as text without deleting
@@ -7699,6 +13268,53 @@ function Get-mdiReportScript {
 '@
 }
 
+function Get-mdiLocaleNoticeHtml {
+    <#
+        A caveat shown in the report ONLY when the scanning host is not running an English locale.
+
+        The script is written to be locale-safe - localised command output is parsed by GUID and
+        column position rather than by translated text, numbers that reach CSS are formatted
+        invariantly, and every artefact is UTF-8 with a BOM - and that is verified under de-DE,
+        fr-FR, tr-TR, ja-JP and ru-RU. What has never been done is a run on genuinely non-English
+        WINDOWS, where the operating system itself returns translated strings rather than just the
+        .NET culture being different. The honest position is that the risk is low but unproven, and
+        the person best placed to notice a wrong answer is the operator reading the report.
+
+        Deliberately conditional. A caveat printed on every run is one that everybody learns to scroll
+        past, which would waste it on exactly the runs where it matters. Both the UI culture (what
+        Windows returns) and the current culture (how numbers and dates are read) are checked, because
+        either can differ on its own.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)] [string] $UiCulture = [Globalization.CultureInfo]::CurrentUICulture.Name,
+        [Parameter(Mandatory = $false)] [string] $Culture = [Globalization.CultureInfo]::CurrentCulture.Name
+    )
+
+    # Ordinal, because this is the very comparison a culture-sensitive test would get wrong.
+    $isEnglish = {
+        param($name)
+        [string]::IsNullOrWhiteSpace($name) -or
+        $name.StartsWith('en-', [StringComparison]::OrdinalIgnoreCase) -or
+        [string]::Equals($name, 'en', [StringComparison]::OrdinalIgnoreCase) -or
+        [string]::Equals($name, 'Invariant Language (Invariant Country)', [StringComparison]::OrdinalIgnoreCase)
+    }
+    if ((& $isEnglish $UiCulture) -and (& $isEnglish $Culture)) { return '' }
+
+    $shown = if ([string]::Equals($UiCulture, $Culture, [StringComparison]::OrdinalIgnoreCase)) {
+        $UiCulture
+    } else {
+        '{0} / {1}' -f $UiCulture, $Culture
+    }
+
+    '<div class="locale-notice"><b>This report was produced on a non-English system ({0})</b>' -f (ConvertTo-mdiHtmlEncoded $shown) +
+    'Results are expected to be correct: this tool reads audit policy, power scheme and service state by identifier ' +
+    'rather than by translated text. That behaviour is verified under several non-English cultures, but it has not ' +
+    'been proven end to end on a non-English Windows installation. If a result here disagrees with what you can see ' +
+    'on the machine itself - most likely advanced audit policy, the power scheme, or time synchronisation - treat ' +
+    'the machine as correct and report the discrepancy.</div>'
+}
+
 function Set-MdiReadinessReport {
     param (
         [Parameter(Mandatory = $true)] [string] $Domain,
@@ -7711,12 +13327,18 @@ function Set-MdiReadinessReport {
 
     $jsonReportFile = Join-Path -Path $Path -ChildPath ('mdi-{0}.json' -f (ConvertTo-mdiSafeFileName $Domain))
     Write-mdiVerbose "Creating detailed json report: $jsonReportFile"
+    # -Encoding utf8 is explicit. Out-File's default in Windows PowerShell 5.1 is UTF-16LE with a BOM,
+    # so the machine-readable report was written in an encoding almost nothing reads: node's JSON.parse,
+    # python's json.load and jq all fail outright on the byte-order mark. The report was designed to be
+    # consumed by automation and could not be. The sibling HTML write next to it already passed
+    # -Encoding utf8; only the JSON was left on the default, which is exactly why it went unnoticed.
+    #
     # -ErrorAction Stop, because Out-File's write failure is NON-terminating by default: a read-only
     # folder, a path that is a file, or a UNC share without write rights produced no report at all
     # while the script went on to print "READY" and a blank report path. Claiming success for a run
     # that wrote nothing is worse than failing.
     try {
-        $ReportData | ConvertTo-Json -Depth 7 | Out-File -FilePath $jsonReportFile -Force -ErrorAction Stop
+        Write-mdiReportFile -Content ($ReportData | ConvertTo-Json -Depth 7) -FilePath $jsonReportFile
     } catch {
         throw ('Unable to write the JSON report to {0}: {1}' -f $jsonReportFile, $_.Exception.Message)
     }
@@ -7728,15 +13350,37 @@ function Set-MdiReadinessReport {
         if ($serverList.Count -gt 0) {
             # Collected from the objects rather than through Get-Member, which throws on an empty pipeline,
             # and which only saw properties present on the first object.
-            $properties = [collections.arraylist] @($serverList | ForEach-Object { Get-mdiCheckProperty -Server $_ } |
-                    Select-Object -ExpandProperty Name -Unique)
+            #
+            # The UNREAD checks are collected too, and this is not a refinement - without them a check
+            # that failed to read on EVERY server had no column at all. Get-mdiEffectiveCheckProperty is
+            # built on Get-mdiCheckProperty, which drops any value that does not parse to a boolean, so
+            # the 'N/A' marker is ABSENT from its output rather than merely non-boolean. An estate with
+            # the Remote Registry service stopped, or a denied certificate-store read, therefore produced
+            # a table with no RootCertificates and no CAAuditing column whatsoever - and the reader saw
+            # what looked like a complete account of everything examined. That is the systemic failure
+            # most worth surfacing, and it was the one the table could not show.
+            #
+            # Get-mdiUnreadCheckName is the same function the per-check chart uses for this, which had
+            # the identical defect and was fixed there; it already excludes the descriptive columns, so
+            # nothing is duplicated with $propsToAdd below. The cells themselves need no special case:
+            # an unread check's stored value is the 'N/A' marker, which the blanket rewrite further down
+            # renders as "Not tested" with the tooltip explaining it could not be read.
+            $checkColumns = @($serverList | ForEach-Object { Get-mdiEffectiveCheckProperty -Server $_ } |
+                    Select-Object -ExpandProperty Name)
+            $unreadColumns = @($serverList | ForEach-Object { Get-mdiUnreadCheckName -Server $_ })
+            $properties = [collections.arraylist] @(@($checkColumns) + @($unreadColumns) | Select-Object -Unique)
             $propsToAdd = @('SensorVersion', 'CapturingComponent', 'MachineType', 'Comment')
+            # The descriptive columns are added whether or not any CHECK was readable. They used to be
+            # dropped in the else branch, so an estate where every check failed to read lost the facts
+            # that had been read successfully - the sensor version, the capture driver and the platform
+            # were all discarded and the table collapsed to FQDN and Comment. Losing measurements that
+            # succeeded because other measurements failed is straightforward data loss.
             if ($properties.Count -gt 0) {
                 $properties.Insert(0, 'FQDN')
-                [void] $properties.AddRange($propsToAdd)
             } else {
-                $properties = [collections.arraylist]@('FQDN', 'Comment')
+                $properties = [collections.arraylist]@('FQDN')
             }
+            [void] $properties.AddRange($propsToAdd)
 
             # A check that could not be read is not a failed check. It is rendered with the reason so the
             # reader is not sent to fix a setting that was never actually measured. A server that could
@@ -7744,26 +13388,48 @@ function Set-MdiReadinessReport {
             # reached and then failed part way through is badged differently: its results are real, and
             # labelling it "not reachable" would tell the reader to ignore findings that are valid.
             $rows = @(foreach ($srv in ($serverList | Sort-Object FQDN)) {
-                    $unreachable = [bool] $srv.Unreachable
+                    $unreachable = Test-mdiServerIsUnreachable -Server $srv
                     $partial = (-not $unreachable) -and [bool] $srv.PartialFailure
                     $reason = if ($unreachable -or $partial) { [string] $srv.Comment } else { '' }
+                    # The same measurement-resolved values the score, the KPI counts and the verdict
+                    # use. Reading the raw property here let this table paint RequiredPorts green on a
+                    # server whose own detail records showed a required port measured shut - the table
+                    # and the summary above it disagreeing about the same server, with the table
+                    # showing the more comfortable answer.
+                    $effective = @{}
+                    foreach ($pair in @(Get-mdiEffectiveCheckProperty -Server $srv)) {
+                        $effective[[string] $pair.Name] = $pair.Value
+                    }
                     $ordered = [ordered]@{}
                     foreach ($p in $properties) {
-                        $value = $srv.PSObject.Properties[$p]
-                        $cell = if ($null -eq $value) { $null } else { $value.Value }
-                        # A descriptive column holding 'N/A' means "there is none", not "it could not
-                        # be read". The blanket rewrite further down turns every N/A cell into
-                        # "Not tested" with a tooltip saying the check could not be read, so a server
-                        # with no sensor installed was reported as one whose sensor version could not
-                        # be determined - and it inflated the apparent number of unread checks the
-                        # reader sees. Descriptive columns are given their real meaning here, before
-                        # that rewrite can reach them.
-                        if ([string] $cell -eq 'N/A' -and $p -in $propsToAdd) {
-                            $cell = switch ($p) {
-                                'SensorVersion' { 'Not installed' }
-                                'CapturingComponent' { 'None' }
-                                'MachineType' { 'Unknown' }
-                                default { '-' }
+                        $cell = if ($effective.ContainsKey([string] $p)) {
+                            $effective[[string] $p]
+                        } else {
+                            $value = $srv.PSObject.Properties[$p]
+                            if ($null -eq $value) { $null } else { $value.Value }
+                        }
+                        # A descriptive column holding 'N/A' means the value COULD NOT BE READ. It is
+                        # left alone here so the blanket rewrite below turns it into "Not tested"
+                        # with the tooltip that says so.
+                        #
+                        # This used to rewrite 'N/A' into a positive claim - SensorVersion became
+                        # "Not installed" and CapturingComponent became "None" - which asserted a
+                        # measured absence on the strength of a read that failed. Worse for the
+                        # capture column, it was exactly inverted: Get-mdiCaptureComponent already
+                        # returns 'N/A' for "the registry could not be opened" and an EMPTY string
+                        # for "the registry was read and no driver is installed", so the unread case
+                        # rendered "None" while the case that really means none rendered blank. The
+                        # readers of those two columns then disagreed with the sensor health table
+                        # and the v3 tab about the same server in the same run.
+                        #
+                        # The genuine-absence cases now arrive already spelled out - 'Not installed'
+                        # from Get-mdiSensorVersion - or are given their wording here from a value
+                        # that was actually read.
+                        if ($p -in $propsToAdd -and [string] $cell -ne 'N/A') {
+                            if ($p -eq 'CapturingComponent' -and [string]::IsNullOrWhiteSpace([string] $cell)) {
+                                $cell = 'None'
+                            } elseif ($p -eq 'MachineType' -and [string]::IsNullOrWhiteSpace([string] $cell)) {
+                                $cell = 'Unknown'
                             }
                         }
                         $ordered[$p] = $cell
@@ -7776,14 +13442,20 @@ function Set-MdiReadinessReport {
                     }
                 })
 
-            $table = ((($rows | ForEach-Object { $_.Row } | ConvertTo-Html -Fragment) `
-                        -replace ('<th>(?!FQDN)(?!{0})(\w+)' -f ($propsToAdd -join '|')), '<th><a href="https://aka.ms/mdi/$1">$1</a>') `
-                    -replace '<td>True</td>', '<td class="green">True</td>') `
-                -replace '<td>False</td>', '<td class="red">False</td>' `
-                -join [environment]::NewLine
+            $table = @($rows | ForEach-Object { $_.Row } | ConvertTo-Html -Fragment)
+            $table = $table -replace ('<th>(?!FQDN)(?!{0})(\w+)' -f ($propsToAdd -join '|')), '<th><a href="https://aka.ms/mdi/$1">$1</a>'
+            # The first cell of a row is the server NAME, never a status, so it is claimed BEFORE the
+            # status rules run. Those patterns match a bare '<td>True</td>' anywhere in the row, and
+            # the FQDN is the first cell - so a server actually named 'True' was claimed by the status
+            # rule, painted green as though it were a passing check, and then no longer matched
+            # '<tr><td>', losing its monospace styling as well. Once the first cell carries
+            # class="mono" no status pattern can match it, while every genuine status cell still does.
+            $table = $table -replace '<tr><td>', '<tr><td class="mono">'
+            $table = $table -replace '<td>True</td>', '<td class="green">True</td>'
+            $table = $table -replace '<td>False</td>', '<td class="red">False</td>'
+            $table = $table -join [environment]::NewLine
 
             $table = $table -replace '<th>FQDN</th>', '<th class="left">FQDN</th>'
-            $table = $table -replace '<tr><td>', '<tr><td class="mono">'
 
             # 'Not tested' rather than 'N/A': the check did not return a neutral answer, it did not run.
             $table = $table -replace '<td>N/A</td>', '<td class="muted-cell" title="This check could not be read on this server, so its state is unknown">Not tested</td>'
@@ -7793,7 +13465,12 @@ function Set-MdiReadinessReport {
             # results were measured and are worth acting on.
             foreach ($row in ($rows | Where-Object { $_.Unreachable -or $_.Partial })) {
                 $fqdn = [string] $row.Row.FQDN
-                $encoded = ConvertTo-mdiHtmlEncoded $fqdn
+                # Two DIFFERENT encoders, deliberately. The match key has to reproduce what
+                # ConvertTo-Html already emitted into $table (numeric entities for the apostrophe and
+                # for anything non-ASCII); the text being INSERTED is built by hand here and only
+                # needs the four markup characters escaped.
+                $encoded = ConvertTo-mdiTableCellEncoded $fqdn
+                $displayName = ConvertTo-mdiHtmlEncoded $fqdn
                 $reasonText = ConvertTo-mdiHtmlEncoded $row.Reason
                 $rowClass = if ($row.Unreachable) { 'unreachable' } else { 'partial' }
                 $badgeText = if ($row.Unreachable) { 'not reachable' } else { 'partial results' }
@@ -7803,7 +13480,7 @@ function Set-MdiReadinessReport {
                 # corrupted the row. Escaping every $ as $$ makes the substitution literal. The pattern
                 # side is already regex-escaped.
                 $replacement = ('<tr class="{0}" title="{1}"><td class="mono">{2} <span class="badge-warn">{3}</span></td>' -f
-                    $rowClass, $reasonText, $encoded, $badgeText).Replace('$', '$$')
+                    $rowClass, $reasonText, $displayName, $badgeText).Replace('$', '$$')
                 $table = $table -replace ('<tr><td class="mono">{0}</td>' -f [regex]::Escape($encoded)), $replacement
             }
 
@@ -7861,18 +13538,33 @@ function Set-MdiReadinessReport {
         })
     $dsTable = @($dsRows | ConvertTo-Html -Fragment)
     $dsTable = $dsTable -replace '<th>(?!Domain)(\w+)', '<th><a href="https://aka.ms/mdi/$1">$1</a>'
+    # The first-column rewrite runs BEFORE the status rewrites, not after. The status patterns match a
+    # bare '<td>True</td>' anywhere in the row, and the Domain name is the FIRST cell - so a domain
+    # actually named 'True' or 'False' was claimed by the status rule, painted with the semantic
+    # colour and then no longer matched '<tr><td>', losing its monospace styling as well. Claiming the
+    # first cell as monospace first makes it '<td class="mono">True</td>', which no status pattern can
+    # match, while every genuine status cell downstream still does.
+    $dsTable = $dsTable -replace '<tr><td>', '<tr><td class="mono">'
     $dsTable = $dsTable -replace '<td>True</td>', '<td class="green">True</td>'
     $dsTable = $dsTable -replace '<td>False</td>', '<td class="red">False</td>'
     $dsTable = $dsTable -replace '<td>Not applicable</td>', '<td class="grey" title="Not applicable: this role was not found in this domain">Not applicable</td>'
     $dsTable = $dsTable -replace '<td>Not tested</td>', '<td class="muted-cell" title="This setting could not be read on this domain, so its state is unknown">Not tested</td>'
     $dsTable = $dsTable -replace '<th>Domain</th>', '<th class="left">Domain</th>'
-    $dsTable = $dsTable -replace '<tr><td>', '<tr><td class="mono">'
     $htmlDS = '<div class="table-scroll">' + ($dsTable -join [environment]::NewLine) + '</div>'
     # The blanket N/A rewrite that used to live here is gone: it could not tell "this role is not
     # present" from "this could not be read", and resolved every case to the reassuring one. Both are
     # now decided per cell above, where the Measured flag is available.
 
-    $allServers = @(@($ReportData.DomainControllers) + @($ReportData.CAServers) + @($ReportData.EntraConnectServers) | Where-Object { $_ })
+    # Merged by FQDN, exactly as the statistics and the verdict are. A host that also holds the CA and
+    # Entra Connect roles is discovered once per role, so the unmerged list carried it three times -
+    # and the tables built from it showed its blocked port three times, its sensor health three times
+    # and its clock three times, while the KPI above it (built from the merged list) counted one
+    # server with one blocked port. Two numbers on the same page, derived from the same fact,
+    # disagreeing by a factor of three.
+    #
+    # Merging is pessimistic, so a failure measured under any one role survives into the merged row.
+    $allServers = @(Merge-mdiServerByFqdn -Server @(@($ReportData.DomainControllers) + @($ReportData.CAServers) + @($ReportData.EntraConnectServers) |
+                Where-Object { $_ }))
 
     $htmlPorts = if ($SkipNetworkPorts) {
         '<p class="muted">Network port validation skipped</p>'
@@ -7882,7 +13574,20 @@ function Set-MdiReadinessReport {
 
     $htmlSensorHealth = Get-mdiSensorHealthHtml -Server $allServers
     $htmlTimeSync = Get-mdiTimeSyncHtml -Server $allServers
-    $htmlCapacity = Get-mdiCapacityHtml -Server @($ReportData.DomainControllers | Where-Object { $_ })
+    # Merged by FQDN, like every other table on this page. Get-mdiDomainControllerInventory emits ONE
+    # ENTRY PER ADDRESS - a multi-homed domain controller has to be probed on each NIC - so the raw
+    # list holds the same physical server once per IP. This was the only section still fed that raw
+    # list: $htmlPorts, $htmlSensorHealth, $htmlTimeSync and $htmlSensorV3 all take $allServers. A
+    # dual-homed DC therefore rendered TWO IDENTICAL capacity rows, both carrying the same sample
+    # because Get-mdiTrafficSampleSet keys its results by host, and the summary above the table
+    # counted it twice - "2 of 2 domain controller(s)" for one machine, disagreeing with the server
+    # count every other table on the same page derived from the same fact. Sizing is read off this
+    # table, so the duplicate row also doubled the apparent number of sensors to budget for.
+    #
+    # Merged from the DOMAIN CONTROLLERS only, not from $allServers: capacity is a domain-controller
+    # question and $allServers also carries certification authority and Entra Connect hosts, which
+    # have no sensor to size and must not appear in this table.
+    $htmlCapacity = Get-mdiCapacityHtml -Server @(Merge-mdiServerByFqdn -Server @($ReportData.DomainControllers | Where-Object { $_ }))
 
     $htmlSensorV3 = if ($SkipSensorV3Readiness) {
         '<p class="muted">Sensor v3.x readiness validation skipped</p>'
@@ -7971,7 +13676,14 @@ function Set-MdiReadinessReport {
 
     $isReady = Test-mdiReadinessResult -ReportData $ReportData
     $verdictClass = if ($isReady) { 'ok' } else { 'bad' }
-    $verdictText = if ($isReady) { 'All prerequisites met' } else { 'Action required' }
+    # The scope qualifier is appended to BOTH verdicts, not only to READY. It was added to stop an
+    # unqualified "All prerequisites met" being produced by a run that examined a fraction of them,
+    # which is the more dangerous case - but "Action required" needs it too. An operator reading that
+    # verdict is about to work through the findings believing the list is complete, when a skipped
+    # area could be hiding more; and after fixing what they can see they will re-run and get READY,
+    # so the scan's scope has to be visible at the point they decide what to act on.
+    $verdictText = $(if ($isReady) { 'All prerequisites met' } else { 'Action required' }) +
+        (Get-mdiVerdictQualifier -ReportData $ReportData)
     $issueCount = @(Get-mdiIssueList -Statistics $stats -ReportData $ReportData).Count
     $issueBadge = if ($issueCount -gt 0) { '<span class="count bad">' + $issueCount + '</span>' } else { '' }
     $schemaText = if ($ReportData.DomainSchemaVersion.details) {
@@ -8003,6 +13715,7 @@ function Set-MdiReadinessReport {
 </div></header>
 
 <div class="wrap">
+@@LOCALENOTICE@@
 <nav class="tabs" role="tablist">
   <button class="tab" role="tab" data-target="tab-overview" aria-selected="true">Overview @@ISSUEBADGE@@</button>
   <button class="tab" role="tab" data-target="tab-dcs">Domain controllers <span class="count">@@DCCOUNT@@</span></button>
@@ -8121,23 +13834,311 @@ function Set-MdiReadinessReport {
     Replace('@@SCHEMA@@', (ConvertTo-mdiHtmlEncoded $schemaText)).
     Replace('@@SERVERCOUNT@@', [string] $stats.TotalServers).
     Replace('@@DOMAINCOUNT@@', [string] $stats.DomainCount).
-    Replace('@@DCCOUNT@@', [string] @($ReportData.DomainControllers).Count).
+    # @($null).Count is 1, not 0, so a forest where no domain controller was discovered rendered a
+    # tab badge reading "1" beside an empty table. Filtering the collection first makes the badge
+    # count real entries.
+    Replace('@@DCCOUNT@@', [string] @($ReportData.DomainControllers | Where-Object { $_ }).Count).
     Replace('@@ISSUEBADGE@@', $issueBadge).
     Replace('@@VERDICTCLASS@@', $verdictClass).
-    Replace('@@VERDICTTEXT@@', $verdictText).
-    Replace('@@JSONPATH@@', (ConvertTo-mdiHtmlEncoded $jsonReportFilePath)).
+    # Encoded like every other substitution. This was the one placeholder inserted raw: the verdict
+    # text is assembled from a fixed phrase plus the scope qualifier, which today lists only four
+    # hard-coded area names - so nothing hostile can reach it yet. That is an argument about the
+    # current callers, not about the substitution, and the next area name added to SkippedAreas would
+    # silently make it reachable. Encoding it costs nothing.
+    # Substituted raw, not encoded: this is generated markup, and its only variable part - the culture
+    # name - is encoded inside the function that builds it.
+    Replace('@@LOCALENOTICE@@', (Get-mdiLocaleNoticeHtml)).
+    Replace('@@VERDICTTEXT@@', (ConvertTo-mdiHtmlEncoded $verdictText)).
+    Replace('@@JSONPATH@@', (ConvertTo-mdiHtmlEncoded ([uri]::EscapeDataString((Split-Path -Path $jsonReportFilePath -Leaf))))).
     Replace('@@JSONFILE@@', (ConvertTo-mdiHtmlEncoded (Split-Path -Leaf $jsonReportFilePath))).
     Replace('@@VERSION@@', (ConvertTo-mdiHtmlEncoded ('v' + [string] $settings.ScriptVersion))).
-    Replace('@@TIMESTAMP@@', (ConvertTo-mdiHtmlEncoded ([datetime]::Now.ToString('yyyy-MM-dd HH:mm'))))
+    Replace('@@TIMESTAMP@@', (ConvertTo-mdiHtmlEncoded ([datetimeoffset]::Now.ToString('yyyy-MM-dd HH:mm zzz', [cultureinfo]::InvariantCulture))))
 
     $htmlReportFile = Join-Path -Path $Path -ChildPath ('mdi-{0}.html' -f (ConvertTo-mdiSafeFileName $Domain))
     Write-mdiVerbose "Creating html report: $htmlReportFile"
     try {
-        $htmlContent | Out-File -FilePath $htmlReportFile -Force -Encoding utf8 -ErrorAction Stop
+        Write-mdiReportFile -Content $htmlContent -FilePath $htmlReportFile
     } catch {
         throw ('Unable to write the HTML report to {0}: {1}' -f $htmlReportFile, $_.Exception.Message)
     }
     (Resolve-Path -Path $htmlReportFile).Path
+}
+
+function Write-mdiReportFile {
+    <#
+        Writes one of the report artefacts, retrying briefly if another process holds the file.
+
+        Out-File opens with FileShare.None, so two scans of the same estate writing to the same -Path
+        collide: the loser gets a terminating IOException and its whole run aborts. Measured with three
+        concurrent processes: 7 of 75 writes failed. Worse than the crash is WHERE it lands - the JSON,
+        the baseline history and the HTML are written in that order, so a collision on the last write
+        leaves a history that has already gained a point for a run the operator was told had failed,
+        beside a stale HTML report and a fresh JSON.
+
+        Two scans of one estate at once is an ordinary thing to do: a scheduled job overlapping a
+        manual run, or two administrators. The write is retried for a few seconds, which is far longer
+        than any of these writes takes, and only a persistent failure is raised - a read-only folder or
+        a full disk still has to fail loudly, because a run that claims success while writing nothing
+        is worse than one that stops.
+    #>
+    param (
+        [Parameter(Mandatory = $true)] [AllowEmptyString()] [string] $Content,
+        [Parameter(Mandatory = $true)] [string] $FilePath,
+        [Parameter(Mandatory = $false)] [int] $TimeoutSeconds = 20
+    )
+
+    # Rooted against the PROVIDER location before any .NET call sees it. WriteAllText below is a .NET
+    # API, and .NET resolves a relative path against [Environment]::CurrentDirectory - the directory
+    # the PROCESS started in. Set-Location moves PowerShell's own location but deliberately leaves
+    # [Environment]::CurrentDirectory alone, so the two disagree the moment an operator changes
+    # directory. -Path defaults to '.', so the most ordinary invocation there is - cd C:\Reports then
+    # run the script - wrote the report into the shell's start directory instead (C:\Windows\System32
+    # for a scheduled task) and left the operator's folder empty. The run then died rather than merely
+    # misfiling: the callers hand the same relative string to Resolve-Path afterwards to report where
+    # the artefact went, that resolves against the PowerShell location where nothing was created, and
+    # it throws - aborting the scan after every expensive collection step had already completed.
+    #
+    # GetUnresolvedProviderPathFromPSPath, not Resolve-Path or GetFullPath: Resolve-Path requires the
+    # file to exist already, which it does not on a first write, and [IO.Path]::GetFullPath would
+    # anchor to [Environment]::CurrentDirectory again and reintroduce the same split. This is also the
+    # only form that keeps a PSDrive-qualified -Path working.
+    if (-not [IO.Path]::IsPathRooted($FilePath)) {
+        $FilePath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($FilePath)
+    }
+
+    # Stopwatch, not a wall-clock deadline: a clock correction during the retry window would make this
+    # expire instantly or never expire at all.
+    $writeTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        try {
+            # WriteAllText rather than Out-File: it takes the encoding explicitly (Out-File's default
+            # in Windows PowerShell 5.1 is UTF-16LE, which broke every downstream JSON consumer once
+            # already) and it does not wrap or pad the content.
+            #
+            # UTF-8 WITH a byte-order mark, deliberately, and it is a genuine trade-off rather than an
+            # oversight. The mark is what lets Windows PowerShell 5.1 read these files back correctly:
+            # Get-Content's default encoding is ANSI, so without it a server name like dc-muenchen
+            # (with the umlaut) is mangled on the way back in, and the generated REMEDIATION SCRIPT -
+            # a .ps1 that goes through this same writer - is parsed as Windows-1252 and its non-ASCII
+            # content corrupted. Both are pinned by tests.
+            #
+            # The cost is that node's JSON.parse, python's json.load and jq all reject a BOM outright,
+            # so the JSON report cannot be read by the automation the comment above the JSON write
+            # says it is for. Measured: python raises "Unexpected UTF-8 BOM", node raises
+            # "Unexpected token". The -AsJson stdout copy carries no mark and parses cleanly, so the
+            # two surfaces of that one document genuinely disagree. Splitting the encoding per
+            # artefact - mark on the .ps1 and .html, none on the .json - would satisfy both, and is a
+            # deliberate decision to take rather than a defect to quietly flip.
+            [IO.File]::WriteAllText($FilePath, $Content, (New-Object System.Text.UTF8Encoding $true))
+            return
+        } catch [IO.IOException] {
+            # ONLY a sharing or lock violation is worth retrying. DirectoryNotFoundException,
+            # FileNotFoundException and PathTooLongException all derive from IOException, so catching
+            # the base type retried them too - a mistyped -Path spent the full timeout spinning and
+            # then reported "still locked by another process after 20s", which is not what happened
+            # and sends the operator looking for a phantom second process instead of at their path.
+            # Measured: a path under a non-existent folder took the whole timeout and produced that
+            # message. The HResults are the Win32 codes ERROR_SHARING_VIOLATION (32) and
+            # ERROR_LOCK_VIOLATION (33) mapped into the 0x8007xxxx range.
+            $hresult = $_.Exception.HResult
+            $isContention = ($hresult -eq -2147024864 -or $hresult -eq -2147024863)
+            if (-not $isContention) { throw }
+            if ($writeTimer.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                throw ('Unable to write {0} - it is still locked by another process after {1}s: {2}' -f
+                    $FilePath, $TimeoutSeconds, ($_.Exception.Message -replace '[\r\n]+', ' '))
+            }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+}
+
+# Set once in Main. Every diagnostic writer consults it, because most of them live in functions that
+# have no -AsJson parameter to pass down, and threading one through sixty call sites would itself be
+# a defect waiting to happen.
+$script:mdiJsonMode = $false
+
+function Write-mdiWarning {
+    <#
+        A warning that does not corrupt the machine-readable channel.
+
+        Write-Warning emits a WarningRecord, and powershell.exe -File folds the warning stream into
+        STDOUT. Measured directly rather than assumed:
+
+            Write-Warning 'x'; Write-Output '{"json":true}'
+            ... 1> out.txt 2> err.txt
+            out.txt => "WARNING: x" then {"json":true}      err.txt => empty
+
+        So under -AsJson every warning lands in front of, or after, the JSON document and the
+        documented caller - Test-MdiReadiness.ps1 -AsJson | ConvertFrom-Json - fails with
+        "Unexpected character encountered while parsing value: W". One warning about a schema read is
+        enough to break it, and warning is the ordinary state on a large estate.
+
+        This was previously reasoned about and dismissed: an earlier note claimed the warning stream
+        "goes to stdout only when it has nowhere else to go". That was wrong, and wrong in the
+        direction that breaks the one interface built for automation. Under -AsJson the text goes to
+        stderr, where a human still sees it and a pipeline does not.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true, Position = 0)] [AllowEmptyString()] [string] $Message
+    )
+
+    if ($script:mdiJsonMode) {
+        [Console]::Error.WriteLine('WARNING: ' + $Message)
+        return
+    }
+    Write-Warning $Message
+}
+
+function Write-mdiConsole {
+    <#
+        The human-readable console output, kept OFF the success stream.
+
+        Write-Host writes to the information stream, which powershell.exe folds into stdout. With
+        -AsJson that puts the banner, the verdict and the report paths on stdout immediately before
+        the JSON document, so the obvious caller - Test-MdiReadiness.ps1 -AsJson | ConvertFrom-Json -
+        fails to parse. -AsJson exists to be machine-read, so under it the same text is written to
+        the error stream, where a human still sees it and a pipeline does not.
+
+        Write-mdiWarning is left alone: it already goes to the warning stream, which powershell.exe
+        renders on stdout only when it has nowhere else to go, and callers redirect 3> for it.
+    #>
+    param (
+        [Parameter(Mandatory = $false, Position = 0)] [AllowEmptyString()] [string] $Message = '',
+        [Parameter(Mandatory = $false)] [string] $ForegroundColor,
+        [Parameter(Mandatory = $false)] [switch] $AsJson
+    )
+
+    if ($AsJson) {
+        [Console]::Error.WriteLine($Message)
+        return
+    }
+    if ($ForegroundColor) { Write-Host $Message -ForegroundColor $ForegroundColor }
+    else { Write-Host $Message }
+}
+
+function Get-mdiVerdictQualifier {
+    <#
+        How much of the estate this run actually examined, in one sentence.
+
+        Skipping an area is legitimate - a customer with no certification authority has no reason to
+        scan for one - so a skip must not be reported as a failure. But it must not be silent either:
+        the headline verdict, the console line and the exit code are what a human and a compliance job
+        read, and an unqualified "READY / All prerequisites met" over a run that skipped the network
+        ports, the CA servers and the Entra Connect servers claims far more than was measured.
+
+        Skipping is not the only way a run examines less than it appears to. The network probes are
+        drawn from a BOUNDED SAMPLE by design - -MaxLdapTargetsPerDomain defaults to 2 and
+        -MaxNnrTargets to 5 - so an ordinary run against a fifty controller forest probes two hosts
+        for ports and five for name resolution. The report cards say so, but the console line did
+        not: it printed "READY 104/104 checks passed across 50 server(s)" over evidence gathered
+        from two of those fifty. The console line is what a scheduled job logs and what ends up in
+        someone's inbox, so the one place the sample qualification was already computed correctly
+        must not be dropped at that boundary. Statistics is optional so every existing caller that
+        only has the report keeps its previous behaviour.
+
+        The sample clause uses the SAME gate as the report cards (scope greater than probed, and
+        probed greater than zero). Probed zero means nothing was measured at all, which is a
+        different statement the "not evaluated" wording already makes, and claiming a sample over it
+        would invent a measurement.
+
+        Returns an empty string when nothing was skipped and nothing was sampled, so a full scan
+        reads exactly as before.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $ReportData,
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Statistics
+    )
+
+    $clauses = @()
+
+    $skipped = @($ReportData.SkippedAreas | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })
+    if ($skipped.Count -gt 0) {
+        $clauses += ' (not examined: {0})' -f (($skipped | ForEach-Object { [string] $_ }) -join ', ')
+    }
+
+    if ($null -ne $Statistics) {
+        $samples = @()
+        $portScope = [int] $Statistics.PortCandidateHostCount
+        $portProbed = [int] $Statistics.PortDistinctTargetCount
+        if ($portScope -gt $portProbed -and $portProbed -gt 0) {
+            $samples += 'ports {0} of {1} host(s), raise -MaxLdapTargetsPerDomain' -f $portProbed, $portScope
+        }
+        $nnrScope = [int] $Statistics.NnrCandidateCount
+        $nnrProbed = [int] $Statistics.NnrDistinctTargetCount
+        if ($nnrScope -gt $nnrProbed -and $nnrProbed -gt 0) {
+            $samples += 'name resolution {0} of {1} host(s), raise -MaxNnrTargets' -f $nnrProbed, $nnrScope
+        }
+        if ($samples.Count -gt 0) {
+            $clauses += ' (network probes used a sample: {0})' -f ($samples -join '; ')
+        }
+    }
+
+    $clauses -join ''
+}
+
+function Test-mdiDomainCheckNotAsserted {
+    <#
+        Whether a per-domain directory check was never ASKED, as opposed to asked and not answered.
+
+        One reader for the whole distinction. The Deleted Objects permission is the case that exists
+        today: -DirectoryServiceAccount is optional, and without it the producer reads the DACL in
+        full, reports who holds access, and returns 'N/A' because there was no account to assert
+        against. That is an answer to a question nobody asked - not a measurement gap.
+
+        Three surfaces could not tell it apart from the three real gaps that also return 'N/A' (an
+        ambiguous trustee, an unresolvable account, a group holder) and so treated the DEFAULT
+        invocation as a failed measurement: the verdict returned NOT READY on a healthy forest, the
+        issue list raised a High "returned no usable result", and the score card counted an unread
+        check. The HTML cell for the same fact rendered a benign grey "Not applicable" throughout,
+        because the renderer read the Measured flag and the other three did not.
+
+        Deliberately a property on the RESULT and not a value, so it cannot be confused with the
+        'N/A' spelling again; and deliberately absent-means-false, so every report written before this
+        existed - and every check that never sets it - behaves exactly as it did.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Result
+    )
+
+    if ($null -eq $Result) { return $false }
+    if ($null -eq $Result.PSObject.Properties['NotAsserted']) { return $false }
+    (ConvertTo-mdiBoolean $Result.NotAsserted) -eq $true
+}
+
+function Test-mdiDomainCheckPassed {
+    <#
+        Whether a per-domain directory check counts as PASSED.
+
+        The verdict and the issue list both used "is the string not 'False'", which treats anything
+        that is not that exact spelling as a pass - including $null, '', 0, 1 and 'Unknown', none of
+        which is a measurement. A report carrying any of those returned READY with an empty issue
+        list, which is the worst answer this tool can give about domain-wide audit coverage.
+
+        Result is the object that HOLDS the value. When it is absent altogether the report predates
+        the check - the fallback a few lines below builds exactly that shape for a report written
+        before DomainAuditing existed - and tightening the rule there would turn every legacy report
+        into four unverified findings, which is a false red for a scan that did nothing wrong. The
+        strict rule applies only when the result object is present and its value is not a measurement.
+
+        RoleMayBeAbsent marks the checks where 'N/A' is a legitimate answer rather than a gap: AD FS
+        and Exchange auditing are only meaningful when that role exists in the domain. Object auditing
+        and the Deleted Objects permission always apply, so for those 'N/A' means the SACL could not
+        be read and is never a pass.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Result,
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Value,
+        [Parameter(Mandatory = $false)] [switch] $RoleMayBeAbsent
+    )
+
+    if ($null -eq $Result) { return $true }
+    # A check that was never asserted is not a failure. It is excluded from the score separately, in
+    # Get-mdiDomainCheckState, because "nothing was asked" must not be counted as a check that passed
+    # either - that is the unmeasured-treated-as-measured class this tri-state exists to prevent.
+    if (Test-mdiDomainCheckNotAsserted -Result $Result) { return $true }
+    if ($RoleMayBeAbsent -and ([string] $Value -eq 'N/A')) { return $true }
+    (ConvertTo-mdiBoolean $Value) -eq $true
 }
 
 function Test-mdiReadinessResult {
@@ -8173,7 +14174,12 @@ function Test-mdiReadinessResult {
     # run rather than pass silently by having contributed nothing to measure. A server that WAS reached
     # and then failed one check part way through also carries a Comment, but keeps whatever it measured,
     # so it is judged on those results rather than being written off.
-    $unreachable = @($servers | Where-Object { $_.Unreachable })
+    #
+    # Through the shared predicate, not a bare truth test. The statistics normalise this flag; the
+    # verdict did not, so a report carrying the string 'False' was counted as reached by one and as
+    # missed by the other - the score said the estate was fine while the verdict refused READY, with
+    # no issue raised to explain why.
+    $unreachable = @($servers | Where-Object { Test-mdiServerIsUnreachable -Server $_ })
 
     # A check that could not be measured is recorded as 'N/A' rather than false, so that an unread
     # setting is not reported as a broken one. That means a server can answer reachability, fail every
@@ -8210,11 +14216,19 @@ function Test-mdiReadinessResult {
                 DeletedObjects   = $ReportData.DomainDeletedObjects
             })
     }
+    # Only a value that NORMALISES to true is a pass. Testing "is the string not 'False'" accepted
+    # anything that was not that exact spelling: $null, '', 0, 1, 'Unknown' - none of which is a
+    # measurement - all satisfied the verdict silently. Proven: six of ten states returned READY with
+    # an empty issue list.
+    #
+    # 'N/A' keeps its documented meaning for AD FS and Exchange only, where it means "this role is not
+    # present in the domain" and is a legitimate pass. Object auditing and the Deleted Objects
+    # permission always apply, so for those 'N/A' is a gap and never a pass.
     $domainChecksOk = @($auditedDomains | Where-Object {
-            ([string] $_.AdfsAuditing.isAdfsAuditingOk -eq 'False') -or
-            ([string] $_.ObjectAuditing.isObjectAuditingOk -eq 'False') -or
-            ([string] $_.ExchangeAuditing.isExchangeAuditingOk -eq 'False') -or
-            ([string] $_.DeletedObjects.isDeletedObjectsPermissionOk -eq 'False')
+            (-not (Test-mdiDomainCheckPassed -Result $_.AdfsAuditing -Value $_.AdfsAuditing.isAdfsAuditingOk -RoleMayBeAbsent)) -or
+            (-not (Test-mdiDomainCheckPassed -Result $_.ObjectAuditing -Value $_.ObjectAuditing.isObjectAuditingOk)) -or
+            (-not (Test-mdiDomainCheckPassed -Result $_.ExchangeAuditing -Value $_.ExchangeAuditing.isExchangeAuditingOk -RoleMayBeAbsent)) -or
+            (-not (Test-mdiDomainCheckPassed -Result $_.DeletedObjects -Value $_.DeletedObjects.isDeletedObjectsPermissionOk))
         }).Count -eq 0
 
     # A domain check that could not be READ is not a pass. 'N/A' carries two meanings here: "this role
@@ -8224,41 +14238,59 @@ function Test-mdiReadinessResult {
     # account lacks audit-read rights reported READY over a domain nobody had actually verified. That
     # is the same false green the tri-state exists to prevent, and the per-domain loop multiplies the
     # chances of hitting it. Reports written before Measured existed have no flag and are accepted.
+    # Routed through the SHARED Get-mdiDomainCheckDefinition so the verdict, the score and the HTML all
+    # decide "was this measured?" the same way. This test used to read the row-level companion
+    # properties directly, so the legacy row shape - which carries no companions but does set Measured
+    # on the RESULT object - was invisible to it: an unreadable Exchange SACL scored unread and raised
+    # an issue, yet the verdict still returned READY because none of the four companion properties
+    # existed to be found. Reports written before Measured existed still carry neither, and are still
+    # accepted, because the shared resolver returns $null for that case rather than $false.
     $unmeasuredDomains = @($auditedDomains | Where-Object {
-            ($null -ne $_.PSObject.Properties['AdfsAuditingMeasured'] -and $_.AdfsAuditingMeasured -eq $false) -or
-            ($null -ne $_.PSObject.Properties['ObjectAuditingMeasured'] -and $_.ObjectAuditingMeasured -eq $false) -or
-            ($null -ne $_.PSObject.Properties['ExchangeAuditingMeasured'] -and $_.ExchangeAuditingMeasured -eq $false) -or
-            ($null -ne $_.PSObject.Properties['DeletedObjectsMeasured'] -and $_.DeletedObjectsMeasured -eq $false)
+            $domainRow = $_
+            @(Get-mdiDomainCheckDefinition -Domain $domainRow | Where-Object { $_.Measured -eq $false }).Count -gt 0
         })
     if ($unmeasuredDomains.Count -gt 0) {
-        Write-Warning ('The directory auditing configuration could not be read for {0} domain(s): {1}. They are reported as not verified rather than as passing.' -f
+        Write-mdiWarning ('The directory auditing configuration could not be read for {0} domain(s): {1}. They are reported as not verified rather than as passing.' -f
             $unmeasuredDomains.Count, (@($unmeasuredDomains | ForEach-Object { [string] $_.Domain }) -join ', '))
     }
 
     # A domain in scope that produced no servers at all was never examined. It contributes no failures
     # precisely because nothing was measured there, so without this the run could report READY over a
     # domain it had never reached - the same false green as an empty scan, only harder to spot because
-    # the other domains look fine. Servers from before the Domain property existed are ignored here
-    # rather than treated as belonging to no domain.
-    $scopedDomains = @($ReportData.DomainsInScope | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })
-    $representedDomains = @($servers | ForEach-Object { [string] $_.Domain } |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
-    $domainsExamined = if ($representedDomains.Count -eq 0) {
-        $true
-    } else {
-        @($scopedDomains | Where-Object { $_ -notin $representedDomains }).Count -eq 0
-    }
+    # the other domains look fine.
+    #
+    # Computed by the shared helper, which is also what the statistics and the issue list use. Three
+    # hand-written copies of this comparison had drifted from the scope list they were comparing
+    # against: they used -notin (case-insensitive) while the scope was de-duplicated ordinally, so a
+    # domain scanned as "contoso.com" but listed in scope as "CONTOSO.COM" - or as "contoso.com." -
+    # was reported as never examined, and the run lost readiness over a domain it had just scanned.
+    # The domain-controller list is WRAPPED before it is passed. $ReportData is declared [object[]],
+    # so a single report object arrives as a one-element array, and member enumeration over that
+    # wrapper collapses an EMPTY DomainControllers array to $null - measured: outside the function
+    # "$null -ne $r.DomainControllers" is True, inside it is False. The helper treats $null as "this
+    # caller has no domain-controller list, fall back to any server", so on every run where domain
+    # controller discovery returned nothing the verdict silently fell back to the all-roles list and
+    # the certification authorities' own domains marked the estate covered: two domains in scope,
+    # zero controllers discovered, one CA reached in each, verdict READY with no discovery finding.
+    # Wrapping keeps an empty list an empty list, so coverage is decided by domain controllers -
+    # which is the only thing that can decide it, since this tool reports domain controller readiness.
+    $unexaminedDomains = @(Get-mdiUnexaminedDomain -ScopedDomain $ReportData.DomainsInScope -Server $servers -DomainControllerServer @($ReportData.DomainControllers))
+    $domainsExamined = ($unexaminedDomains.Count -eq 0)
     if (-not $domainsExamined) {
-        Write-Warning ('These domains were in scope but produced no servers, so they were not examined: {0}' -f
-            (@($scopedDomains | Where-Object { $_ -notin $representedDomains }) -join ', '))
+        Write-mdiWarning ('These domains were in scope but produced no servers, so they were not examined: {0}' -f
+            ($unexaminedDomains -join ', '))
     }
 
     # A -Forest run that could not enumerate the forest fell back to a single domain. The report still
     # says "Forest", so reporting READY would be a pass over every other domain in it.
+    #
+    # Normalised rather than compared against the literal 'False'. A Complete property carrying $null,
+    # '', 0, 1 or 'Unknown' is not a statement that discovery finished - it is the absence of one - and
+    # every one of those returned READY with no issue raised.
     $forestComplete = $true
     if ($null -ne $ReportData.ForestDiscovery -and
         $null -ne $ReportData.ForestDiscovery.PSObject.Properties['Complete']) {
-        $forestComplete = [string] $ReportData.ForestDiscovery.Complete -ne 'False'
+        $forestComplete = (ConvertTo-mdiBoolean $ReportData.ForestDiscovery.Complete) -eq $true
     }
 
     # A server that was reached and then failed part way through is not a server that passed. Its
@@ -8268,7 +14300,7 @@ function Test-mdiReadinessResult {
     # has to read it.
     $partial = @($servers | Where-Object { $_.PartialFailure -eq $true })
     if ($partial.Count -gt 0) {
-        Write-Warning ('Testing stopped early on {0} server(s), so their remaining prerequisites were never measured: {1}' -f
+        Write-mdiWarning ('Testing stopped early on {0} server(s), so their remaining prerequisites were never measured: {1}' -f
             $partial.Count, (@($partial | ForEach-Object { [string] $_.FQDN }) -join ', '))
     }
 
@@ -8283,22 +14315,42 @@ function Test-mdiReadinessResult {
     # redundant NNR method does not fail the run. A required probe that could not be measured is not
     # counted as blocked (nothing was observed shut) but still prevents READY, the same way an unread
     # boolean check does - nothing measured is not the same as nothing wrong.
-    $portRecords = @(Get-mdiPortResultRecord -Server @($servers | Where-Object { -not $_.Unreachable }))
+    $portRecords = @(Get-mdiPortResultRecord -Server @($servers | Where-Object { -not (Test-mdiServerIsUnreachable -Server $_) }))
     # An all-untested NNR group ('NnrUntested') still keeps the run out of READY, but it is a gap to
     # re-measure, not a port observed shut - so it is routed with the untested probes, not the blocked
     # ones, and never worded as "blocked by measurement".
     $blockingAll = @(Get-mdiBlockingPortFailure -Record $portRecords)
     $blockingPorts = @($blockingAll | Where-Object { [string] $_.BlockingKind -ne 'NnrUntested' })
     $untestedNnr = @($blockingAll | Where-Object { [string] $_.BlockingKind -eq 'NnrUntested' })
-    $untestedRequiredPorts = @($portRecords | Where-Object {
-            $_.Requirement -in @('Required', 'All') -and $_.Applicable -ne $false -and
-            ($_.Applicable -ne $true -or [string] $_.Detail -match $script:mdiPortNotTestedPattern)
-        })
+    $untestedRequiredPorts = @(Get-mdiUnmeasuredRequiredProbe -Record $portRecords)
     if ($blockingPorts.Count -gt 0) {
-        Write-Warning ('{0} required network probe(s) are blocked by measurement, so the run is not ready regardless of the per-server ports summary.' -f $blockingPorts.Count)
+        Write-mdiWarning ('{0} required network probe(s) are blocked by measurement, so the run is not ready regardless of the per-server ports summary.' -f $blockingPorts.Count)
     }
     if (($untestedRequiredPorts.Count + $untestedNnr.Count) -gt 0) {
-        Write-Warning ('{0} required network probe(s) could not be measured, so the run cannot be reported as ready.' -f ($untestedRequiredPorts.Count + $untestedNnr.Count))
+        Write-mdiWarning ('{0} required network probe(s) could not be measured, so the run cannot be reported as ready.' -f ($untestedRequiredPorts.Count + $untestedNnr.Count))
+    }
+
+    # A domain that contributed no LDAP probe target was never in the shared port plan, so no sensor
+    # was ever asked whether it can reach that domain's controllers. Main warns that the domain "will
+    # be reported as unverified rather than ready" and records it for the verdict and the issue list to
+    # read - and neither did, so the warning was written and then forgotten: a forest run whose FIRST
+    # discovery pass failed for a child domain but whose SECOND pass succeeded showed that domain fully
+    # examined and returned READY over a path nobody measured. Judged like an untested required probe:
+    # nothing was observed shut, but nothing was measured either, and nothing measured is not the same
+    # as nothing wrong.
+    $ldapPlanGap = @($ReportData.LdapPlanGapDomains | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })
+    if ($ldapPlanGap.Count -gt 0) {
+        Write-mdiWarning ('No LDAP probe target was built for {0} domain(s): {1}. The sensor-to-domain path was never measured there, so the run cannot be reported as ready.' -f
+            $ldapPlanGap.Count, (@($ldapPlanGap | ForEach-Object { [string] $_ }) -join ', '))
+    }
+
+    # A Network Name Resolution target the operator named that resolved to no address was dropped from
+    # the probe plan, so nothing measured whether the sensor can resolve it. Judged the same way as an
+    # untested required probe: nothing was observed to fail, but nothing was observed at all.
+    $nnrUnresolved = @($ReportData.NnrUnresolvedTargets | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })
+    if ($nnrUnresolved.Count -gt 0) {
+        Write-mdiWarning ('{0} Network Name Resolution target(s) you named could not be resolved to an address and were never probed: {1}. The run cannot be reported as ready.' -f
+            $nnrUnresolved.Count, (@($nnrUnresolved | ForEach-Object { [string] $_ }) -join ', '))
     }
 
     $return = (($serversOk -ne $true).Count -eq 0) -and
@@ -8310,6 +14362,8 @@ function Test-mdiReadinessResult {
     ($blockingPorts.Count -eq 0) -and
     ($untestedRequiredPorts.Count -eq 0) -and
     ($untestedNnr.Count -eq 0) -and
+    ($ldapPlanGap.Count -eq 0) -and
+    ($nnrUnresolved.Count -eq 0) -and
     $domainsExamined -and
     $forestComplete -and
     $domainChecksOk
@@ -8320,6 +14374,46 @@ function Test-mdiReadinessResult {
 #endregion
 
 #region Main
+
+# Set before anything can warn. Under -AsJson stdout is reserved for the JSON document, and
+# powershell.exe -File folds the warning stream into stdout - so any diagnostic emitted before this
+# line would corrupt the document the caller is about to parse.
+$script:mdiJsonMode = [bool] $AsJson
+
+# Exit codes are a contract, and until now two completely different outcomes shared code 1: an uncaught
+# throw exits 1, and -FailOnIssues exits with the ISSUE COUNT, which is 1 when exactly one issue was
+# found. A scheduled compliance job therefore could not tell "the scan ran and found one thing to fix"
+# from "the scan never ran at all" - a parameter typo, a missing module, a crash mid-scan. The two need
+# opposite responses, and conflating them means a broken job looks like a nearly-clean estate.
+#
+# The contract is now:
+#     0        the scan ran and found nothing to fix
+#     1..254   -FailOnIssues only: that many readiness issues were found
+#     255      the scan did not run, or did not complete - re-run it, do not read the result
+#
+# ONE case cannot be brought inside this contract: a PARAMETER BINDING failure - a misspelled switch,
+# a value of the wrong type - is raised by PowerShell before this file executes at all, so no trap
+# exists yet and powershell.exe exits 1. Verified by running the script with an unknown parameter.
+# Nothing inside the script can change that, which is why a caller that needs to tell the two apart
+# must check stderr, or validate its own command line first. It is called out here rather than left
+# to be rediscovered: a compliance job reading exit 1 as "one readiness issue" would treat a typo in
+# its own scheduled command as a nearly-clean estate. The same reasoning is why the ActiveDirectory
+# module is checked in code below instead of with #requires, which had exactly this failure mode.
+#
+# A trap is used rather than wrapping the region in try/catch: `exit` inside a try block is NOT caught
+# by its catch, so the deliberate exits below still win (verified - a script whose trap exits 255 still
+# exits 3 when it reaches its own `exit 3`), and no re-indentation of the region is needed. Verified to
+# fire for a throw at script scope, a throw inside a called function, a throw inside an if block, and a
+# non-terminating error promoted by $ErrorActionPreference.
+#
+# Write-Error carries -ErrorAction Continue deliberately: with $ErrorActionPreference set to Stop a bare
+# Write-Error inside a trap raises again and the exit statement after it is never reached, which would
+# put the collision straight back.
+trap {
+    Write-Error ('Test-MdiReadiness did not complete: {0}' -f $_.Exception.Message) -ErrorAction Continue
+    Write-mdiWarning 'Exiting with code 255 (the scan did not run to completion). No readiness conclusion should be drawn from this run.'
+    exit 255
+}
 
 # This is a Windows PowerShell 5.1 script, and the check is a hard stop rather than a warning.
 #
@@ -8339,6 +14433,17 @@ if ($PSVersionTable.PSEdition -eq 'Core') {
     'It uses the WMI cmdlets, which PowerShell 7 removed; the compatibility layer returns deserialized ' +
     'objects whose methods do not work, which would silently degrade the results. ' +
     'Run it with: powershell.exe -File .\Test-MdiReadiness.ps1'
+}
+
+# Checked here rather than with #requires -Module. A #requires that cannot be satisfied stops PowerShell
+# before this file executes at all, so the trap above never exists and the process exits 1 - the same
+# code -FailOnIssues uses for "the scan ran and found exactly one readiness issue". Throwing here routes
+# a missing module through the trap and out as 255, "the scan did not run", which is what an automated
+# caller has to be able to distinguish.
+if (-not (Get-Module -Name ActiveDirectory -ListAvailable)) {
+    throw 'The ActiveDirectory PowerShell module is required and is not installed. ' +
+    'Install it with: Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0 ' +
+    '(or Install-WindowsFeature RSAT-AD-PowerShell on a server).'
 }
 
 # These pairs used to be expressed as parameter sets, which made PowerShell reject any command line
@@ -8371,13 +14476,13 @@ if ($Forest -and @($explicitLists).Count -gt 0) {
 # named, which reads as though that domain was the whole scope. Warned rather than rejected: -Domain
 # is frequently left in a saved command line, and refusing would break those runs for no benefit.
 if ($Forest -and $PSBoundParameters.ContainsKey('Domain') -and $Domain) {
-    Write-Warning ('-Forest scans every domain in the forest, so -Domain {0} does not limit this run. Drop -Forest to scan only that domain.' -f $Domain)
+    Write-mdiWarning ('-Forest scans every domain in the forest, so -Domain {0} does not limit this run. Drop -Forest to scan only that domain.' -f $Domain)
 }
 
 # -SkipRemediationScript wins, so asking for the script and suppressing it in the same command left
 # no file and said nothing about why. Someone who passed -RemediationScript is expecting a file.
 if ($RemediationScript -and $SkipRemediationScript) {
-    Write-Warning '-SkipRemediationScript overrides -RemediationScript, so no remediation script will be written on this run.'
+    Write-mdiWarning '-SkipRemediationScript overrides -RemediationScript, so no remediation script will be written on this run.'
 }
 
 # Port-related switches are only read while building the probe plan, which -SkipNetworkPorts skips
@@ -8394,13 +14499,23 @@ if ($SkipNetworkPorts) {
         @{ Name = '-MaxLdapTargetsPerDomain'; Set = $PSBoundParameters.ContainsKey('MaxLdapTargetsPerDomain') }
     ) | Where-Object { $_.Set }
     if (@($ignored).Count -gt 0) {
-        Write-Warning ('-SkipNetworkPorts disables all port probing, so {0} will have no effect on this run.' -f
+        Write-mdiWarning ('-SkipNetworkPorts disables all port probing, so {0} will have no effect on this run.' -f
             (@($ignored.Name) -join ', '))
     }
 }
 
 if ($SkipTrend -and $PSBoundParameters.ContainsKey('BaselinePath')) {
-    Write-Warning '-SkipTrend disables trend tracking, so -BaselinePath will not be read or written on this run.'
+    Write-mdiWarning '-SkipTrend disables trend tracking, so -BaselinePath will not be read or written on this run.'
+}
+
+# -AsJson and -PassThru are contradictory: the JSON document is the whole of stdout under -AsJson, so
+# emitting the PassThru object as well would put a second, differently shaped payload on the same
+# stream and break the obvious caller - Test-MdiReadiness.ps1 -AsJson | ConvertFrom-Json. Dropping
+# -PassThru is therefore the right resolution; doing it SILENTLY was not. Every other contradictory
+# pair in this block names the switch that won, and a caller who asked for an object and received a
+# JSON string had no way to tell the tool had made that decision for them.
+if ($AsJson -and $PassThru) {
+    Write-mdiWarning '-AsJson emits the report as JSON on stdout and overrides -PassThru; the report object is not also returned.'
 }
 
 if (-not $Domain) { $Domain = $env:USERDNSDOMAIN }
@@ -8418,7 +14533,7 @@ if (-not $Domain) {
 }
 if (-not $Domain) {
     try {
-        $Domain = [string] ([System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()).Name
+        $Domain = [string] ([DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()).Name
     } catch {
         Write-Verbose ('Unable to determine the current domain from the directory: {0}' -f $_.Exception.Message)
     }
@@ -8464,21 +14579,98 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
     } else {
         [PSCustomObject]@{ Name = $Domain; Domains = @($Domain); Method = 'Parameter'; Complete = $true; Error = $null }
     }
-    $domainsInScope = @($forestInfo.Domains)
+    # The scope is NORMALISED once, here, before anything downstream can be counted against it.
+    #
+    # Two forms of the same domain reached this list unchanged and were treated as two domains:
+    # "contoso.com" and "CONTOSO.COM" - Select-Object -Unique is ordinal, so it keeps every casing -
+    # and "contoso.com" beside the fully-qualified "contoso.com." that DNS considers identical. The
+    # consequence was not merely cosmetic. The unexamined-domain guard compares the scope list
+    # against the domains the servers actually reported, so the variant that no server matched was
+    # charged as an unexamined domain: the run lost readiness and gained an "unread" check over a
+    # domain that had in fact been scanned, under its other spelling. In the other direction the
+    # same estate could be enumerated and probed twice, doubling every count in the report.
+    #
+    # Trailing dots are stripped and comparison is case-insensitive, which is what DNS itself does.
+    # The FIRST spelling encountered is the one kept, so the report shows the operator the name they
+    # typed rather than a lower-cased rewrite of it.
+    $domainsInScope = @(
+        $seenDomain = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($domainName in @($forestInfo.Domains)) {
+            $trimmed = ([string] $domainName).Trim().TrimEnd('.')
+            if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+            if ($seenDomain.Add($trimmed)) { $trimmed }
+        }
+    )
+    if ($domainsInScope.Count -lt @($forestInfo.Domains | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) }).Count) {
+        Write-mdiVerbose ('Domain discovery returned duplicate spellings; scanning {0} distinct domain(s)' -f $domainsInScope.Count)
+    }
 
     $portProbePlan = $null
+    # Empty when the port plan is not built at all. With -SkipNetworkPorts no sensor-to-domain path is
+    # claimed to have been measured anywhere, so singling these domains out would be noise; the existing
+    # skip disclosure already tells the operator the whole surface went untested.
+    $ldapPlanGapDomains = @()
+    # Empty when the port plan is not built at all, for the same reason as the LDAP gap above: with
+    # -SkipNetworkPorts nothing was asked of any sensor, and the skip disclosure already says so.
+    $nnrUnresolvedTargets = @()
     if (-not $SkipNetworkPorts) {
         Write-mdiVerbose 'Building the network port probe plan'
         # Every sensor must be able to reach every domain controller over LDAP, so the inventory is collected once for
         # the whole scope and shared by all the probes.
         $dcInventory = @(Get-mdiDomainControllerInventory -Domain $domainsInScope)
-        Write-mdiVerbose ('Found {0} domain controller(s) in {1} domain(s)' -f $dcInventory.Count, $domainsInScope.Count)
+        # Counted as distinct HOSTS, keyed on Name - which is the property this inventory actually
+        # carries. An earlier version of this line counted distinct FQDN, which the records do not have,
+        # so Select-Object returned nothing and the line reported "Found 0 domain controller(s)" for a
+        # populated forest: a fix for a double-count that replaced it with a zero-count.
+        #
+        # The rows themselves stay per-address, because a sensor resolves whatever source address it
+        # observed and each one is a separate NNR target; only the number shown to the operator is per
+        # host, so a multi-homed DC is not counted twice.
+        Write-mdiVerbose ('Found {0} domain controller(s) in {1} domain(s)' -f
+            @($dcInventory | Where-Object { $_.Name } | Select-Object -ExpandProperty Name -Unique).Count, $domainsInScope.Count)
 
         $ldapTargets = @(Resolve-mdiLdapTarget -DomainControllers $dcInventory -MaxPerDomain $MaxLdapTargetsPerDomain)
+        # A scoped domain that produced NO LDAP target is a hole in the port plan, whether that is
+        # because its controllers could not be enumerated or because the inventory returned nothing
+        # usable for it. Captured from the plan itself rather than from the enumeration flag, so it
+        # stays true however the target list came to be empty.
+        $ldapPlanGapDomains = @($domainsInScope | Where-Object {
+                $scoped = ([string] $_).Trim().TrimEnd('.')
+                -not [string]::IsNullOrWhiteSpace($scoped) -and
+                @($ldapTargets | Where-Object { ([string] $_.Domain).Trim().TrimEnd('.') -eq $scoped }).Count -eq 0
+            })
+        if ($ldapPlanGapDomains.Count -gt 0) {
+            Write-mdiWarning ('No LDAP probe target could be built for {0}, so no sensor was asked whether it can reach that domain. It will be reported as unverified rather than ready.' -f ($ldapPlanGapDomains -join ', '))
+        }
         Write-mdiVerbose ('Using {0} LDAP target(s): {1}' -f @($ldapTargets).Count, (@($ldapTargets | ForEach-Object { $_.Name }) -join ', '))
 
         $nnrTargets = @(Resolve-mdiNnrTarget -DomainControllers $dcInventory -NnrTargetComputer $NnrTargetComputer `
                 -Domain $Domain -MaxTargets $MaxNnrTargets)
+        # A host the OPERATOR named that resolved to no address at all is dropped from the plan with
+        # nothing but a warning, so no sensor is ever asked to resolve it and no consumer can tell.
+        # That is the same shape as the LDAP plan gap below: the failure was written to a warning and
+        # then forgotten. It matters more here, not less, because the operator asked for this host by
+        # name - a silent drop answers "can the sensor resolve my workstations?" with a run that never
+        # tried. Captured from the PLAN rather than from the resolver, so it stays true however the
+        # target came to be missing.
+        $nnrUnresolvedTargets = @()
+        if ($NnrTargetComputer) {
+            $resolvedNames = @($nnrTargets | ForEach-Object { ([string] $_.Name).Trim().TrimEnd('.') })
+            $nnrUnresolvedTargets = @($NnrTargetComputer | Where-Object {
+                    $requested = ([string] $_).Trim().TrimEnd('.')
+                    if ([string]::IsNullOrWhiteSpace($requested)) { return $false }
+                    # A short name is resolved to its DNSHostName, so 'SRV1' comes back as
+                    # 'srv1.contoso.com'. Matching the label before the first dot as well keeps a
+                    # successfully resolved short name from being reported as a gap.
+                    $label = ($requested -split '\.')[0]
+                    @($resolvedNames | Where-Object {
+                            $_ -eq $requested -or ($_ -split '\.')[0] -eq $label
+                        }).Count -eq 0
+                })
+            if ($nnrUnresolvedTargets.Count -gt 0) {
+                Write-mdiWarning ('No address could be resolved for the Network Name Resolution target(s) you named: {0}. They were dropped from the probe plan, so they will be reported as unverified rather than ready.' -f ($nnrUnresolvedTargets -join ', '))
+            }
+        }
         Write-mdiVerbose ('Using {0} Network Name Resolution target(s): {1}' -f @($nnrTargets).Count, (@($nnrTargets | ForEach-Object { $_.Name }) -join ', '))
         if (-not $NnrTargetComputer) {
             Write-mdiVerbose 'Tip: use -NnrTargetComputer to also validate NNR against workstations and member servers'
@@ -8529,7 +14721,7 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
                     # 'N/A' rather than $false: the setting was not read, so it is unknown, not wrong.
                     # Measured records WHY it is 'N/A', because the same value also legitimately means
                     # "this role is not present in the forest", which is a pass rather than a gap.
-                    Write-Warning ('Could not read {0} for {1}: {2}' -f $item.Key, $domainName, $_.Exception.Message)
+                    Write-mdiWarning ('Could not read {0} for {1}: {2}' -f $item.Key, $domainName, $_.Exception.Message)
                     $failure = [ordered]@{}
                     if ($item.Status) { $failure[$item.Status] = 'N/A' }
                     # details is an object with a Detail property on the success path, and the report
@@ -8556,6 +14748,26 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
         Forest                 = $forestInfo.Name
         ForestDiscovery        = $forestInfo
         DomainsInScope         = $domainsInScope
+        # Domains whose domain controllers could not be enumerated when the SHARED PORT PLAN was built.
+        #
+        # Discovery runs twice: once here to build the LDAP/NNR probe plan, and again per role for the
+        # readiness checks. A domain that failed the FIRST pass contributes no LDAP target, so no
+        # sensor is ever asked whether it can reach that domain's controllers - but if the SECOND pass
+        # succeeds the domain appears in the report fully examined, and the run reaches READY with the
+        # sensor-to-domain path never measured. The failure was written to a warning and then forgotten.
+        # Recorded here so the issue list and the verdict can both see it.
+        LdapPlanGapDomains     = @($ldapPlanGapDomains | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } | Select-Object -Unique)
+        # Network Name Resolution targets the OPERATOR named that resolved to no address, so no sensor
+        # was ever asked to resolve them. Recorded for the verdict and the issue list, which both read
+        # it - unlike the first version of LdapPlanGapDomains, which was written for consumers that
+        # were never implemented and so returned READY over an unmeasured path.
+        NnrUnresolvedTargets   = @($nnrUnresolvedTargets | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } | Select-Object -Unique)
+        # Recorded so the report can tell whether the NNR target list was CHOSEN by the operator or
+        # sampled from the domain controller inventory. The report discloses the sample only in the
+        # second case: when these hosts were named explicitly there is no sample to disclose, and
+        # saying "a sample of 500 in scope" about a list the operator wrote himself is just wrong.
+        NnrTargetComputer      = @($NnrTargetComputer | Where-Object { $_ })
+        MaxNnrTargets          = $MaxNnrTargets
         DomainControllers      = @(foreach ($domainName in $domainsInScope) {
                 Write-mdiVerbose "Testing the domain controllers of $domainName"
                 Get-mdiDomainControllerReadiness -Domain $domainName `
@@ -8571,6 +14783,30 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
         DomainExchangeAuditing = $primaryAuditing.ExchangeAuditing
         DomainDeletedObjects   = $primaryAuditing.DeletedObjects
         DomainSchemaVersion    = $primaryAuditing.SchemaVersion
+        # What this run did NOT look at. Skipping is a legitimate thing to do - a customer with no
+        # certification authority has no reason to scan for one - but the verdict has to be able to
+        # qualify itself, and until now it could not: the report carried no record of the skips at
+        # all, so a run with -SkipNetworkPorts -SkipCA -SkipEntraConnect examined a fraction of the
+        # prerequisites and still printed an unqualified "READY / All prerequisites met" and exited 0.
+        # A compliance job reading that exit code cannot tell a clean estate from an unexamined one.
+        #
+        # Only areas the operator explicitly TURNED OFF are listed. Capacity planning is opt-in
+        # (-CapacityPlanning), so reporting it as "not examined" would append the same sentence to
+        # every ordinary run - and a qualifier that appears every time is one operators learn to skip
+        # over, which would waste the signal on the runs where it matters.
+        # The @() wraps the PIPELINE, not just the list. With the filter outside the array
+        # subexpression PowerShell stored whatever the pipeline happened to emit: its zero-output
+        # sentinel for no skips, a bare [string] for exactly one, and an array only from two upwards.
+        # ConvertTo-Json then rendered the same field as {}, as "Network ports", and as
+        # ["Network ports","..."] - three different shapes for one field, decided purely by how many
+        # -Skip switches the operator passed. A consumer cannot iterate that: .forEach fails on the
+        # first two, and no schema can describe it. It is always a JSON array now.
+        SkippedAreas           = @(@(
+                $(if ($SkipNetworkPorts) { 'Network ports' })
+                $(if ($SkipCA) { 'Certification authority servers' })
+                $(if ($SkipEntraConnect) { 'Entra Connect servers' })
+                $(if ($SkipSensorV3Readiness) { 'Sensor v3.x readiness' })
+            ) | Where-Object { $_ })
     }
     if (-not $SkipCA) {
         $report.CAServers = @(foreach ($domainName in $domainsInScope) {
@@ -8586,22 +14822,78 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
             })
     }
 
-    # The remediation script is generated before the report so the report can link to it. It is produced
-    # on every run because it is only ever written, never executed, and left opt-in it was rarely
-    # discovered. -SkipRemediationScript suppresses it when nothing should be written beside the report.
-    $remediation = $null
-    if (-not $SkipRemediationScript) {
-        $remediationFile = Join-Path -Path $Path -ChildPath ('Fix-MdiReadiness-{0}.ps1' -f (ConvertTo-mdiSafeFileName $report.Domain))
-        $remediation = New-mdiRemediationScript -ReportData $report -FilePath $remediationFile
-        if ($remediation.SectionCount -gt 0) {
-            Write-Warning ('Remediation script written to {0} with {1} section(s). Review it before running.' -f $remediation.Path, $remediation.SectionCount)
-        } else {
-            Write-mdiVerbose ('Remediation script written to {0} (nothing to remediate)' -f $remediation.Path)
+    # One lock across the WHOLE artefact set, not per file.
+    #
+    # Write-mdiReportFile already serialises each individual write and retries a sharing violation, so
+    # no single file is ever torn. That is not the same as the set being consistent. The remediation
+    # script, the JSON and the HTML are written at three separate moments that can be minutes apart on
+    # a large forest, so two overlapping runs against one -Path - a nightly scheduled scan and a manual
+    # re-run, which is exactly when someone re-runs this - interleave, and the last writer of each file
+    # can be a different run. Measured with two real processes: the HTML came from run A while the JSON
+    # and the remediation script came from run B.
+    #
+    # These artefacts CROSS-REFERENCE each other, which is what makes the mixture dangerous rather than
+    # merely untidy. The HTML links to the JSON as "the machine-readable version of this report" and
+    # tells the operator to execute Fix-MdiReadiness-<domain>.ps1 - so a mixed set hands an
+    # administrator a remediation script generated from a different scan of a possibly different scope,
+    # to be run as Domain Admin against production domain controllers. Both runs report success.
+    #
+    # A named mutex rather than a lock file: it is released by the operating system if the process is
+    # killed, where a lock file would strand every later run. Scoped to the output path and domain, so
+    # unrelated scans writing elsewhere never wait on each other. Failure to acquire is not fatal - the
+    # run still produces its artefacts, exactly as before, with a warning that they may be mixed.
+    $reportSetKey = ('{0}|{1}' -f $Path, $report.Domain).ToLowerInvariant()
+    $reportSetHash = [BitConverter]::ToString(
+        [Security.Cryptography.SHA256]::Create().ComputeHash(
+            [Text.Encoding]::UTF8.GetBytes($reportSetKey))).Replace('-', '').Substring(0, 32)
+    $reportSetMutex = $null
+    $reportSetHeld = $false
+    try {
+        $reportSetMutex = New-Object System.Threading.Mutex($false, ('Global\MdiReadinessReportSet_{0}' -f $reportSetHash))
+    } catch {
+        # A constrained environment, or a Global\ name the caller may not create. Fall back to a
+        # session-local mutex, which still protects the common case of two runs by the same operator.
+        try { $reportSetMutex = New-Object System.Threading.Mutex($false, ('MdiReadinessReportSet_{0}' -f $reportSetHash)) } catch { $reportSetMutex = $null }
+    }
+    if ($reportSetMutex) {
+        try {
+            # AbandonedMutexException means the previous holder died without releasing. The lock IS
+            # acquired in that case, so it must be treated as success or the run would both hold the
+            # mutex and believe it did not.
+            $reportSetHeld = $reportSetMutex.WaitOne([timespan]::FromMinutes(10))
+        } catch [Threading.AbandonedMutexException] {
+            $reportSetHeld = $true
+        } catch {
+            $reportSetHeld = $false
+        }
+        if (-not $reportSetHeld) {
+            Write-mdiWarning ('Another scan is writing the report set for {0} in {1}. Continuing anyway - if both runs finish together the HTML, JSON and remediation script may come from different scans.' -f $report.Domain, $Path)
         }
     }
 
-    $htmlReportFile = Set-MdiReadinessReport -Domain $report.Domain -Path $Path -ReportData $report `
-        -Remediation $remediation -BaselinePath $BaselinePath -SkipTrend:$SkipTrend
+    try {
+        # The remediation script is generated before the report so the report can link to it. It is produced
+        # on every run because it is only ever written, never executed, and left opt-in it was rarely
+        # discovered. -SkipRemediationScript suppresses it when nothing should be written beside the report.
+        $remediation = $null
+        if (-not $SkipRemediationScript) {
+            $remediationFile = Join-Path -Path $Path -ChildPath ('Fix-MdiReadiness-{0}.ps1' -f (ConvertTo-mdiSafeFileName $report.Domain))
+            $remediation = New-mdiRemediationScript -ReportData $report -FilePath $remediationFile
+            if ($remediation.SectionCount -gt 0) {
+                Write-mdiWarning ('Remediation script written to {0} with {1} section(s). Review it before running.' -f $remediation.Path, $remediation.SectionCount)
+            } else {
+                Write-mdiVerbose ('Remediation script written to {0} (nothing to remediate)' -f $remediation.Path)
+            }
+        }
+
+        $htmlReportFile = Set-MdiReadinessReport -Domain $report.Domain -Path $Path -ReportData $report `
+            -Remediation $remediation -BaselinePath $BaselinePath -SkipTrend:$SkipTrend
+    } finally {
+        if ($reportSetMutex) {
+            if ($reportSetHeld) { try { [void] $reportSetMutex.ReleaseMutex() } catch { } }
+            try { $reportSetMutex.Dispose() } catch { }
+        }
+    }
 
     $result = Test-mdiReadinessResult -ReportData $report
 
@@ -8624,31 +14916,49 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
     if ($stats.TotalServers -eq 0) {
         # Reporting "0/0 checks passed" as a readiness verdict invites the reader to treat a failed run
         # as a finished one. The run did not fail to find problems, it failed to look.
-        Write-Host ''
-        Write-Host '  SCAN INCOMPLETE  No server could be enumerated, so nothing was checked.' -ForegroundColor Red
-        Write-Host '  This is not a readiness result. Check that this computer can reach a domain controller,' -ForegroundColor Red
-        Write-Host '  that the account running the script may read the directory, and re-run.' -ForegroundColor Red
+        Write-mdiConsole -AsJson:$AsJson ''
+        Write-mdiConsole -AsJson:$AsJson '  SCAN INCOMPLETE  No server could be enumerated, so nothing was checked.' -ForegroundColor Red
+        Write-mdiConsole -AsJson:$AsJson '  This is not a readiness result. Check that this computer can reach a domain controller,' -ForegroundColor Red
+        Write-mdiConsole -AsJson:$AsJson '  that the account running the script may read the directory, and re-run.' -ForegroundColor Red
     } elseif ($result) {
-        Write-Host ''
-        Write-Host ('  READY  {0}/{1} checks passed across {2} server(s).' -f
-            $stats.ChecksPassed, $stats.ChecksTotal, $stats.TotalServers) -ForegroundColor Green
+        Write-mdiConsole -AsJson:$AsJson ''
+        Write-mdiConsole -AsJson:$AsJson ('  READY  {0}/{1} checks passed across {2} server(s).{3}' -f
+            $stats.ChecksPassed, (Get-mdiCoverageDenominator -Measured $stats.ChecksTotal -Unread $stats.ChecksUnread),
+            $stats.TotalServers,
+            (Get-mdiVerdictQualifier -ReportData $report -Statistics $stats)) -ForegroundColor Green
     } else {
-        Write-Host ''
-        Write-Host ('  {0} issue(s) found: {1}/{2} checks passed across {3} server(s).' -f
-            $issueCount, $stats.ChecksPassed, $stats.ChecksTotal, $stats.TotalServers) -ForegroundColor Yellow
-        Write-Host '  Open the report and start with the Issues found table on the Overview tab.' -ForegroundColor Yellow
+        Write-mdiConsole -AsJson:$AsJson ''
+        # The same denominator the HTML score card uses. Dividing by ChecksTotal alone made the console
+        # and the report disagree about the same scan: the console said "2/2 checks passed" while the
+        # score card on the page said "2 of 7 checks passed, 5 not measured (28%)". The console line is
+        # what a scheduled job logs, so that is the number that ends up in someone's inbox.
+        #
+        # The scope qualifier is appended here for the same reason it is appended to the READY line and
+        # to BOTH HTML verdicts: a run that examined a fraction of the estate must not present itself
+        # as a verdict over all of it. This line had it and the READY line did not, so one run produced
+        # two console verdicts that disagreed about their own scope - and the silent one was the line an
+        # operator acts on. "12 issue(s) found" invites them to work the findings believing the list is
+        # complete; with -SkipCA -SkipEntraConnect -SkipNetworkPorts three areas were never looked at
+        # and the line said nothing. That is also the ordinary invocation, so the silent line was the
+        # common case rather than the edge one.
+        Write-mdiConsole -AsJson:$AsJson ('  {0} issue(s) found: {1}/{2} checks passed across {3} server(s).{4}' -f
+            $issueCount, $stats.ChecksPassed,
+            (Get-mdiCoverageDenominator -Measured $stats.ChecksTotal -Unread $stats.ChecksUnread),
+            $stats.TotalServers,
+            (Get-mdiVerdictQualifier -ReportData $report -Statistics $stats)) -ForegroundColor Yellow
+        Write-mdiConsole -AsJson:$AsJson '  Open the report and start with the Issues found table on the Overview tab.' -ForegroundColor Yellow
     }
     if ($unreadCount -gt 0 -and $stats.TotalServers -gt 0) {
-        Write-Host ('  {0} check(s) could not be read at all, so this is only a partial picture.' -f $unreadCount) -ForegroundColor Red
-        Write-Host '  The usual cause is that the account running this script cannot query those servers' -ForegroundColor Red
-        Write-Host '  over WMI or the remote registry. Fix that first, then re-run.' -ForegroundColor Red
+        Write-mdiConsole -AsJson:$AsJson ('  {0} check(s) could not be read at all, so this is only a partial picture.' -f $unreadCount) -ForegroundColor Red
+        Write-mdiConsole -AsJson:$AsJson '  The usual cause is that the account running this script cannot query those servers' -ForegroundColor Red
+        Write-mdiConsole -AsJson:$AsJson '  over WMI or the remote registry. Fix that first, then re-run.' -ForegroundColor Red
     }
-    Write-Host ('  Report: {0}' -f $htmlReportFile) -ForegroundColor Cyan
+    Write-mdiConsole -AsJson:$AsJson ('  Report: {0}' -f $htmlReportFile) -ForegroundColor Cyan
     if ($remediation -and $remediation.SectionCount -gt 0) {
-        Write-Host ('  Remediation: {0} ({1} section(s), review before running)' -f
+        Write-mdiConsole -AsJson:$AsJson ('  Remediation: {0} ({1} section(s), review before running)' -f
             $remediation.Path, $remediation.SectionCount) -ForegroundColor Cyan
     }
-    Write-Host ''
+    Write-mdiConsole -AsJson:$AsJson ''
 
     if ($AsJson) {
         $report | ConvertTo-Json -Depth 7
@@ -8667,13 +14977,57 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
     # between "the environment has problems" and "the scan did not run" is the whole point of the
     # separate code, so the sentinel has to win.
     if ($stats.TotalServers -eq 0) {
-        Write-Warning 'No server could be enumerated, exiting with code 255 (scan incomplete).'
+        Write-mdiWarning 'No server could be enumerated, exiting with code 255 (scan incomplete).'
+        exit 255
+    }
+
+    # "Did not complete" is the other half of the documented 255 contract, and it was never reached.
+    # A server whose scan aborted part way has checks that were never run - the verdict says so, and
+    # the console prints "Testing stopped early on N server(s)" - but the exit path fell through to
+    # the issue count. One interrupted server therefore exited 1, which a compliance gate cannot tell
+    # apart from a COMPLETE scan that found exactly one real issue. The whole point of the separate
+    # sentinel is that "the scan did not finish" must never be reported as a measurement, so it is
+    # tested here, before -FailOnIssues, exactly as the empty-scan case is.
+    if ($stats.PartialScanCount -gt 0) {
+        Write-mdiWarning ('Testing stopped part way on {0} server(s), so the scan did not complete: exiting with code 255 (scan incomplete). Re-run it rather than reading the result.' -f $stats.PartialScanCount)
         exit 255
     }
 
     if ($FailOnIssues -and -not $result) {
-        Write-Warning ('{0} readiness issue(s) found, exiting with code {1}' -f $issueCount, [math]::Min($issueCount, 254))
-        exit ([math]::Min([math]::Max($issueCount, 1), 254))
+        # The code is computed ONCE and then both reported and used. The message and the exit used to
+        # compute it separately - Min(count,254) for the text, Min(Max(count,1),254) for the exit - so
+        # a run whose verdict was false with zero generated issues announced "exiting with code 0" and
+        # then exited 1. An operator reading the console and a pipeline reading $LASTEXITCODE were told
+        # two different things by the same branch.
+        #
+        # The floor of 1 is deliberate: the verdict says the estate is not ready, so exiting 0 would
+        # report success. The ceiling of 254 is deliberate too - 255 is the "scan did not run"
+        # sentinel, and a count that collided with it would be indistinguishable from a scan that
+        # enumerated nothing. When the count is clamped the message says so, rather than letting 254
+        # be read as an exact number of findings.
+        $exitCode = [math]::Min([math]::Max($issueCount, 1), 254)
+        if ($issueCount -gt 254) {
+            Write-mdiWarning ('{0} readiness issue(s) found, exiting with code {1} (the exit code is capped at 254 because 255 means the scan did not run).' -f $issueCount, $exitCode)
+        } else {
+            Write-mdiWarning ('{0} readiness issue(s) found, exiting with code {1}' -f $issueCount, $exitCode)
+        }
+        exit $exitCode
+    }
+} else {
+    # -WhatIf suppresses the entire scan, and the script then simply ran off the end and exited 0. With
+    # -FailOnIssues that is the worst outcome available: a pipeline that reads the exit code as
+    # "readiness verified, nothing to fix" was handed a clean pass by a run that looked at nothing at
+    # all. A stale -WhatIf left in a saved command line or a pipeline definition is exactly how that
+    # happens, and nothing in the output made it obvious.
+    #
+    # The sentinel is the same 255 used for a scan that enumerated nothing, because it means the same
+    # thing: no conclusion may be drawn from this run. It is raised only when -FailOnIssues asked for a
+    # pass/fail signal that cannot be produced, so an interactive -WhatIf still exits 0 as the common
+    # convention expects.
+    Write-mdiWarning 'No scan was performed because -WhatIf was specified. No report was written and no readiness conclusion is available.'
+    if ($FailOnIssues) {
+        Write-mdiWarning 'Exiting with code 255: -FailOnIssues cannot report on a run that did not happen. Remove -WhatIf to produce a verdict.'
+        exit 255
     }
 }
 
