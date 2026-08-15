@@ -150,13 +150,50 @@ try {
     # Behavioural, not textual: the writer is what every artefact goes through, so assert what the
     # writer DOES. A source-text search for "| Out-File" passed just as happily when a writer used
     # Set-Content or WriteAllText with the wrong encoding, which is the failure it existed to catch.
-    $utf8File = Join-Path $ccDir 'enc.json'
-    Write-mdiReportFile -Content ('{"n":"dc-m' + [char]0xFC + 'nchen"}') -FilePath $utf8File
-    $bytes = [System.IO.File]::ReadAllBytes($utf8File)
-    Assert-That 'report files are written UTF-8 with a BOM' (
-        $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+    #
+    # The encoding is chosen PER ARTEFACT, because the two artefacts have opposite requirements and
+    # one rule cannot serve both:
+    #
+    #   .ps1 / .html  KEEP the byte-order mark. These are read back by Get-Content, whose default
+    #                 encoding in Windows PowerShell 5.1 is ANSI, so without the mark a non-ASCII
+    #                 server name is corrupted and the generated remediation script is parsed as
+    #                 Windows-1252. That is the cc-2 defect above and it must stay fixed.
+    #
+    #   .json         MUST NOT carry a mark. node's JSON.parse, python's json.load and jq all reject
+    #                 a leading BOM, so the one artefact that exists to be machine-read could not be
+    #                 read by the machines it is for. Nothing reads the .json through an
+    #                 ANSI-defaulting reader: Get-mdiBaselineHistory uses
+    #                 [IO.File]::ReadAllText(..., UTF8), whose decoder skips a mark when present and
+    #                 is equally happy without one - which is what the BOM-less baseline test below
+    #                 already proves, and what makes dropping the mark here safe rather than a
+    #                 reintroduction of cc-2.
+    $umlaut = 'dc-m' + [char]0xFC + 'nchen'
+
+    $jsonFile = Join-Path $ccDir 'enc.json'
+    Write-mdiReportFile -Content ('{"n":"' + $umlaut + '"}') -FilePath $jsonFile
+    $jsonBytes = [System.IO.File]::ReadAllBytes($jsonFile)
+    Assert-That 'a .json report is written WITHOUT a BOM so real parsers accept it' (
+        -not ($jsonBytes[0] -eq 0xEF -and $jsonBytes[1] -eq 0xBB -and $jsonBytes[2] -eq 0xBF)) `
+        ("(first bytes {0:X2} {1:X2} {2:X2})" -f $jsonBytes[0], $jsonBytes[1], $jsonBytes[2])
+    Assert-That '  ...and its first byte is the document itself' ($jsonBytes[0] -eq 0x7B) `
+        ("(first byte {0:X2})" -f $jsonBytes[0])
+    Assert-That '  ...and a non-ASCII name survives the reader the script uses' (
+        [IO.File]::ReadAllText($jsonFile, [Text.Encoding]::UTF8) -match $umlaut)
+
+    # The control that stops this being "fixed" by dropping the mark everywhere.
+    $ps1File = Join-Path $ccDir 'enc.ps1'
+    Write-mdiReportFile -Content ("# " + $umlaut + "`r`nWrite-Output 'ok'") -FilePath $ps1File
+    $ps1Bytes = [System.IO.File]::ReadAllBytes($ps1File)
+    Assert-That 'a .ps1 artefact is STILL written UTF-8 with a BOM' (
+        $ps1Bytes[0] -eq 0xEF -and $ps1Bytes[1] -eq 0xBB -and $ps1Bytes[2] -eq 0xBF)
     Assert-That '  ...so a non-ASCII name survives Get-Content' (
-        (Get-Content -LiteralPath $utf8File -Raw) -match ('dc-m' + [char]0xFC + 'nchen'))
+        (Get-Content -LiteralPath $ps1File -Raw) -match $umlaut)
+
+    $htmlFile = Join-Path $ccDir 'enc.html'
+    Write-mdiReportFile -Content ('<p>' + $umlaut + '</p>') -FilePath $htmlFile
+    $htmlBytes = [System.IO.File]::ReadAllBytes($htmlFile)
+    Assert-That 'an .html artefact is STILL written UTF-8 with a BOM' (
+        $htmlBytes[0] -eq 0xEF -and $htmlBytes[1] -eq 0xBB -and $htmlBytes[2] -eq 0xBF)
 } finally {
     Remove-Item $ccDir -Recurse -Force -ErrorAction SilentlyContinue
 }

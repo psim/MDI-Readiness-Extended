@@ -143,7 +143,13 @@ Assert-That 'no shipped script calls a function it does not define' (
     @(Get-mdiMissingShippedFunction -ScriptText $withUrl).Count -eq 0)
 
 '[budget] an oversized plan is written to the server rather than silently dropped'
-$huge = New-BudgetPlan -Targets 150 -ApiUrl 'https://contoso-sensorapi.atp.azure.com'
+# 800 targets, not 150. The command line no longer costs 2.67 characters per character of payload -
+# it is passed as a -Command argument rather than -EncodedCommand - so 150 targets now produces a
+# 12,947 character command line that fits comfortably and proved nothing about the refusal. The
+# guard itself is unchanged and still required: a plan that cannot be delivered on a command line
+# has to fail loudly so the caller writes the script to the server, rather than quietly measuring
+# fewer targets than asked. Measured at this size: 34,079 characters, past the 32,000 throw.
+$huge = New-BudgetPlan -Targets 800 -ApiUrl 'https://contoso-sensorapi.atp.azure.com'
 $threwOnHuge = $false
 try { [void] (Get-mdiPortProbeCommandLine -Plan $huge -OutputFile 'C:\Windows\Temp\m.json') } catch { $threwOnHuge = $true }
 Assert-That 'the command line still refuses an oversized plan' $threwOnHuge

@@ -121,9 +121,17 @@ Assert-That '-MultiForest does not mutate the settings table' ((@($settings.Requ
 
 Write-Host "`n[6] Remote payload generation + round-trip" -ForegroundColor Yellow
 $cmd = Get-mdiPortProbeCommandLine -Plan $plan -OutputFile 'C:\Windows\Temp\mdi-test.json'
-Assert-That 'Command line is a powershell.exe -EncodedCommand' ($cmd -match '^powershell\.exe .*-EncodedCommand ')
+# The payload is passed as an ordinary -Command argument rather than -EncodedCommand. -EncodedCommand
+# cost 2.67 characters of command line per character of stub (UTF-16 doubles it, base64 adds a third)
+# and that multiplier applied to the whole compressed payload, which is what pushed a 25-DC plan past
+# this budget while the shipped code was actually SHRINKING. The payload is base64, so its alphabet
+# cannot close the quoting, and Win32_Process.Create calls CreateProcess directly - there is no shell
+# to satisfy.
+Assert-That 'Command line is a single-line powershell.exe -Command' (
+    $cmd -match '^powershell\.exe .*-Command "' -and $cmd -notmatch "`n")
 Assert-That 'Command line fits the WMI limit' ($cmd.Length -lt 30000) "($($cmd.Length) chars)"
-$stub = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(($cmd -split ' ')[-1]))
+$stub = [regex]::Match($cmd, '-Command "(.+)"$').Groups[1].Value
+Assert-That 'the stub was recovered from the command line' ($stub.Length -gt 100) "($($stub.Length) chars)"
 $inner = [regex]::Match($stub, "FromBase64String\('([^']+)'\)").Groups[1].Value
 $ms = New-Object IO.MemoryStream (, [Convert]::FromBase64String($inner))
 $gz = New-Object IO.Compression.GzipStream $ms, ([IO.Compression.CompressionMode]::Decompress)
