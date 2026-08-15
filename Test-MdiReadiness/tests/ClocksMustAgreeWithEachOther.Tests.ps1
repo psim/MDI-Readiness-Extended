@@ -209,6 +209,25 @@ Assert-That 'CONTROL: High time-sync rows are still raised' (
 Assert-That 'CONTROL: and the run is NOT ready' (
     (Test-mdiReadinessResult -ReportData @(New-ReportData -Server $reallySplit) 3>$null) -eq $false)
 
+# The spread row must not claim something this run measured as FALSE. Both these servers also failed
+# their own scanner-relative check, so the "each is individually within tolerance" clause - which is
+# the right thing to say when the scanner sits between two drifting sensors - would be a lie here.
+$splitSpreadRow = @($splitIssues | Where-Object { $_.Issue -match 'span \d+ second' })
+Assert-That 'CONTROL: the spread row exists' ($splitSpreadRow.Count -eq 1) "count=$($splitSpreadRow.Count)"
+Assert-That 'CONTROL: and does NOT claim each server was within scanner tolerance' (
+    $splitSpreadRow.Count -eq 1 -and
+    $splitSpreadRow[0].Issue -notmatch 'individually within tolerance') "issue=$($splitSpreadRow.Issue)"
+Assert-That 'CONTROL: it says how many also failed against the scanner' (
+    $splitSpreadRow.Count -eq 1 -and
+    $splitSpreadRow[0].Issue -match 'also outside tolerance') "issue=$($splitSpreadRow.Issue)"
+
+# And the inverse: when every server IS within scanner tolerance, the clause is TRUE and explains why
+# the per-server rows all look fine. $split is the morning's case - +240 and -240, both compliant.
+$originalSpreadRow = @($issues | Where-Object { $_.Issue -match 'span 480 second' })
+Assert-That 'CONTROL: with all servers scanner-compliant the clause IS stated' (
+    $originalSpreadRow.Count -eq 1 -and
+    $originalSpreadRow[0].Issue -match 'individually within tolerance') "issue=$($originalSpreadRow.Issue)"
+
 # A single server has no estate to appeal to, so its scanner-relative failure must still count.
 $loneBadClock = @((New-ClockServer -Fqdn 'sensor1.contoso.com' -SkewSeconds 600 -TimeSync $false))
 $loneBadClock[0] | Add-Member -NotePropertyName 'OSVersionOk' -NotePropertyValue $true -Force
@@ -262,6 +281,43 @@ $looseSpread = Get-mdiClockSpread -Server $loose
 Assert-That 'CONTROL: a 10 minute tolerance accepts the same 480 second spread' (
     $looseSpread.IsWithin -eq $true -and $looseSpread.MaxSkewMinutes -eq 10) (
     "isWithin=$($looseSpread.IsWithin) tolerance=$($looseSpread.MaxSkewMinutes)")
+
+Write-Host ''
+Write-Host 'The SCORE must follow the verdict, not contradict it' -ForegroundColor Cyan
+# The verdict and the issue list already refuse a split estate. The headline numbers did not: a run
+# whose clocks were 480 seconds apart rendered "Overall check score 100% - 8 of 8 checks passed" in
+# green, a "Servers fully ready 2/2 - All checks passed" tile and a solid-green donut, directly
+# beside a hero verdict of "Action required" and a High finding. One estate, described two ways on
+# one page - which is the defect class this codebase spends most of its guards on.
+#
+# $split is the fixture that isolates it: +240 and -240, so EVERY per-server check passes and the
+# ONLY thing wrong is the relationship between them. Using a fixture whose servers also fail their
+# own TimeSync check would charge the score by that route instead, and the assertion would pass
+# whether or not the estate charge exists - which is exactly what happened on the first attempt, and
+# the mutation test caught it by not going red.
+$splitStats = Get-mdiReportStatistics -ReportData (New-ReportData -Server $split)
+Assert-That 'the clock failure is charged to the score' (
+    [int] $splitStats.ChecksPassed -lt [int] $splitStats.ChecksTotal) (
+    "passed=$($splitStats.ChecksPassed) total=$($splitStats.ChecksTotal)")
+Assert-That 'so the coverage percentage is not a perfect 100' (
+    (Get-mdiCoveragePercent -Passed $splitStats.ChecksPassed -Measured $splitStats.ChecksTotal -Unread $splitStats.ChecksUnread) -lt 100) (
+    "percent=$(Get-mdiCoveragePercent -Passed $splitStats.ChecksPassed -Measured $splitStats.ChecksTotal -Unread $splitStats.ChecksUnread)")
+# It is charged as a measured FAILURE, not as an unread check - two clocks were read and their
+# difference is known.
+Assert-That 'and it is charged as a failure, not as unread' (
+    [int] $splitStats.ChecksUnread -eq 0) "unread=$($splitStats.ChecksUnread)"
+
+# CONTROL: a healthy estate must still score a clean 100, or the assertion above is just "the score
+# is never 100".
+$tightStats = Get-mdiReportStatistics -ReportData (New-ReportData -Server $tight)
+Assert-That 'CONTROL: an estate whose clocks agree still scores every check passed' (
+    [int] $tightStats.ChecksPassed -eq [int] $tightStats.ChecksTotal) (
+    "passed=$($tightStats.ChecksPassed) total=$($tightStats.ChecksTotal)")
+# CONTROL: an unmeasurable spread must not be charged either.
+$singleStats = Get-mdiReportStatistics -ReportData (New-ReportData -Server $singleServer)
+Assert-That 'CONTROL: one clock - an unmeasurable spread - is not charged as a failure' (
+    [int] $singleStats.ChecksPassed -eq [int] $singleStats.ChecksTotal) (
+    "passed=$($singleStats.ChecksPassed) total=$($singleStats.ChecksTotal)")
 
 Write-Host ("`n{0} passed, {1} failed" -f $script:pass, $script:fail) -ForegroundColor $(if ($script:fail) { 'Red' } else { 'Green' })
 if ($script:fail) { exit 1 }

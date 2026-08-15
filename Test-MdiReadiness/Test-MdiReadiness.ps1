@@ -3359,6 +3359,22 @@ function Get-mdiMeasuredInteger {
     $parsed
 }
 
+function Test-mdiV3DetailMeasured {
+    <#
+        Whether a v3.x check's DETAIL text claims the server was actually read.
+
+        'Not tested - ' is the producer's convention for the kind of N/A that means the server could
+        not be read, as against the informational kind that leaves the verdict intact. That rule was
+        written out twice - once where the checks are produced and once where two roles' copies are
+        merged - and the merge has to reason about it as well as apply it, so it is stated here once
+        and both surfaces read it. Two copies of one rule is how they drift apart.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $Detail
+    )
+    -not ([string] $Detail -like 'Not tested*')
+}
+
 function Get-mdiSensorV3Readiness {
     param (
         [Parameter(Mandatory = $true)] [string] $ComputerName,
@@ -3383,7 +3399,7 @@ function Get-mdiSensorV3Readiness {
                 Status      = $Status
                 Detail      = $Detail
                 Remediable  = $Remediable
-                Measured    = -not ($Detail -like 'Not tested*')
+                Measured    = Test-mdiV3DetailMeasured -Detail $Detail
             })
     }
 
@@ -4308,6 +4324,9 @@ function Get-mdiDeletedObjectsPermission {
         # asserting an absence that was never established.
         $groupTrustee = @()
         $unknownKindTrustee = @()
+        # The accounts that resolved, were searched for on a fully-read DACL, and were genuinely not
+        # on it. Named in the failure message so a multi-account run says WHICH one is missing.
+        $unmatchedAccount = @()
         $status = if (-not $DirectoryServiceAccount) {
             'N/A'
         } else {
@@ -4354,6 +4373,14 @@ function Get-mdiDeletedObjectsPermission {
                 $unknownKindTrustee += @($holderKind | Where-Object { $_.Kind -eq 'Unknown' } | ForEach-Object { $_.Trustee })
                 if (@($holderKind | Where-Object { $_.Kind -ne 'NonGroup' }).Count -eq 0) {
                     $allSatisfied = $false
+                    # Recorded so the failure can NAME the account it is about. The message said only
+                    # "The Directory Service Account does not have read access", which is unusable when
+                    # more than one was supplied - and actively misleading in the per-domain model,
+                    # where each domain has its own DSA and every account is currently required on
+                    # every domain. Measured: root grants ROOT\mdi-root and child grants CHILD\mdi-child,
+                    # both correct, and both domains were reported False. Naming the account turns that
+                    # from a mystery into something an operator can recognise in one read.
+                    $unmatchedAccount += @($dsa)
                 }
             }
             # Precedence is deliberate and unchanged: a DEFINITE failure still beats an unverified
@@ -4449,7 +4476,14 @@ function Get-mdiDeletedObjectsPermission {
                     } elseif ($status) {
                         'The Directory Service Account has read access to the Deleted Objects container'
                     } else {
-                        'The Directory Service Account does not have read access. Grant it with: dsacls "{0}" /G "<DSA>":LCRP' -f $deletedObjectsDn
+                        # The account is NAMED. "The Directory Service Account does not have read
+                        # access" is unusable when more than one was supplied, and the dsacls line
+                        # carried a "<DSA>" placeholder the operator had to fill in themselves.
+                        $missingText = if ($unmatchedAccount.Count -gt 0) {
+                            (@($unmatchedAccount | Select-Object -Unique) -join ', ')
+                        } else { '<DSA>' }
+                        'The following Directory Service Account(s) do not have read access: {0}. Grant with: dsacls "{1}" /G "{0}":LCRP' -f
+                            $missingText, $deletedObjectsDn
                     })
             }
         }
@@ -4566,6 +4600,67 @@ function Get-mdiDomainCheckIssueText {
     else { '{0} is not configured on this domain' -f $CheckName }
 }
 
+function Get-mdiTargetLabel {
+    <#
+        How a probe target is NAMED in operator-facing text.
+
+        A multi-homed host is discovered once per address and probed per address, so the host name
+        alone does not identify what was measured. Two rows for the same protocol, port and host came
+        out byte-for-byte identical - measured on the shipped issue list: two unmeasured required-port
+        rows with exactly ONE distinct string between them. An operator sees what looks like the table
+        repeating itself, cannot tell which NIC each row is about, and cannot tell whether one of them
+        has already been dealt with.
+
+        Stated once because four surfaces need it - the measured NNR row, the untested NNR row, the
+        unmeasured required-port row and the remediation generator's coverage key - and the wording
+        has already drifted apart once in this file.
+
+        The address is appended only when it ADDS something: a single-homed target, a target with no
+        address recorded, or one discovered BY address (where both fields hold the same value) keeps
+        the plain name, because "10.0.0.5 (10.0.0.5)" is noise.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [string] $Target,
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [string] $TargetIP
+    )
+
+    $name = ([string] $Target).Trim()
+    $address = ([string] $TargetIP).Trim()
+    if ([string]::IsNullOrEmpty($name)) {
+        if (-not [string]::IsNullOrEmpty($address)) { return $address }
+        return ''
+    }
+    if (-not [string]::IsNullOrEmpty($address) -and $address -ne $name) { return '{0} ({1})' -f $name, $address }
+    $name
+}
+
+function Get-mdiUnmeasuredProbeText {
+    <#
+        The one wording for "this probe did not run", carrying WHICH target and WHY.
+
+        The untested-NNR row said only "Name resolution could not be tested for <host>" - dropping
+        both the address and the record's own Detail. Measured: NNR_ISSUE_CONTAINS_UNTESTED_IP=False
+        and NNR_ISSUE_CONTAINS_REASON=False, over a record that carried both. The reason is the
+        actionable half: "no route to the target network" and "the remote probe timed out before this
+        check ran" call for completely different responses, and the operator was shown neither.
+    #>
+    param (
+        [Parameter(Mandatory = $true)] [string] $Prefix,
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [string] $Target,
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [string] $TargetIP,
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [string] $Detail
+    )
+
+    $label = Get-mdiTargetLabel -Target $Target -TargetIP $TargetIP
+    if ([string]::IsNullOrEmpty($label)) { $label = 'an unnamed target' }
+    $text = '{0} {1}' -f $Prefix, $label
+    $reason = ([string] $Detail).Trim()
+    # The reason is appended only when there is one. An empty Detail must not produce a trailing
+    # colon, which reads as a truncated message rather than as an absent one.
+    if (-not [string]::IsNullOrEmpty($reason)) { $text = '{0}: {1}' -f $text, $reason }
+    $text
+}
+
 function Get-mdiNnrIssueText {
     <#
         The one wording for "no network name resolution method could resolve this target".
@@ -4607,12 +4702,9 @@ function Get-mdiNnrIssueText {
         if (-not [string]::IsNullOrEmpty($address)) { return 'No NNR method could resolve an unnamed target at ' + $address }
         return 'No NNR method could resolve an unnamed target'
     }
-    # The address is appended only when it ADDS something. A target discovered by its address alone
-    # carries the same value in both fields, and "10.0.0.11 (10.0.0.11)" is noise.
-    if (-not [string]::IsNullOrEmpty($address) -and $address -ne $name) {
-        return 'No NNR method could resolve {0} ({1})' -f $name, $address
-    }
-    'No NNR method could resolve ' + $name
+    # Labelled through the shared rule, so this row and the untested-NNR row and the unmeasured
+    # required-port row all name a multi-homed target the same way.
+    'No NNR method could resolve ' + (Get-mdiTargetLabel -Target $name -TargetIP $address)
 }
 
 function Get-mdiPortIssueText {
@@ -6563,7 +6655,30 @@ function Test-mdiTrendPointsComparable {
         } elseif (-not $sameChecks) {
             'the set of checks changed'
         } elseif (-not $samePopulation) {
-            'a different number of checks was covered ({0} then {1})' -f (Get-mdiWholeNumberText $prevDenominator), (Get-mdiWholeNumberText $currDenominator)
+            # A denominator that could not be READ must not be reported as a coverage of zero.
+            #
+            # Get-mdiCoverageCount returns 0 for a null, empty or non-numeric stored value - it has to,
+            # because the alternative is throwing on a corrupt history entry - so an unreadable previous
+            # denominator both compares unequal to a real one (reaching this branch) and then renders
+            # through Get-mdiWholeNumberText as '0'. Measured on the shipped functions: a baseline whose
+            # denominator is null, empty or the string 'corrupt' produced
+            # "a different number of checks was covered (0 then 8)", byte-for-byte identical to a run
+            # that genuinely covered nothing.
+            #
+            # The two facts are opposite in what they ask the reader to do. A real 0 says the previous
+            # run examined nothing and the estate has since been scanned. An unreadable 0 says the
+            # baseline file is damaged and should be replaced. Reporting the second as the first sends
+            # the reader to the estate to explain a change that never happened.
+            $prevReadable = $null -ne (Get-mdiMeasuredInteger $Previous.ChecksTotal)
+            $currReadable = $null -ne (Get-mdiMeasuredInteger $Current.ChecksTotal)
+            if (-not $prevReadable -or -not $currReadable) {
+                $which = if (-not $prevReadable -and -not $currReadable) { 'neither run records' }
+                elseif (-not $prevReadable) { 'the previous run does not record' }
+                else { 'this run does not record' }
+                'how many checks were covered could not be read ({0} a readable count)' -f $which
+            } else {
+                'a different number of checks was covered ({0} then {1})' -f (Get-mdiWholeNumberText $prevDenominator), (Get-mdiWholeNumberText $currDenominator)
+            }
         } else {
             'one of the runs measured nothing'
         }
@@ -9604,7 +9719,31 @@ function Get-mdiDomainControllerReadiness {
         # into one table, so there was no way to tell which domain a server belonged to, and no way for
         # the verdict to notice that a domain in scope had contributed no servers at all - which is what
         # an unreachable or unenumerable domain looks like from here.
-        $dc['Domain'] = $Domain
+        #
+        # Taken from the server's OWN name when that name says which domain it is in, and only from the
+        # requested scope when it does not. Assigning the scope unconditionally credited a controller to
+        # whatever domain the caller asked about, regardless of where it actually lives. Measured on the
+        # shipped functions with -Domain child.root.test and a target whose authoritative DN is
+        # CN=DC01,OU=Domain Controllers,DC=root,DC=test:
+        #
+        #   authoritative_directory_domain=root.test   produced_domain=child.root.test
+        #   unexamined_count=0   ready=True   issues=0
+        #
+        # So a root-domain controller was filed under the child domain, Get-mdiUnexaminedDomain saw the
+        # child as covered, and the run certified READY over a domain nothing had examined. That is the
+        # same false green the per-domain scan exists to prevent, arriving through the attribution
+        # instead of the enumeration - and it is worse than reporting the child as unexamined, because
+        # the operator is told the opposite of the truth rather than being told nothing.
+        #
+        # DERIVED, never guessed: the domain is the FQDN with its leftmost label removed, which is what
+        # a fully qualified host name means. A name with no dot carries no domain information, so the
+        # requested scope is still used there - a short name genuinely cannot be placed.
+        $dcFqdn = ([string] $dc.FQDN).Trim().TrimEnd('.').Trim()
+        $dc['Domain'] = if ($dcFqdn -match '\.') {
+            $dcFqdn.Substring($dcFqdn.IndexOf('.') + 1)
+        } else {
+            $Domain
+        }
 
         # Declared before the branch so an unreachable server does not inherit the previous server's
         # details, and reset per server so nothing leaks between iterations.
@@ -10126,6 +10265,23 @@ function Get-mdiEntraConnectReadiness {
                 @{ FQDN = $ecName; IP = $null; Addresses = @(); OS = $null }
             }
         } | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_.FQDN) })
+    # De-duplicated by IDENTITY, after resolution rather than before. Two directory-synchronization
+    # accounts can name the SAME physical host - an account left behind by a re-installation, a
+    # staging-mode server promoted in place, or simply two accounts whose descriptions resolve to one
+    # DNSHostName. Measured on the shipped producer with two such accounts: the host was contacted
+    # TWICE (2 remote check invocations against one machine) and rendered as TWO rows in both the JSON
+    # and the HTML, describing a server that does not exist.
+    #
+    # The score was already correct, because Merge-mdiServerByFqdn collapses the rows before they are
+    # counted - which is exactly why this was invisible. The merge cannot un-do the duplicated remote
+    # work, and it does not touch the per-role tables the operator reads.
+    #
+    # AFTER resolution because that is where the identity becomes knowable: two accounts naming
+    # "AADC01" and "aadc01.contoso.com" are the same host only once both have been resolved to a
+    # DNSHostName. Get-mdiServerIdentityKey is the same rule the merge and the coverage counters use,
+    # so all three agree about what one machine is.
+    $ecs = @($ecs | Group-Object -Property { Get-mdiServerIdentityKey -Server ([PSCustomObject] $_) } |
+            ForEach-Object { @($_.Group)[0] })
     Write-mdiVerbose "Found $($ecs.Count) Entra Connect server(s)"
 
     foreach ($ec in $ecs) {
@@ -10869,9 +11025,9 @@ function Merge-mdiSensorV3Check {
         Get-mdiCheckDetailRank was written for one level up.
 
         Measured is DERIVED from the winning Detail with the producer's own rule
-        (Measured = -not ($Detail -like 'Not tested*')), not merged separately, so the invariant that
-        holds on a produced check still holds on a merged one. Two surfaces of the same fact were free
-        to disagree otherwise.
+        (Test-mdiV3DetailMeasured), not merged separately, so the invariant that holds on a produced
+        check still holds on a merged one. Two surfaces of the same fact were free to disagree
+        otherwise.
 
         Remediable is pessimistic in the "do not invent work" direction: a check that is architectural
         under either role - a member server, an operating system too old for the v3.x sensor - is
@@ -10889,12 +11045,35 @@ function Merge-mdiSensorV3Check {
 
     $firstRank = Get-mdiCheckDetailRank -Value $First.Status
     $secondRank = Get-mdiCheckDetailRank -Value $Second.Status
-    # Equal standing and two different truthful explanations is settled by an ordinal comparison,
-    # exactly as Merge-mdiRequiredPortsDetails settles the identical tie. The choice is arbitrary on
-    # purpose: what matters is that it is a property of the two values rather than of the order they
-    # arrived in, which is what makes the merge commutative.
+
+    # Two roles can BOTH report 'N/A' for DIFFERENT reasons: one because the server could not be read
+    # ('Not tested - ...', which is unmeasured) and one informationally, which stays measured. Those
+    # are not equal evidence, and Get-mdiCheckDetailRank cannot tell them apart because it is shown
+    # only the STATUS, which reads 'N/A' on both. Settling that tie on the ordinal comparison alone
+    # made the outcome depend on the first letter of the sentence. Measured on the migration check of
+    # a host discovered as both a domain controller and a CA, where one pass could not read the
+    # service list:
+    #
+    #     role A  N/A  'Not tested - the service list could not be read on this server: Access is denied'
+    #     role B  N/A  'No v2.x sensor is installed - the server can be activated directly with the v3.x sensor'
+    #     merged  N/A  Measured=True, detail = role B's
+    #
+    # 'No v2.x sensor...' sorts 84 code points before 'Not tested...', so the informational text won,
+    # Measured came out $true, and the only sentence saying the read had failed was deleted from the
+    # row - the report advising a direct v3.x activation on a server whose installed services nobody
+    # could list, which is the one outcome the migration guidance exists to prevent. The identical tie
+    # on the cumulative-update check resolves the other way purely because its informational text
+    # begins 'OS build'.
+    #
+    # So the UNMEASURED detail wins an equal-rank tie. That is the pessimistic reading, it matches
+    # Merge-mdiCheckValue's treatment of the status it explains, and - like the ordinal fallback it
+    # sits in front of - it is a property of the two values rather than of the order they arrived in,
+    # which is what keeps the merge commutative.
+    $firstMeasured = Test-mdiV3DetailMeasured -Detail $First.Detail
+    $secondMeasured = Test-mdiV3DetailMeasured -Detail $Second.Detail
     $winner = if ($secondRank -gt $firstRank) { $Second }
     elseif ($firstRank -gt $secondRank) { $First }
+    elseif ($firstMeasured -ne $secondMeasured) { if ($firstMeasured) { $Second } else { $First } }
     elseif ([string]::CompareOrdinal([string] $Second.Detail, [string] $First.Detail) -lt 0) { $Second }
     else { $First }
 
@@ -10912,7 +11091,7 @@ function Merge-mdiSensorV3Check {
         Status      = $status
         Detail      = $detail
         Remediable  = (($First.Remediable -ne $false) -and ($Second.Remediable -ne $false))
-        Measured    = -not ($detail -like 'Not tested*')
+        Measured    = Test-mdiV3DetailMeasured -Detail $detail
     }
 }
 
@@ -11580,7 +11759,12 @@ function Get-mdiWholeNumberText {
     #>
     [CmdletBinding()]
     param ([Parameter(Mandatory = $true)] [AllowNull()] $Value)
-    [string] [math]::Floor((Get-mdiCoverageCount -Value $Value))
+    # Formatted, not cast. [string] on a double switches to scientific notation from 1e15 up, so the
+    # corrupted entry this function exists to survive rendered the trend tooltip as "3/1E+20" and the
+    # delta caption as "a different number of checks was covered (1E+15 then 4)" - a count no reader
+    # can act on, produced by the very guard that was meant to keep the chart readable. Invariant
+    # culture for the same reason Get-mdiCoverageCount parses invariantly.
+    ([math]::Floor((Get-mdiCoverageCount -Value $Value))).ToString('F0', [Globalization.CultureInfo]::InvariantCulture)
 }
 function Get-mdiCoveragePercent {
     <#
@@ -12313,6 +12497,33 @@ function Get-mdiReportStatistics {
                 Kind   = 'Unmeasured'
             }
         })
+
+    # The clock SPREAD is the sixth gap of this family, and the same shape as the fifth. MDI requires
+    # the sensor servers to be within five minutes OF EACH OTHER; that is an estate-level fact and
+    # belongs to no single server, so no per-server check carries it. The verdict reads it and the
+    # issue list raises it - but the SCORE surfaces never did, so a run whose clocks were 480 seconds
+    # apart rendered a byte-perfect "Overall check score 100% - 8 of 8 checks passed" in green, a
+    # "Servers fully ready 2/2 - All checks passed" tile, and a solid-green donut, directly beside a
+    # hero verdict of "Action required" and a High finding. Measured on the shipped functions.
+    #
+    # Charged as a FAILURE rather than as unread, because unlike the five gaps above this one WAS
+    # measured: two clocks were read and their difference is known. Passed=0/Total=1 puts it in both
+    # the numerator and the denominator, which is what makes the score, the donut and the tile follow
+    # the verdict instead of contradicting it.
+    #
+    # Only a definite $false is charged. 'N/A' - fewer than two clocks read - is not a failure, and
+    # the unread clocks it comes from are already counted as unread checks on their own servers.
+    $clockSpread = Get-mdiClockSpread -Server $allServers
+    if ($clockSpread.IsWithin -eq $false) {
+        $serverScores = @($serverScores) + @([PSCustomObject]@{
+                FQDN   = 'Sensor clocks disagree with each other'
+                Passed = 0
+                Total  = 1
+                Failed = 1
+                Unread = 0
+                Kind   = 'Estate'
+            })
+    }
 
     # The chart is built in TWO passes, from the SAME definition of "unread" the per-server score uses.
     #
@@ -13107,8 +13318,17 @@ function Get-mdiIssueList {
                     'NnrUntested' {
                         # Every NNR method for this target was "Not tested", so name resolution was never
                         # observed. Reported as unmeasured, never as a firewall to open.
+                        #
+                        # Named by ADDRESS and carrying the REASON, for the same reason the measured NNR
+                        # row is: a multi-homed target is probed per address, so one NIC can be untested
+                        # while another was probed fine - and the row said only "could not be tested for
+                        # <host>", which neither identifies the untested address nor says why. Measured:
+                        # NNR_ISSUE_CONTAINS_UNTESTED_IP=False, NNR_ISSUE_CONTAINS_REASON=False, over a
+                        # record carrying both. The detail is the actionable half - "no route to the
+                        # target network" and "the remote probe timed out" need different responses.
                         [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Not measured'
-                                Issue = 'Name resolution could not be tested for ' + [string] $rec.Target
+                                Issue = Get-mdiUnmeasuredProbeText -Prefix 'Name resolution could not be tested for' `
+                                    -Target ([string] $rec.Target) -TargetIP ([string] $rec.TargetIP) -Detail ([string] $rec.Detail)
                             })
                     }
                     'NnrMeasured' {
@@ -13129,9 +13349,16 @@ function Get-mdiIssueList {
                 }
             }
             foreach ($rec in @(Get-mdiUnmeasuredRequiredProbe -Record $portResults)) {
+                # The ADDRESS is named. A multi-homed target is probed once per address, so two rows
+                # for the same protocol, port and host were byte-for-byte identical - measured:
+                # UNMEASURED_PORT_ISSUE_COUNT=2 with DISTINCT_UNMEASURED_PORT_TEXT_COUNT=1. An operator
+                # working the table sees what looks like the list repeating itself, cannot tell which
+                # NIC each row is about, and cannot tell whether one has been dealt with.
                 [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Not measured'
                         Issue = ('A required network probe could not be measured: {0}/{1} to {2}: {3}' -f
-                            [string] $rec.Protocol, [string] $rec.Port, [string] $rec.Target, [string] $rec.Detail)
+                            [string] $rec.Protocol, [string] $rec.Port,
+                            (Get-mdiTargetLabel -Target ([string] $rec.Target) -TargetIP ([string] $rec.TargetIP)),
+                            [string] $rec.Detail)
                     })
             }
         }
@@ -13182,9 +13409,26 @@ function Get-mdiIssueList {
     }
 
     if ($clockSpread.IsWithin -eq $false) {
+        # The scanner-relative clause is CONDITIONAL, because it is a claim about the servers and it
+        # is not always true. It read "Each server is individually within tolerance of the computer
+        # that ran this scan" unconditionally - which is the point being made when the scanner sits
+        # between two drifting sensors, but is simply false when one of them also failed its own
+        # check. Measured: sensor1 at +0s and sensor2 at +600s produced TimeSync True and False
+        # respectively, and the spread row still asserted that each was individually within tolerance,
+        # one line under a High row saying sensor2 was not. Stating something the same run measured as
+        # false is the defect this file exists to remove, whichever direction it points.
+        $allWithinScanner = @($scannerRelativeClockFailure).Count -eq 0
+        $scannerClause = if ($allWithinScanner) {
+            ' Each server is individually within tolerance of the computer that ran this scan, which is a different and weaker condition.'
+        } else {
+            ' {0} of them {1} also outside tolerance of the computer that ran this scan.' -f
+                @($scannerRelativeClockFailure).Count,
+                $(if (@($scannerRelativeClockFailure).Count -eq 1) { 'is' } else { 'are' })
+        }
         [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = ''; Area = 'Time sync'
-                Issue = ('The sensor server clocks span {0} second(s), more than the {1} minute(s) MDI requires between them: {2} is the furthest behind and {3} the furthest ahead. Each server is individually within tolerance of the computer that ran this scan, which is a different and weaker condition.' -f
-                    $clockSpread.SpreadSeconds, $clockSpread.MaxSkewMinutes, [string] $clockSpread.Earliest, [string] $clockSpread.Latest)
+                Issue = ('The sensor server clocks span {0} second(s), more than the {1} minute(s) MDI requires between them: {2} is the furthest behind and {3} the furthest ahead.{4}' -f
+                    $clockSpread.SpreadSeconds, $clockSpread.MaxSkewMinutes, [string] $clockSpread.Earliest,
+                    [string] $clockSpread.Latest, $scannerClause)
             })
     }
 

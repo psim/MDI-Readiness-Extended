@@ -352,7 +352,29 @@ foreach ($unknown in @($null, '', 'N/A', 'Unknown')) {
 # An unmeasured check must render as "Not tested" rather than as a pass.
 Assert-That 'an unmeasured v3 check renders as Not tested' ($reportSource -match 'muted-cell[^>]*>Not tested</td>')
 Assert-That 'the registry reader reports readability separately from value' ($reportSource -match 'function Get-mdiRemoteRegistryResult')
-Assert-That 'checks carry a Measured flag' ($reportSource -match 'Measured\s*=\s*-not \(\$Detail -like')
+# Asserted BEHAVIOURALLY, for the same reason as the two checks above. This used to grep the source
+# for "Measured = -not ($Detail -like", and it went red the moment that predicate was extracted into
+# Test-mdiV3DetailMeasured so the producer and the role-merge could share one copy of the rule - a
+# refactor that did not change a single emitted value. The source shape is not the fact worth
+# pinning; the CONTRACT is: every v3 check carries a Measured flag, and that flag is false exactly
+# when the check's own Detail says the server could not be read.
+$allV3Checks = @(@($v3Healthy.details.Checks) + @($v3Unknown.details.Checks))
+Assert-That 'every v3 check carries a Measured flag' (
+    $allV3Checks.Count -gt 0 -and
+    @($allV3Checks | Where-Object { $null -eq $_.PSObject.Properties['Measured'] }).Count -eq 0
+) "($($allV3Checks.Count) check(s) inspected)"
+Assert-That 'the Measured flag is false exactly when the detail says Not tested' (
+    @($allV3Checks | Where-Object {
+            ([bool] $_.Measured) -ne (-not ([string] $_.Detail -like 'Not tested*'))
+        }).Count -eq 0
+)
+# Both directions, so the flag cannot be satisfied by hard-coding it either way.
+Assert-That 'a readable server still produces measured checks' (
+    @($v3Healthy.details.Checks | Where-Object { $_.Measured }).Count -gt 0
+) "(got $(@($v3Healthy.details.Checks | Where-Object { $_.Measured }).Count) of $(@($v3Healthy.details.Checks).Count))"
+Assert-That 'an unreadable server produces no measured check at all' (
+    @($v3Unknown.details.Checks | Where-Object { $_.Measured }).Count -eq 0
+) "(got $(@($v3Unknown.details.Checks | Where-Object { $_.Measured }).Count))"
 
 Write-Host "`n[12] A partially readable scan is never reported as a clean one" -ForegroundColor Yellow
 # Seen live: access was denied on almost everything, yet the run printed
