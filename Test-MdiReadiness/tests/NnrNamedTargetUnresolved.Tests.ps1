@@ -139,7 +139,7 @@ foreach ($case in @(
 # The half that the probe-plan code owns: if Main stops recording the field, everything above still
 # passes while the real script silently regresses.
 Assert-That 'main records NnrUnresolvedTargets on the report' ($full -match 'NnrUnresolvedTargets\s+=')
-Assert-That 'main compares the named targets against the resolved plan' ($full -match '\$nnrUnresolvedTargets = @\(\$NnrTargetComputer \| Where-Object')
+Assert-That 'main computes the gap through the shared function' ($full -match 'Get-mdiUnresolvedNnrTarget -Requested \$NnrTargetComputer')
 Assert-That 'the verdict reads the field' `
     ($full.Substring($full.IndexOf('function Test-mdiReadinessResult')) -match 'NnrUnresolvedTargets')
 $issueStart = $full.IndexOf('function Get-mdiIssueList')
@@ -147,51 +147,36 @@ $issueEnd = $full.IndexOf('function Test-mdiReadinessResult')
 Assert-That 'the issue list reads the field' `
     ($issueStart -ge 0 -and $issueEnd -gt $issueStart -and ($full.Substring($issueStart, $issueEnd - $issueStart) -match 'NnrUnresolvedTargets'))
 
-'[w83] main''s own gap computation is correct, executed rather than described'
-# Main's body cannot be called without running a scan, so the gap statement is lifted out of the
-# PARSED script and executed with the two names it depends on bound. Taken from the AST, so a decoy
-# in a comment or a string cannot satisfy this, and executed verbatim, so it is the script's own
-# logic being measured rather than a copy of it.
-$ast = [System.Management.Automation.Language.Parser]::ParseInput($full, [ref] $null, [ref] $null)
-$resolvedNamesStatement = @($ast.FindAll({
-            param($n)
-            $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-            $n.Left.Extent.Text -eq '$resolvedNames'
-        }, $true) | ForEach-Object { $_.Extent.Text })
-$gapStatement = @($ast.FindAll({
-            param($n)
-            $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-            $n.Left.Extent.Text -eq '$nnrUnresolvedTargets' -and
-            $n.Right.Extent.Text -match 'Where-Object'
-        }, $true) | ForEach-Object { $_.Extent.Text })
-Assert-That 'the resolved-name statement was found in the parsed script' ($resolvedNamesStatement.Count -eq 1) "(found $($resolvedNamesStatement.Count))"
-Assert-That 'the gap statement was found in the parsed script' ($gapStatement.Count -eq 1) "(found $($gapStatement.Count))"
-
-if ($gapStatement.Count -eq 1 -and $resolvedNamesStatement.Count -eq 1) {
-    $cases = @(
-        @{ Name = 'short name resolved to its FQDN is NOT a gap'; Named = @('ws1'); Resolved = @('ws1.contoso.com'); Expect = @() }
-        @{ Name = 'unresolved name IS a gap'; Named = @('ghost1'); Resolved = @(); Expect = @('ghost1') }
-        @{ Name = 'mixed list reports only the unresolved one'; Named = @('ws1', 'ghost1'); Resolved = @('ws1.contoso.com'); Expect = @('ghost1') }
-        @{ Name = 'exact FQDN match is NOT a gap'; Named = @('ws1.contoso.com'); Resolved = @('ws1.contoso.com'); Expect = @() }
-        @{ Name = 'trailing dot is NOT a gap'; Named = @('ws1.contoso.com.'); Resolved = @('ws1.contoso.com'); Expect = @() }
-        @{ Name = 'blank entries are never a gap'; Named = @('', '   '); Resolved = @(); Expect = @() }
-        @{ Name = 'a different host IS a gap'; Named = @('ws2'); Resolved = @('ws1.contoso.com'); Expect = @('ws2') }
-        @{ Name = 'a multi-homed host resolved twice is NOT a gap'; Named = @('ws1'); Resolved = @('ws1.contoso.com', 'ws1.contoso.com'); Expect = @() }
-    )
-    foreach ($case in $cases) {
-        $NnrTargetComputer = $case.Named
-        $nnrTargets = @($case.Resolved | ForEach-Object { [PSCustomObject]@{ Name = $_ } })
-        $resolvedNames = $null
-        $nnrUnresolvedTargets = $null
-        # Both of Main's statements, in order, exactly as written.
-        Invoke-Expression $resolvedNamesStatement[0]
-        Invoke-Expression $gapStatement[0]
-        $got = @($nnrUnresolvedTargets | ForEach-Object { [string] $_ })
-        $want = @($case.Expect)
-        $same = ($got.Count -eq $want.Count) -and
-            (($got | Sort-Object) -join '|') -eq (($want | Sort-Object) -join '|')
-        Assert-That "  $($case.Name)" $same "(got [$($got -join ', ')] want [$($want -join ', ')])"
-    }
+'[w83] the gap computation is correct, executed rather than described'
+# This block used to lift two assignment statements out of the PARSED script and Invoke-Expression
+# them, because the computation lived inline in Main and nothing else could reach it. It is now the
+# shipped function Get-mdiUnresolvedNnrTarget, so it is CALLED directly - which is strictly better
+# evidence: the same code path Main uses, with no reconstruction of its surrounding variables.
+#
+# The move happened because the inline version was wrong in a way this arrangement could not catch:
+# it matched every request on its leftmost DNS label, so an unresolved host.beta.contoso.com was
+# masked by a resolved host.alpha.contoso.com and vanished from the verdict and the exit code. The
+# same-label case below is that defect, and it is now covered here as well as in
+# NnrGapIsNotHiddenBySharedLabel.Tests.ps1.
+$cases = @(
+    @{ Name = 'short name resolved to its FQDN is NOT a gap'; Named = @('ws1'); Resolved = @('ws1.contoso.com'); Expect = @() }
+    @{ Name = 'unresolved name IS a gap'; Named = @('ghost1'); Resolved = @(); Expect = @('ghost1') }
+    @{ Name = 'mixed list reports only the unresolved one'; Named = @('ws1', 'ghost1'); Resolved = @('ws1.contoso.com'); Expect = @('ghost1') }
+    @{ Name = 'exact FQDN match is NOT a gap'; Named = @('ws1.contoso.com'); Resolved = @('ws1.contoso.com'); Expect = @() }
+    @{ Name = 'trailing dot is NOT a gap'; Named = @('ws1.contoso.com.'); Resolved = @('ws1.contoso.com'); Expect = @() }
+    @{ Name = 'blank entries are never a gap'; Named = @('', '   '); Resolved = @(); Expect = @() }
+    @{ Name = 'a different host IS a gap'; Named = @('ws2'); Resolved = @('ws1.contoso.com'); Expect = @('ws2') }
+    @{ Name = 'a multi-homed host resolved twice is NOT a gap'; Named = @('ws1'); Resolved = @('ws1.contoso.com', 'ws1.contoso.com'); Expect = @() }
+    @{ Name = 'a same-label host in another domain does NOT mask an unresolved one'
+        Named = @('host.alpha.contoso.com', 'host.beta.contoso.com'); Resolved = @('host.alpha.contoso.com')
+        Expect = @('host.beta.contoso.com') }
+)
+foreach ($case in $cases) {
+    $got = @(Get-mdiUnresolvedNnrTarget -Requested $case.Named -Resolved $case.Resolved | ForEach-Object { [string] $_ })
+    $want = @($case.Expect)
+    $same = ($got.Count -eq $want.Count) -and
+        (($got | Sort-Object) -join '|') -eq (($want | Sort-Object) -join '|')
+    Assert-That "  $($case.Name)" $same "(got [$($got -join ', ')] want [$($want -join ', ')])"
 }
 
 ''

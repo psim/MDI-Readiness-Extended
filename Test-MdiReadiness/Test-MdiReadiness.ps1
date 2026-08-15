@@ -8390,15 +8390,28 @@ function Get-mdiSensorVersion {
             # The value has to be QUOTED. Without the quotes WQL rejects the whole query - measured
             # against a real provider: Invalid query "select Version from CIM_DataFile where Name=C:\..."
             # - so the version silently came back empty on every server and the sensor version read as
-            # unknown even where the sensor was installed and running. The separators are doubled
-            # because a backslash escapes in WQL; -replace '\\', '\\' does exactly that, verified by
-            # querying a known file and getting its version back.
+            # unknown even where the sensor was installed and running.
+            #
+            # BOTH escapes are needed, and only the backslash was applied. A backslash escapes in WQL,
+            # so the separators are doubled; an APOSTROPHE closes the single-quoted literal early, and
+            # the v2 installer explicitly supports a caller-chosen InstallationPath, so a company or
+            # person-named folder like O'Brien is a legal install location. Measured against the real
+            # provider with two byte-identical copies of one executable: the plain path returned
+            # 10.0.26100.8875 while the apostrophe path returned Invalid query and, because this call
+            # uses SilentlyContinue, an ordinary run simply reported the version as 'N/A' - the server
+            # table then rendered it "Not tested" and the v3 migration check lost the measurement, on a
+            # server whose sensor was installed, running, and carrying a perfectly readable version.
+            #
+            # Ordered deliberately: backslashes first, then apostrophes. Escaping the apostrophe first
+            # would introduce a backslash that the backslash pass would then double into a literal one,
+            # breaking the escape it had just added.
+            $wqlName = ($executable -replace '\\', '\\') -replace "'", "\'"
             $versionParams = @{
                 ComputerName = $ComputerName
                 Namespace    = 'root\cimv2'
                 Class        = 'CIM_DataFile'
                 Property     = 'Version'
-                Filter       = "Name='{0}'" -f ($executable -replace '\\', '\\')
+                Filter       = "Name='{0}'" -f $wqlName
                 ErrorAction  = 'SilentlyContinue'
             }
             $version = (Get-WmiObject @versionParams).Version
@@ -10400,7 +10413,7 @@ function New-mdiBarChart {
 
 function Copy-mdiDetails {
     <#
-        A copy of a server's Details that shares nothing with the original.
+        A copy of a server's Details whose ENTRIES can be rewritten without touching the original.
 
         Details is an [ordered] hashtable, not a PSCustomObject, and that matters twice over:
 
@@ -10413,6 +10426,17 @@ function Copy-mdiDetails {
         target and none of the actual details.
 
         Both shapes are handled because a report loaded back from JSON has PSCustomObject details.
+
+        The copy is SHALLOW, and deliberately so: the nested blobs are large, and the merge path does
+        not need its own copy of them because it never writes into one. It reads the stored blob,
+        asks a Merge-mdi* function to build a NEW blob from it, and stores that. Deep-copying every
+        detail on every role of every server to protect against a write that does not happen would
+        cost more than it buys.
+
+        That makes "the merges do not mutate their arguments" a load-bearing invariant rather than an
+        incidental property: a merge that started updating its -First argument in place would reach
+        straight through this copy and rewrite the ORIGINAL server's measurements, which are what the
+        per-role tables and the JSON are rendered from. MergeDoesNotMutateItsInputs.Tests.ps1 pins it.
     #>
     param ([Parameter(Mandatory = $false)] [AllowNull()] [object] $Details)
 
@@ -10912,6 +10936,74 @@ function Merge-mdiSensorV3ReadyDetails {
         UnknownChecks      = $unknownChecks
         Checks             = $mergedChecks
     }
+}
+
+function Get-mdiUnresolvedNnrTarget {
+    <#
+        The Network Name Resolution targets the OPERATOR named that never reached the probe plan.
+
+        A host named with -NnrTargetComputer that resolves to no address is dropped by
+        Resolve-mdiNnrTarget with only a warning, so no sensor is ever asked about it. That gap has to
+        reach the verdict, the issue list and the exit code, or the run answers "can my sensors resolve
+        these workstations?" without having tried.
+
+        Lives in its own function rather than inline in the main body because nothing below the Main
+        region marker can be reached by a test - the harness truncates the file there - and this
+        comparison was wrong in a way no test could have caught.
+
+        A SHORT request is resolved to its DNSHostName, so 'SRV1' comes back as 'srv1.contoso.com' and
+        has to match on the leftmost label or it would look like a gap. That fallback was applied to
+        EVERY request, including names the operator had already qualified - and a label is not an
+        identity across domains. Measured on the shipped path with
+        -NnrTargetComputer host.alpha.contoso.com,host.beta.contoso.com where only alpha resolves:
+
+            RESOLVED_IN_PLAN=host.alpha.contoso.com
+            UNRESOLVED_COUNT=0
+            HTML_VERDICT=All prerequisites met
+            PROCESS_EXIT=0
+
+        while the console had already warned "Unable to resolve the NNR target computer
+        host.beta.contoso.com". The one named host that was never probed was erased from the JSON gap
+        list, the HTML issues, the verdict and the exit code by a DIFFERENT machine that happens to
+        share its leftmost label. Identically named hosts in sibling domains are the ordinary shape of
+        a multi-domain forest, not a contrived case.
+
+        So a DOTTED request matches the full name and nothing else; only a dotless one may match on its
+        label.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [AllowEmptyCollection()] [string[]] $Requested,
+        [Parameter(Mandatory = $false)] [AllowNull()] [AllowEmptyCollection()] [string[]] $Resolved
+    )
+
+    if ($null -eq $Requested -or @($Requested).Count -eq 0) { return @() }
+
+    # Normalised once. A trailing dot is the absolute spelling of the same DNS name, surrounding
+    # whitespace is not part of a name at all, and DNS names are case insensitive - so a request that
+    # differs from the resolved name only in those respects is the SAME host and must not be reported
+    # as a gap.
+    $resolvedKeys = @(foreach ($name in @($Resolved)) {
+            $key = ([string] $name).Trim().TrimEnd('.').Trim().ToLowerInvariant()
+            if (-not [string]::IsNullOrWhiteSpace($key)) { $key }
+        })
+
+    @(foreach ($name in @($Requested)) {
+            $requested = ([string] $name).Trim().TrimEnd('.').Trim()
+            if ([string]::IsNullOrWhiteSpace($requested)) { continue }
+            $requestedKey = $requested.ToLowerInvariant()
+
+            if ($requestedKey -match '\.') {
+                # Already qualified: it identifies exactly one host, so only that name will do.
+                if (@($resolvedKeys | Where-Object { $_ -eq $requestedKey }).Count -eq 0) { $requested }
+                continue
+            }
+
+            # Dotless, so the resolver was expected to qualify it. The leftmost label is all there is
+            # to compare against.
+            if (@($resolvedKeys | Where-Object {
+                        $_ -eq $requestedKey -or ($_ -split '\.')[0] -eq $requestedKey
+                    }).Count -eq 0) { $requested }
+        })
 }
 
 function Get-mdiServerIdentityKey {
@@ -16295,23 +16387,9 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
         # name - a silent drop answers "can the sensor resolve my workstations?" with a run that never
         # tried. Captured from the PLAN rather than from the resolver, so it stays true however the
         # target came to be missing.
-        $nnrUnresolvedTargets = @()
-        if ($NnrTargetComputer) {
-            $resolvedNames = @($nnrTargets | ForEach-Object { ([string] $_.Name).Trim().TrimEnd('.') })
-            $nnrUnresolvedTargets = @($NnrTargetComputer | Where-Object {
-                    $requested = ([string] $_).Trim().TrimEnd('.')
-                    if ([string]::IsNullOrWhiteSpace($requested)) { return $false }
-                    # A short name is resolved to its DNSHostName, so 'SRV1' comes back as
-                    # 'srv1.contoso.com'. Matching the label before the first dot as well keeps a
-                    # successfully resolved short name from being reported as a gap.
-                    $label = ($requested -split '\.')[0]
-                    @($resolvedNames | Where-Object {
-                            $_ -eq $requested -or ($_ -split '\.')[0] -eq $label
-                        }).Count -eq 0
-                })
-            if ($nnrUnresolvedTargets.Count -gt 0) {
-                Write-mdiWarning ('No address could be resolved for the Network Name Resolution target(s) you named: {0}. They were dropped from the probe plan, so they will be reported as unverified rather than ready.' -f ($nnrUnresolvedTargets -join ', '))
-            }
+        $nnrUnresolvedTargets = @(Get-mdiUnresolvedNnrTarget -Requested $NnrTargetComputer -Resolved @($nnrTargets | ForEach-Object { $_.Name }))
+        if ($nnrUnresolvedTargets.Count -gt 0) {
+            Write-mdiWarning ('No address could be resolved for the Network Name Resolution target(s) you named: {0}. They were dropped from the probe plan, so they will be reported as unverified rather than ready.' -f ($nnrUnresolvedTargets -join ', '))
         }
         Write-mdiVerbose ('Using {0} Network Name Resolution target(s): {1}' -f @($nnrTargets).Count, (@($nnrTargets | ForEach-Object { $_.Name }) -join ', '))
         if (-not $NnrTargetComputer) {
