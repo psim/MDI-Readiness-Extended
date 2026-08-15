@@ -217,19 +217,25 @@ function Get-mdiDsSacl {
     [PSCustomObject]@{ isAuditingOk = $true; Measured = $true; details = $script:fakeApplied }
 }
 # A complete SACL covering every expected entry yields $true.
+# The schema version is stated EXPLICITLY here. These three cases exercise the ACE-MATCHING logic,
+# not applicability - and applicability is now tri-state, so leaving it at 0 against an unresolvable
+# domain means "could not determine whether the dMSA entry applies" and correctly short-circuits to
+# N/A before any SACL comparison happens. 88 is a known pre-dMSA schema: the question is answered,
+# the five-entry expected set is the same one these assertions were written against, and the ACE
+# matcher is reached.
 $script:fakeApplied = @($expectedAuditing | ForEach-Object { New-mdiAce $_ })
-$complete = Get-mdiObjectAuditing -Domain 'nonexistent.invalid.test' -DomainSchemaVersion 0
+$complete = Get-mdiObjectAuditing -Domain 'nonexistent.invalid.test' -DomainSchemaVersion 88
 Assert-That 'a SACL covering every expected entry is a pass' (
     $complete.isObjectAuditingOk -eq $true) "(got '$($complete.isObjectAuditingOk)')"
 # N duplicate ACEs (one per expected entry) all covering ONE expected entry, the rest uncovered, is a
 # FAIL. Counting applied ACEs makes this N matches for N expected entries - a false green.
 $script:fakeApplied = @(1..($expectedAuditing.Count) | ForEach-Object { New-mdiAce $expectedAuditing[0] })
-$dupes = Get-mdiObjectAuditing -Domain 'nonexistent.invalid.test' -DomainSchemaVersion 0
+$dupes = Get-mdiObjectAuditing -Domain 'nonexistent.invalid.test' -DomainSchemaVersion 88
 Assert-That 'duplicate ACEs for one entry do not fake full coverage' (
     $dupes.isObjectAuditingOk -eq $false) "(got '$($dupes.isObjectAuditingOk)')"
 # Full coverage PLUS a second valid ACE for one entry is still a pass (the old false red).
 $script:fakeApplied = @(@($expectedAuditing | ForEach-Object { New-mdiAce $_ }) + (New-mdiAce $expectedAuditing[0]))
-$twoAce = Get-mdiObjectAuditing -Domain 'nonexistent.invalid.test' -DomainSchemaVersion 0
+$twoAce = Get-mdiObjectAuditing -Domain 'nonexistent.invalid.test' -DomainSchemaVersion 88
 Assert-That 'two valid ACEs matching one entry still pass' (
     $twoAce.isObjectAuditingOk -eq $true) "(got '$($twoAce.isObjectAuditingOk)')"
 # The tri-state from Get-mdiDsSacl is honoured: a not-measured SACL stays N/A.

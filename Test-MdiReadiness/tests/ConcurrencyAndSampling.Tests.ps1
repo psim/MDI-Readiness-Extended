@@ -85,8 +85,16 @@ Write-Host 'A bounded wait is bounded for the PHASE, not once per server' -Foreg
 # The jobs run concurrently in a runspace pool, so waiting for them one at a time and charging each
 # the full budget is an accounting error: three wedged domain controllers took 3 x 121s.
 Assert-That 'the wait deadline is shared across the pending jobs' ($text -match '\$totalWaitMs')
+# Shape-independent: what matters is that the remaining budget is TOTAL MINUS ELAPSED, not which
+# clamp is wrapped around it. This assertion used to pin the exact literal
+# "[int] [Math]::Max(0, $totalWaitMs" and broke when that expression gained an Int32 ceiling - a
+# change that strengthened the behaviour rather than weakening it. Per this project's rule that a
+# test breaking on a behaviour-preserving refactor is the wrong test, it now checks the relationship
+# instead of the spelling. The clamp's actual BEHAVIOUR - no overflow, no server silently nulled,
+# a spent budget still flooring at zero - is covered behaviourally by
+# CapacityWaveBudgetDoesNotOverflow.Tests.ps1.
 Assert-That '  and each wait asks only for the REMAINING budget' (
-    $text -match '\$remainingMs\s*=\s*\[int\]\s*\[Math\]::Max\(0,\s*\$totalWaitMs')
+    $text -match '(?s)\$remainingMs\s*=.{0,200}?\$totalWaitMs\s*-\s*\$waitTimer\.Elapsed\.TotalMilliseconds')
 Assert-That '  measured on a monotonic stopwatch, not the wall clock' (
     $text -match '\$waitTimer\s*=\s*\[System\.Diagnostics\.Stopwatch\]::StartNew\(\)')
 # It must still scale with WAVES, or a forest larger than the pool throttle would abandon jobs that

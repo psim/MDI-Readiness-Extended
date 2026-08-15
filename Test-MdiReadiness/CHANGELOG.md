@@ -15,6 +15,32 @@ The version is defined once, in the `$settings` block of the script, and appears
 footer, in the `-AsJson` output and in each baseline history entry, so any report or trend can be
 traced back to the build that produced it.
 
+## [1.1.2] - 2026-08-15
+
+Correctness release, continuing 1.1.1. Same families of defect: a value that was never read being
+presented as a measurement, and a figure quoted over a population it did not cover.
+
+No parameter, report section or JSON field changed, so an existing `-BaselinePath` history and any
+`-AsJson` consumer keep working.
+
+### Fixed
+
+- The generated remediation script no longer weakens a setting that already passes. The NTLM
+  auditing values were written without reading the current value first, so a domain controller
+  configured more strictly than the minimum would have been downgraded by running it.
+- Remediation names the correct servers as the source of the network rules it generates, and the
+  one destructive command it emits runs once per container.
+- The trend chart no longer joins runs that cannot be compared, and the delta pill no longer prints
+  a zero it did not measure.
+- Unmeasured name resolution, sensor and capacity results are reported as unmeasured rather than as
+  failures or absence, and the KPI strip, score card and issue list agree on the same population.
+- A capacity sampling budget too large for a 32-bit counter no longer aborts the run.
+
+### Added
+
+- The regression suite grew to 169 files. Each new test was mutation-tested: the defect was
+  reintroduced, the test confirmed red, then restored and confirmed green.
+
 ## [1.1.1] - 2026-08-14
 
 Correctness release. Roughly 120 defects were found by an automated hunt against the lab forest and

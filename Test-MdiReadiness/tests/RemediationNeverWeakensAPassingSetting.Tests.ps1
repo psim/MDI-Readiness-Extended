@@ -78,9 +78,16 @@ $writeIdx = @(0..($lines.Count - 1) | Where-Object { $lines[$_] -match 'New-Item
 Assert-That 'the section emits its registry writes' ($writeIdx.Count -ge 1) "($($writeIdx.Count) write(s) found)"
 foreach ($idx in $writeIdx) {
     $name = if ($lines[$idx] -match "-Name '([^']+)'") { $Matches[1] } else { '?' }
-    $preceding = $lines[([Math]::Max(0, $idx - 4))..($idx - 1)] -join ' '
+    # Widened from four lines to eight, and the reader/comparison spellings are both accepted: the
+    # guard now also tests the value KIND, so it reads through Get-Item/GetValue rather than
+    # Get-ItemProperty and expresses acceptability positively ($mdiAcceptable = ... -match ...) instead
+    # of as a -notmatch. The INTENT asserted here is unchanged - a write must be preceded by a read of
+    # the current value and a comparison against it - and the behavioural half of that is pinned by
+    # NtlmRemediationRepairsWrongType.Tests.ps1, which executes the emitted guard against a real key.
+    $preceding = $lines[([Math]::Max(0, $idx - 8))..($idx - 1)] -join ' '
     Assert-That "  $name is written only after its current value is read" `
-        ($preceding -match 'Get-ItemProperty' -and $preceding -match 'notmatch') `
+        (($preceding -match 'Get-ItemProperty' -or $preceding -match 'Get-Item ') -and
+            ($preceding -match 'notmatch' -or $preceding -match '-match')) `
         "(preceding lines: $preceding)"
 }
 
@@ -90,8 +97,9 @@ foreach ($idx in $writeIdx) {
 $restrictIdx = @($writeIdx | Where-Object { $lines[$_] -match 'RestrictSendingNTLMTraffic' })
 Assert-That 'the RestrictSendingNTLMTraffic write was located' ($restrictIdx.Count -eq 1) "($($restrictIdx.Count))"
 if ($restrictIdx.Count -eq 1) {
-    $guardLine = @($lines[([Math]::Max(0, $restrictIdx[0] - 4))..($restrictIdx[0] - 1)] | Where-Object { $_ -match 'notmatch' })[0]
-    $rx = if ($guardLine -match "notmatch\s+'([^']+)'") { $Matches[1] } else { $null }
+    $guardLine = @($lines[([Math]::Max(0, $restrictIdx[0] - 8))..($restrictIdx[0] - 1)] |
+            Where-Object { $_ -match 'notmatch' -or $_ -match '\$mdiAcceptable\s*=' })[0]
+    $rx = if ($guardLine -match "match\s+'([^']+)'") { $Matches[1] } else { $null }
     Assert-That 'the guard carries a right-anchored alternation' `
         ($null -ne $rx -and $rx -match '^\^\(\?:.*\)\$$') "(guard '$guardLine')"
 
@@ -105,9 +113,25 @@ if ($restrictIdx.Count -eq 1) {
         Assert-That '  an unreadable value IS still written' ('not-a-number' -notmatch $rx) "(regex '$rx')"
 
         # The written value must still be one the check accepts, or the repair would not repair.
-        $written = if ($lines[$restrictIdx[0]] -match '-Value (\d+)') { $Matches[1] } else { '' }
+        # The write now passes a variable ($mdiWrite) so the guard can preserve an acceptable value
+        # that merely has the wrong TYPE, instead of forcing the default over it. The DEFAULT is what
+        # this assertion is about, so it is read from the assignment that sets it.
+        $written = if ($lines[$restrictIdx[0]] -match '-Value (\d+)') {
+            $Matches[1]
+        } else {
+            $defaultLine = @($lines[([Math]::Max(0, $restrictIdx[0] - 8))..($restrictIdx[0] - 1)] |
+                    Where-Object { $_ -match '\$mdiWrite\s*=\s*\d+' })[0]
+            if ($defaultLine -match '\$mdiWrite\s*=\s*(\d+)') { $Matches[1] } else { '' }
+        }
         Assert-That '  the value it writes is itself acceptable to the check' ($written -match $rx) `
             "(writes '$written', accepts '$rx')"
+        # ...and when the current value is already acceptable, THAT value is written rather than the
+        # default - otherwise repairing a wrong TYPE on a DC hardened to 2 would relax it to 1, which
+        # is the exact weakening this whole file exists to prevent.
+        $preserves = @($lines[([Math]::Max(0, $restrictIdx[0] - 8))..($restrictIdx[0] - 1)] |
+                Where-Object { $_ -match '\$mdiWrite\s*=\s*\[int\]\s*\$mdiCurrent' }).Count
+        Assert-That '  an acceptable current value is preserved, not replaced by the default' `
+            ($preserves -ge 1) '(the default would overwrite a hardened value)'
     }
 }
 

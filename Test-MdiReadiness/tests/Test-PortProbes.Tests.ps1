@@ -1,4 +1,4 @@
-﻿# Test harness: loads only the function definitions from Test-MdiReadiness.ps1 and exercises the port probes
+# Test harness: loads only the function definitions from Test-MdiReadiness.ps1 and exercises the port probes
 $scriptPath = Join-Path $PSScriptRoot 'Test-MdiReadiness.ps1'
 if (-not (Test-Path $scriptPath)) { $scriptPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'Test-MdiReadiness.ps1' }
 $tokens = $null; $errors = $null
