@@ -1,4 +1,4 @@
-<#
+﻿<#
     .NOTES
         NON-ENGLISH WINDOWS AND NON-ENGLISH LOCALES
 
@@ -502,7 +502,7 @@ $settings = @{
     # Single source of truth for the version. It is surfaced in the HTML report footer, in the -AsJson
     # output and in the baseline history, so a report or a trend can always be traced back to the build
     # that produced it. A release workflow checks this value against the git tag.
-    ScriptVersion                   = '1.1.2'
+    ScriptVersion                   = '1.1.3'
 
     AdvancedAuditPolicyDCs          = @'
 Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Setting Value
@@ -2228,10 +2228,28 @@ function Get-mdiPortProbeScriptText {
 
     $planJson = (Get-mdiSlimProbePlan -Plan $Plan) | ConvertTo-Json -Depth 6 -Compress
     $planB64 = [convert]::ToBase64String([text.encoding]::UTF8.GetBytes($planJson))
+    # The OUTPUT PATH travels as base64 too, exactly like the plan above, rather than as a quoted
+    # literal. It used to be placed in a single-quoted literal with only ASCII U+0027 escaped, and
+    # Windows PowerShell 5.1 also honours U+2018, U+2019, U+201A and U+201B as single-quote
+    # delimiters. U+2019 is the ordinary apostrophe in French, so a machine-wide TEMP of
+    # "D:\Company<U+2019>s Temp" is a legal Windows path - and it closed the literal early. Measured
+    # on the shipped generator, executing the result the way Win32_Process.Create does: 3 parse
+    # errors ("Missing ')' in method call"), exit code 1, and NO result file, against a
+    # byte-identical control using U+0027 that parsed cleanly and produced valid JSON. The caller
+    # reads a missing result file as a server it could not measure, so the entire network-port
+    # surface for that server was lost without anything reporting a defect.
+    #
+    # Base64 rather than better escaping. Folding the typographic quotes to ASCII - which is what the
+    # remediation generator does for NAMES - would be wrong here: it would change the target
+    # directory, writing the results to "Company's Temp" while the caller reads "Company<U+2019>s
+    # Temp". Doubling them in place was measured to work, but a path must round-trip EXACTLY and
+    # base64 cannot be broken by any character at all, which is why the plan already travels this way.
+    $outputB64 = [convert]::ToBase64String([text.encoding]::UTF8.GetBytes([string] $OutputFile))
 
     Compress-mdiScriptText -ScriptText (@'
 {0}
 $plan = ConvertFrom-Json ([text.encoding]::UTF8.GetString([convert]::FromBase64String('{1}')))
+$outputFile = [text.encoding]::UTF8.GetString([convert]::FromBase64String('{2}'))
 $result = Invoke-mdiPortProbePlan -Plan $plan
 $json = $result | ConvertTo-Json -Depth 4 -Compress
 # Written WITH a byte order mark. The caller reads this file back with Get-Content, which on Windows
@@ -2240,8 +2258,8 @@ $json = $result | ConvertTo-Json -Depth 4 -Compress
 # characters, and a Windows error message in Cyrillic or Japanese was destroyed outright. The reader
 # is shared with other producers (auditpol writes its own CSV through the same path), so the BOM is
 # added here at the writer rather than forcing an encoding on the reader.
-[io.file]::WriteAllText('{2}', $json, (New-Object text.utf8encoding $true))
-'@ -f $definitions, $planB64, ($OutputFile -replace "'", "''"))
+[io.file]::WriteAllText($outputFile, $json, (New-Object text.utf8encoding $true))
+'@ -f $definitions, $planB64, $outputB64)
 }
 
 function Get-mdiPortProbeCommandLine {
@@ -4564,10 +4582,36 @@ function Get-mdiNnrIssueText {
     # unnamed NNR target produced NO HTML REPORT AT ALL for the whole estate. Losing the entire report
     # is far worse than one row reading "an unnamed target", and an unnamed target is itself a fact
     # worth stating rather than a reason to abort.
-    param ([Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [string] $Target)
+    param (
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [string] $Target,
+        # The ADDRESS the failure was measured against, when the target has more than one. A
+        # multi-homed host is discovered once per address and probed per address, so one NIC can
+        # answer every NNR method while another answers none - and the unqualified wording then made
+        # a claim the same run had already contradicted. Measured on the shipped functions with
+        # dual.contoso.com on 10.0.0.10 (all methods succeed) and 10.0.0.11 (all fail):
+        #
+        #   PRODUCER_NNR_FAILED_TARGETS=dual.contoso.com (10.0.0.11)
+        #   STATISTICS_NNR=1/2
+        #   ISSUE=No NNR method could resolve dual.contoso.com
+        #
+        # The producer had the address and the statistics said one of two resolved, but the row an
+        # operator works from said the host could not be resolved at all - and gave them no way to
+        # find the broken NIC. Optional, because a single-homed target has nothing to qualify and the
+        # shorter sentence is the right one there.
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [string] $TargetIP
+    )
 
     $name = ([string] $Target).Trim()
-    if ([string]::IsNullOrEmpty($name)) { return 'No NNR method could resolve an unnamed target' }
+    $address = ([string] $TargetIP).Trim()
+    if ([string]::IsNullOrEmpty($name)) {
+        if (-not [string]::IsNullOrEmpty($address)) { return 'No NNR method could resolve an unnamed target at ' + $address }
+        return 'No NNR method could resolve an unnamed target'
+    }
+    # The address is appended only when it ADDS something. A target discovered by its address alone
+    # carries the same value in both fields, and "10.0.0.11 (10.0.0.11)" is noise.
+    if (-not [string]::IsNullOrEmpty($address) -and $address -ne $name) {
+        return 'No NNR method could resolve {0} ({1})' -f $name, $address
+    }
     'No NNR method could resolve ' + $name
 }
 
@@ -5391,12 +5435,22 @@ function New-mdiRemediationScript {
         # A target is only covered when every one of its blocked NNR methods was scripted. If any
         # failing method has no rule in $ruleMap then something about that target is still unfixed and
         # the finding has to stay visible.
+        #
+        # Grouped by target AND ADDRESS, matching the issue list. A multi-homed host is probed once
+        # per address and the issue text names the failing address, so keying on the name alone
+        # produced a covered-marker that no longer matched any row - the finding would have reappeared
+        # under "needs manual attention" for a rule the script had just written. This is exactly the
+        # silent drift the note above describes, reached again by a change at the other end.
         foreach ($target in $blockedTargets) {
             $forTarget = @($blockedNnr | Where-Object { [string] $_.Target -eq [string] $target })
-            $unscripted = @($forTarget | Where-Object { -not $ruleMap.ContainsKey([int] $_.Port) })
-            if ($forTarget.Count -eq 0 -or $unscripted.Count -gt 0) { continue }
-            foreach ($server in @($forTarget | ForEach-Object { [string] $_.Server } | Select-Object -Unique)) {
-                & $markCovered $server (Get-mdiNnrIssueText -Target $target)
+            if ($forTarget.Count -eq 0) { continue }
+            foreach ($address in @($forTarget | ForEach-Object { [string] $_.TargetIP } | Select-Object -Unique)) {
+                $forAddress = @($forTarget | Where-Object { [string] $_.TargetIP -eq [string] $address })
+                $unscripted = @($forAddress | Where-Object { -not $ruleMap.ContainsKey([int] $_.Port) })
+                if ($forAddress.Count -eq 0 -or $unscripted.Count -gt 0) { continue }
+                foreach ($server in @($forAddress | ForEach-Object { [string] $_.Server } | Select-Object -Unique)) {
+                    & $markCovered $server (Get-mdiNnrIssueText -Target $target -TargetIP $address)
+                }
             }
         }
     }
@@ -6158,14 +6212,47 @@ function Get-mdiBaselineHistory {
                 #
                 # UTF-8 is a superset of ASCII, so a file that happens to be plain ASCII is unaffected,
                 # and a BOM is skipped by the decoder rather than becoming a stray character.
-                $parsed = [IO.File]::ReadAllText($file, [Text.Encoding]::UTF8) | ConvertFrom-Json
+                #
+                # Decoded STRICTLY. The default UTF8Encoding replaces every invalid byte with U+FFFD
+                # instead of failing, so a baseline saved by a Windows-1252 editor - or by any tool
+                # that writes the operator's ANSI code page - was accepted silently and its damage
+                # made permanent by the rewrite below. Measured on a file whose only non-ASCII
+                # character was the umlaut in dc-muenchen: python refused it outright
+                # ("'utf-8' codec can't decode byte 0xfc"), while this reader produced
+                # dc-m<U+FFFD>nchen with NO warning, the trend then compared the set of server names,
+                # saw a machine it had never seen before, and printed "Not comparable with the
+                # previous run - the set of servers changed" instead of the delta. The next write put
+                # the replacement character into the file as well-formed UTF-8, so the operator's
+                # history was corrupted beyond recovery by a run that reported nothing wrong.
+                #
+                # Failing here is the right answer rather than transcoding: the catch below already
+                # warns and starts a new history, which is honest, and guessing at the code page would
+                # be the same silent rewrite in a different disguise. An unreadable file is announced,
+                # never quietly reinterpreted.
+                $strictUtf8 = New-Object System.Text.UTF8Encoding @($false, $true)
+                $parsed = [IO.File]::ReadAllText($file, $strictUtf8) | ConvertFrom-Json
                 # Assigned before being wrapped: ConvertFrom-Json emits a JSON array as a single
                 # pipeline object in Windows PowerShell, so @(... | ConvertFrom-Json) would nest the
                 # whole history into a one-element array and every later index would return an array
                 # instead of a run.
                 $history = @($parsed)
             } catch {
-                Write-mdiWarning ('Unable to read the baseline history at {0}, starting a new one: {1}' -f $file, $_.Exception.Message)
+                # A file that cannot be DECODED must not be overwritten. The history is the operator's
+                # only record of where the estate has been, and the rewrite below would replace a
+                # merely-unreadable file with one containing this run alone - so a wrong code page
+                # would cost every previous run permanently. The current run still gets its own
+                # report; only the trend is refused, and it is refused out loud.
+                Write-mdiWarning ('Unable to read the baseline history at {0}: {1}' -f $file, $_.Exception.Message)
+                if ($_.Exception -is [System.Text.DecoderFallbackException] -or
+                    $_.Exception.InnerException -is [System.Text.DecoderFallbackException]) {
+                    Write-mdiWarning ('The baseline history at {0} is not valid UTF-8, so it was left untouched rather than being rewritten and losing the runs already in it. Re-save it as UTF-8 to resume the trend.' -f $file)
+                    return [PSCustomObject]@{
+                        Path    = $file
+                        History = @()
+                        Current = $entry
+                    }
+                }
+                Write-mdiWarning ('Starting a new baseline history at {0}.' -f $file)
                 $history = @()
             }
         }
@@ -12700,6 +12787,10 @@ function Get-mdiIssueList {
     )
 
     $issues = New-Object -TypeName System.Collections.ArrayList
+    # Collected during the per-server loop and judged AFTER it, once the estate is known. A
+    # scanner-relative clock failure cannot be classified server by server: whether it means anything
+    # depends on what the OTHER servers said, and that is only known when the loop has finished.
+    $scannerRelativeClockFailure = New-Object -TypeName System.Collections.ArrayList
 
     # Domain-level and forest-level findings first. These live on the report, not on any server object,
     # so a list built only from servers could be EMPTY while the verdict was "action required" - the
@@ -13022,7 +13113,7 @@ function Get-mdiIssueList {
                     }
                     'NnrMeasured' {
                         [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Name resolution'
-                                Issue = Get-mdiNnrIssueText -Target ([string] $rec.Target)
+                                Issue = Get-mdiNnrIssueText -Target ([string] $rec.Target) -TargetIP ([string] $rec.TargetIP)
                             })
                     }
                     default {
@@ -13049,18 +13140,47 @@ function Get-mdiIssueList {
             [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Sensor health'; Issue = [string] $sensorIssue })
         }
         if ($srv.PSObject.Properties['TimeSync'] -and (Test-mdiCheckFailed -Value $srv.TimeSync)) {
+            [void] $scannerRelativeClockFailure.Add($srv)
+        }
+    }
+
+    # The MDI prerequisite is that the sensor servers agree with EACH OTHER. Every per-server TimeSync
+    # value above compares one clock with the computer that ran the scan, which is a different
+    # question - and the answers diverge in BOTH directions:
+    #
+    #   * the scanner sits between two sensors eight minutes apart: both look compliant, and without
+    #     the spread check below the run reports READY over an estate that fails the requirement;
+    #   * the sensors agree perfectly but the SCANNER's clock is ten minutes out: every server is
+    #     flagged, and the run fails on a prerequisite that is in fact satisfied.
+    #
+    # The second is the one that reaches an operator most often - an administration workstation with a
+    # wrong clock is far more common than a split estate - and it was measured on the shipped
+    # functions: two sensors reading the same instant produced spread=0, IsWithin=True, and TWO High
+    # rows both saying "MDI requires all sensor servers to be within 5 minutes of each other", which
+    # is the very rule the spread had just proved satisfied. The report contradicted itself on one
+    # page, and -FailOnIssues acted on it.
+    #
+    # So the per-server rows are raised ONLY when the estate itself has not already answered the
+    # question. When the spread is measured and within tolerance, the prerequisite is met and the
+    # scanner's own clock is reported once, as an accuracy caveat about the measurement rather than a
+    # readiness failure of the estate.
+    $clockSpread = Get-mdiClockSpread -Server @(@($Statistics.ReachableList) + @($Statistics.UnreachableList) | Where-Object { $_ })
+    if ($clockSpread.IsWithin -eq $true -and $scannerRelativeClockFailure.Count -gt 0) {
+        # Medium, not High: nothing about the estate is wrong. Worded about the SCANNER, because that
+        # is what the measurement actually implicates, and the operator still needs to know - every
+        # timestamp in this report came from that clock.
+        [void] $issues.Add([PSCustomObject]@{ Severity = 'Medium'; Server = ''; Area = 'Time sync'
+                Issue = ('The sensor server clocks agree with each other to within {0} second(s), so the Defender for Identity requirement is met, but they differ from the computer that ran this scan by more than {1} minute(s) ({2} server(s)). That is a clock problem on the scanning computer rather than on the estate; the timestamps in this report come from it.' -f
+                    $clockSpread.SpreadSeconds, $clockSpread.MaxSkewMinutes, $scannerRelativeClockFailure.Count)
+            })
+    } else {
+        foreach ($srv in $scannerRelativeClockFailure) {
             [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Time sync'
                     Issue = [string] $srv.Details.TimeSyncDetails.Detail
                 })
         }
     }
 
-    # Raised once for the estate, not per server, because the finding IS the relationship between
-    # them: MDI requires the sensor servers to be within five minutes OF EACH OTHER, and every check
-    # above compares one server with the computer that ran this script. A scanner sitting between two
-    # sensors eight minutes apart sees both as compliant, so no per-server issue is raised and the
-    # verdict reads "All prerequisites met" over an estate that fails the requirement.
-    $clockSpread = Get-mdiClockSpread -Server @(@($Statistics.ReachableList) + @($Statistics.UnreachableList) | Where-Object { $_ })
     if ($clockSpread.IsWithin -eq $false) {
         [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = ''; Area = 'Time sync'
                 Issue = ('The sensor server clocks span {0} second(s), more than the {1} minute(s) MDI requires between them: {2} is the furthest behind and {3} the furthest ahead. Each server is individually within tolerance of the computer that ran this scan, which is a different and weaker condition.' -f
@@ -15872,8 +15992,22 @@ function Test-mdiReadinessResult {
     $properties = @($servers | ForEach-Object { Get-mdiCheckProperty -Server $_ } |
             Select-Object -ExpandProperty Name -Unique)
 
+    # The MDI clock prerequisite is server-to-server, and TimeSync answers a different question - each
+    # clock against the computer that ran the scan. When the estate itself has been measured and
+    # AGREES, a scanner-relative skew says the scanning computer's clock is wrong, not the estate's,
+    # and it must not fail the run. Measured on the shipped functions: two sensors reading the same
+    # instant with the scanner ten minutes out produced spread=0, IsWithin=True, and a NOT READY
+    # verdict citing the very rule the spread had just proved satisfied.
+    #
+    # Only excluded when the spread is a definite $true. 'N/A' - fewer than two clocks read - leaves
+    # TimeSync judged exactly as before, because with one clock there is no estate to appeal to, and
+    # 'N/A' is a truthy string that must never be mistaken for a pass.
+    $clockSpread = Get-mdiClockSpread -Server $servers
+    $ignoreTimeSync = ($clockSpread.IsWithin -eq $true)
+
     $serversOk = @(foreach ($server in $servers) {
             $properties | ForEach-Object {
+                if ($ignoreTimeSync -and $_ -eq 'TimeSync') { return }
                 $server | Select-Object -ExpandProperty $_ -ErrorAction SilentlyContinue
             }
         })
@@ -16074,7 +16208,7 @@ function Test-mdiReadinessResult {
     # STRING 'N/A' when fewer than two clocks were read, which is non-empty and therefore truthy. A
     # spread that could not be measured must not fail the run on its own - the unread clocks it came
     # from are already counted as unread checks - so only a definite $false blocks READY.
-    $clockSpread = Get-mdiClockSpread -Server $servers
+    # Computed once, above, where the TimeSync exclusion needed it.
     if ($clockSpread.IsWithin -eq $false) {
         Write-mdiWarning ('The sensor server clocks span {0} second(s), more than the {1} minute(s) MDI requires between them, so the run cannot be reported as ready.' -f
             $clockSpread.SpreadSeconds, $clockSpread.MaxSkewMinutes)

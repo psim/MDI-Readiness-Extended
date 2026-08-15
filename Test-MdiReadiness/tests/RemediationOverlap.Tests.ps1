@@ -93,8 +93,16 @@ $nnrIssues = @(Get-mdiIssueList -Statistics $nnrStats -ReportData $nnrReport |
 Assert-That 'the issue list raises exactly one NNR finding per target' (@($nnrIssues).Count -eq 1) "(got $(@($nnrIssues).Count))"
 Assert-That 'and it uses the shared NNR wording helper' (
     @($nnrIssues).Count -ge 1 -and
-    ([string] @($nnrIssues)[0].Issue -eq (Get-mdiNnrIssueText -Target 'wks1.contoso.com'))
+    ([string] @($nnrIssues)[0].Issue -eq (Get-mdiNnrIssueText -Target 'wks1.contoso.com' -TargetIP '10.0.0.50'))
 ) "(got '$(@($nnrIssues)[0].Issue)')"
+# The invariant this file defends is that the wording has ONE SOURCE - not that it is any particular
+# sentence. The helper gained a -TargetIP parameter so a multi-homed target names the address that
+# actually failed, and pinning the old exact string would have made this test fight that change
+# rather than defend the invariant. It is asserted by CALLING the helper with the same inputs the
+# issue list had, so any future rewording is followed automatically and a private copy of the string
+# still fails.
+Assert-That '  ...and the helper is what carries the failing address' (
+    (Get-mdiNnrIssueText -Target 'wks1.contoso.com' -TargetIP '10.0.0.50') -match '10\.0\.0\.50')
 Assert-That 'the real NNR probes are AtLeastOne, not Required' (
     @($realRecs | Where-Object { [string] $_.Requirement -ne 'AtLeastOne' }).Count -eq 0)
 

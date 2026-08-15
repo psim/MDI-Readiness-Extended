@@ -15,6 +15,34 @@ The version is defined once, in the `$settings` block of the script, and appears
 footer, in the `-AsJson` output and in each baseline history entry, so any report or trend can be
 traced back to the build that produced it.
 
+## [1.1.3] - 2026-08-15
+
+Correctness release. Same family as 1.1.1 and 1.1.2: a figure the run did not measure being
+presented as one that it did.
+
+No parameter, report section or JSON field changed, so an existing `-BaselinePath` history and any
+`-AsJson` consumer keep working.
+
+### Fixed
+
+- A baseline file written in another encoding was silently corrupted, permanently, losing the trend
+  history it was meant to preserve.
+- A server discovered under two spellings was merged into one machine, but the counters still
+  charged it twice, so the score was taken over an estate larger than the one that exists.
+- A name-resolution target that was never probed disappeared from the report when another host
+  shared its first label, and an NNR issue now names the address that actually failed.
+- Sizing thresholds are applied to the measurement rather than to a rounded copy of it.
+- A path containing a space, an apostrophe or a quote no longer breaks the remote probe, the
+  auditpol call or the sensor version check.
+- Clock comparisons must agree with each other before a skew is reported.
+- The detail merges are pinned as non-mutating, which is what makes the shallow per-role copy of a
+  server's details safe.
+
+### Added
+
+- The regression suite grew to 189 files. Each new test was mutation-tested: the defect was
+  reintroduced, the test confirmed red, then restored and confirmed green.
+
 ## [1.1.2] - 2026-08-15
 
 Correctness release, continuing 1.1.1. Same families of defect: a value that was never read being

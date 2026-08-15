@@ -150,6 +150,76 @@ Assert-That 'CONTROL: one clock - an unmeasurable spread - does not fail the run
     $singleVerdict -eq $true) "verdict=$singleVerdict"
 
 Write-Host ''
+Write-Host 'The inverse: a wrong SCANNER clock must not fail an estate that agrees with itself' -ForegroundColor Cyan
+# The mirror image of the defect above, and the one an operator hits far more often - an
+# administration workstation with a wrong clock is much commoner than a split estate. Both sensors
+# read the same instant, so the MDI prerequisite is satisfied with a zero-second spread, but each is
+# ten minutes from the scanner. Measured before this was fixed: spread=0, IsWithin=True, and TWO High
+# rows both saying "MDI requires all sensor servers to be within 5 minutes of each other" - the very
+# rule the spread had just proved satisfied - plus a NOT READY verdict and a non-zero exit.
+$scannerOff = @(
+    (New-ClockServer -Fqdn 'sensor1.contoso.com' -SkewSeconds 600 -TimeSync $false),
+    (New-ClockServer -Fqdn 'sensor2.contoso.com' -SkewSeconds 600 -TimeSync $false)
+)
+foreach ($srv in $scannerOff) {
+    $srv | Add-Member -NotePropertyName 'OSVersionOk' -NotePropertyValue $true -Force
+    $srv.Details.TimeSyncDetails | Add-Member -NotePropertyName 'Detail' `
+        -NotePropertyValue 'Clock differs by 10 minute(s) - MDI requires all sensor servers to be within 5 minutes of each other' -Force
+}
+
+$offSpread = Get-mdiClockSpread -Server $scannerOff
+Assert-That 'the estate itself agrees - a zero second spread' (
+    $offSpread.SpreadSeconds -eq 0 -and $offSpread.IsWithin -eq $true) (
+    "spread=$($offSpread.SpreadSeconds) isWithin=$($offSpread.IsWithin)")
+
+$offIssues = @(Get-mdiIssueList -Statistics ([PSCustomObject]@{ ReachableList = $scannerOff; UnreachableList = @() }))
+$offClock = @($offIssues | Where-Object { $_.Area -eq 'Time sync' })
+Assert-That 'no High time-sync row is raised against the servers' (
+    @($offClock | Where-Object { $_.Severity -eq 'High' }).Count -eq 0) (
+    'rows: ' + (($offClock | ForEach-Object { $_.Severity + '/' + $_.Issue }) -join ' | '))
+Assert-That 'the scanner clock is reported once, not once per server' (
+    $offClock.Count -eq 1) "count=$($offClock.Count)"
+Assert-That 'and it is Medium, because nothing about the estate is wrong' (
+    $offClock.Count -eq 1 -and $offClock[0].Severity -eq 'Medium') "severity=$($offClock.Severity)"
+Assert-That 'it says the requirement IS met' (
+    $offClock.Count -eq 1 -and $offClock[0].Issue -match 'requirement is met') "issue=$($offClock.Issue)"
+Assert-That 'and it points at the scanning computer, not the estate' (
+    $offClock.Count -eq 1 -and $offClock[0].Issue -match 'scanning computer') "issue=$($offClock.Issue)"
+# The decisive one: a correct estate must not be failed by a wrong wristwatch.
+$offVerdict = Test-mdiReadinessResult -ReportData @(New-ReportData -Server $scannerOff) 3>$null
+Assert-That 'the run is READY - the prerequisite is satisfied' (
+    $offVerdict -eq $true) "verdict=$offVerdict"
+
+Write-Host ''
+Write-Host 'CONTROL - a genuinely split estate is still failed, even though it also fails against the scanner' -ForegroundColor Cyan
+# Both servers ten minutes from the scanner AND twenty minutes from each other. The spread is the
+# real failure and must still be caught; the exclusion above must not swallow it.
+$reallySplit = @(
+    (New-ClockServer -Fqdn 'sensor1.contoso.com' -SkewSeconds 600 -TimeSync $false),
+    (New-ClockServer -Fqdn 'sensor2.contoso.com' -SkewSeconds -600 -TimeSync $false)
+)
+foreach ($srv in $reallySplit) { $srv | Add-Member -NotePropertyName 'OSVersionOk' -NotePropertyValue $true -Force }
+$splitSpread = Get-mdiClockSpread -Server $reallySplit
+Assert-That 'CONTROL: the spread is measured as outside tolerance' (
+    $splitSpread.IsWithin -eq $false) "spread=$($splitSpread.SpreadSeconds)"
+$splitIssues = @(Get-mdiIssueList -Statistics ([PSCustomObject]@{ ReachableList = $reallySplit; UnreachableList = @() }))
+Assert-That 'CONTROL: High time-sync rows are still raised' (
+    @($splitIssues | Where-Object { $_.Area -eq 'Time sync' -and $_.Severity -eq 'High' }).Count -ge 1) (
+    'rows: ' + (($splitIssues | Where-Object { $_.Area -eq 'Time sync' } | ForEach-Object { $_.Severity }) -join ', '))
+Assert-That 'CONTROL: and the run is NOT ready' (
+    (Test-mdiReadinessResult -ReportData @(New-ReportData -Server $reallySplit) 3>$null) -eq $false)
+
+# A single server has no estate to appeal to, so its scanner-relative failure must still count.
+$loneBadClock = @((New-ClockServer -Fqdn 'sensor1.contoso.com' -SkewSeconds 600 -TimeSync $false))
+$loneBadClock[0] | Add-Member -NotePropertyName 'OSVersionOk' -NotePropertyValue $true -Force
+$loneIssues = @(Get-mdiIssueList -Statistics ([PSCustomObject]@{ ReachableList = $loneBadClock; UnreachableList = @() }))
+Assert-That 'CONTROL: one server with a bad clock is still a High finding' (
+    @($loneIssues | Where-Object { $_.Area -eq 'Time sync' -and $_.Severity -eq 'High' }).Count -eq 1) (
+    'rows: ' + (($loneIssues | Where-Object { $_.Area -eq 'Time sync' } | ForEach-Object { $_.Severity + '/' + $_.Issue }) -join ' | '))
+Assert-That 'CONTROL: and it is NOT ready, since there is no estate to appeal to' (
+    (Test-mdiReadinessResult -ReportData @(New-ReportData -Server $loneBadClock) 3>$null) -eq $false)
+
+Write-Host ''
 Write-Host 'CONTROLS - a healthy estate must not be accused of drift' -ForegroundColor Cyan
 $tightSpread = Get-mdiClockSpread -Server $tight
 Assert-That 'CONTROL: a 60 second spread is within tolerance' (
