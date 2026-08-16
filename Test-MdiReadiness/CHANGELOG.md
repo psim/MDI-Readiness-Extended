@@ -15,6 +15,37 @@ The version is defined once, in the `$settings` block of the script, and appears
 footer, in the `-AsJson` output and in each baseline history entry, so any report or trend can be
 traced back to the build that produced it.
 
+## [1.1.4] - 2026-08-16
+
+Correctness release. The same family as 1.1.1 through 1.1.3: a value the run could not read being
+presented as a definite answer.
+
+No parameter, report section or JSON field changed, so an existing `-BaselinePath` history and any
+`-AsJson` consumer keep working.
+
+### Fixed
+
+- A run that scanned nothing handed a machine a success signal, and the Windows PowerShell 5.1
+  re-launch leaked onto the interfaces a machine reads.
+- A service state that could not be determined was reported as stopped, a sensor version read short
+  became a measured "upgrade the sensor", and a value whose type could not be read counted as
+  passing.
+- Migration eligibility that was never established was published as a measured "No".
+- A domain controller the directory could not name was dropped from the estate rather than counted.
+- A required subcategory listed twice turned a correct audit policy into a measured failure.
+- Port probes are sent on the address family they are probing, and a port finding names the address
+  that actually failed.
+- An unread coverage figure in the trend comparison is no longer reported as a coverage of zero.
+- Forest discovery reports a partial enumeration as partial, and domain attribution no longer credits
+  coverage nobody measured.
+
+### Added
+
+- The regression suite grew to 215 files. Each new test was mutation-tested: the defect was
+  reintroduced, the test confirmed red, then restored and confirmed green.
+- The published build is now verified by a real scan against a live multi-domain forest before it is
+  promoted, in addition to the unit suite and the linter.
+
 ## [1.1.3] - 2026-08-15
 
 Correctness release. Same family as 1.1.1 and 1.1.2: a figure the run did not measure being
