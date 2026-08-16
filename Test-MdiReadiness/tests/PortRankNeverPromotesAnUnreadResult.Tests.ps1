@@ -30,6 +30,24 @@
 
     The string forms are pinned deliberately too: a report read back from -AsJson carries Success as
     the strings 'True' and 'False', so those MUST keep ranking as real measurements.
+
+    Section [7] closes a hole this file shipped with. Success is not the only place a probe records
+    that it never ran: the port checks also report it in DETAIL, and the ranking reads it -
+
+        if (($Record.Applicable -ne $true) -or
+            ([string] $Record.Detail -match $script:mdiPortNotTestedPattern)) { return 1 }
+
+    - so a record carrying a perfectly good boolean is still ranked "never measured" when its Detail
+    says the probe did not happen ('Not tested...', 'Unable to...', 'Could not...', 'Not determined',
+    'Access is denied', 'RPC server is unavailable'). Every case built above leaves Detail at the
+    default 'Connected', so none of them exercised that clause and deleting it left this file green.
+    Measured with the clause removed: of nine shapes, seven change answer and FIVE of those become
+    'measured open' - an unread probe reported to the operator as a working port, which is this
+    project's oldest defect family and is silent rather than loud. A blocked-port shape moves the
+    other way, to 'measured blocked', inventing a firewall rule nobody can find.
+
+    The clause is also what makes Success and Detail agree. Without it the two halves of one record
+    state different things about whether the probe ran, and the merge keeps whichever ranks higher.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -128,6 +146,53 @@ Assert-That 'an unmeasured probe yields N/A, not a failure' ("$vUnread" -eq 'N/A
 Assert-That '  ...and N/A is not the boolean false' (-not ($vUnread -is [bool])) "(type $($vUnread.GetType().Name))"
 $vOpen = Get-mdiEffectivePortCheckValue -Server (New-Server @((New-Rec $true)))
 Assert-That 'an all-open estate adds nothing to override' ($null -eq $vOpen -or $vOpen -eq $true) "(got '$vOpen')"
+
+Write-Host "`n[7] A probe that says in DETAIL that it never ran is not a measurement" -ForegroundColor Yellow
+# Success and Detail are two surfaces of one fact. A record can carry a clean boolean and still be
+# reporting that nothing was probed, and the boolean is the one that looks authoritative. Ranking it
+# as evidence is how an unread port reaches the operator as an open one.
+foreach ($case in @(
+        @{ d = 'Not tested - the host could not be reached'; s = $true },
+        @{ d = 'Not tested - the host could not be reached'; s = $false },
+        @{ d = 'Unable to resolve dc1.contoso.com'; s = $true },
+        @{ d = 'Could not open a socket to 10.0.0.1'; s = $true },
+        @{ d = 'Not determined'; s = $true },
+        @{ d = 'Access is denied'; s = $false },
+        @{ d = 'The RPC server is unavailable'; s = $true },
+        @{ d = 'Connecting failed: Access is denied'; s = $true },
+        @{ d = 'The RPC server is unavailable'; s = 'True' }
+    )) {
+    $r = Get-mdiPortRecordRank -Record (New-Rec -Success $case.s -Detail $case.d)
+    Assert-That ("Success=$($case.s) but Detail='$($case.d)' is never measured") ($r -eq 1) "(got rank $r)"
+    Assert-That '  ...so it cannot outrank a real probe' ($r -lt 2) "(got rank $r)"
+}
+# The controls: a Detail that reports a genuine outcome must stay a measurement, or this clause would
+# be swallowing real results instead of unread ones.
+Assert-That "a real 'Connected' success still ranks as measured" `
+    ((Get-mdiPortRecordRank -Record (New-Rec -Success $true -Detail 'Connected')) -eq 2)
+Assert-That "a real 'Blocked - no response' failure still ranks as measured" `
+    ((Get-mdiPortRecordRank -Record (New-Rec -Success $false -Detail 'Blocked - no response')) -eq 3)
+Assert-That "'Access is denied' inside ordinary prose is not a not-tested marker" `
+    ((Get-mdiPortRecordRank -Record (New-Rec -Success $false -Detail 'Port closed because Access is denied was expected')) -eq 3)
+
+# And it must survive the merge: a real measurement beats the unread copy whichever order they arrive.
+$realOpenRec = New-Blob @((New-Rec -Success $true -Detail 'Connected'))
+$unreadDetail = New-Blob @((New-Rec -Success $false -Detail 'Not tested - the host could not be reached'))
+foreach ($pair in @(
+        @{ n = 'real first, detail-unread second'; a = $realOpenRec; b = $unreadDetail },
+        @{ n = 'detail-unread first, real second'; a = $unreadDetail; b = $realOpenRec }
+    )) {
+    $merged = Merge-mdiRequiredPortsDetails -First $pair.a -Second $pair.b
+    $w = @($merged.Results | Where-Object { $_.Id -eq 'NnrRpc' })[0]
+    Assert-That "$($pair.n): the measurement survives, not the unread copy" `
+        ("$($w.Success)" -eq 'True') "(surviving Success='$($w.Success)' Detail='$($w.Detail)')"
+}
+
+# Carried through to the value every consumer reads: a server whose only probe never ran must reach
+# them as 'N/A', not as a silent pass.
+$vDetailUnread = Get-mdiEffectivePortCheckValue -Server (New-Server @((New-Rec -Success $true -Detail 'Not tested - the host could not be reached')))
+Assert-That 'a detail-unread probe reaches the consumers as N/A' ("$vDetailUnread" -eq 'N/A') "(got '$vDetailUnread')"
+Assert-That '  ...and never as a boolean pass' (-not ($vDetailUnread -is [bool]) -and $vDetailUnread -ne $true) "(got '$vDetailUnread')"
 
 Write-Host ''
 Write-Host ("================ {0} passed / {1} failed ================" -f $script:pass, $script:fail) -ForegroundColor $(if ($script:fail) { 'Red' } else { 'Green' })
