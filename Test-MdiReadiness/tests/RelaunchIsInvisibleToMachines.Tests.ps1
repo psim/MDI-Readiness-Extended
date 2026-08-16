@@ -60,6 +60,29 @@
 # The ActiveDirectory module gate sits ahead of everything under test, so a stub ActiveDirectory
 # module is staged on PSModulePath. Every case here stops at -WhatIf or at parameter validation, so
 # no directory is contacted, no report is written and no output folder is created.
+#
+# The cleanup case counts the staged parameter files in a temp directory this test OWNS, and that is
+# the point of the private staging directory below - not tidiness. Measured on 16 Aug 2026, with the
+# leftover count taken from the user-wide [IO.Path]::GetTempPath():
+#
+#     [w163] the staged parameter file is always cleaned up
+#         mdi-relaunch-*.xml in TEMP: before=0 after=1
+#       FAIL  no parameter file is left behind, not even by a dry run (before=0 after=1)
+#
+# The shipped script had not leaked anything: by the time the failure was read back the directory
+# held ZERO mdi-relaunch-*.xml files, and the same frozen script and test passed three times in a
+# row once the machine was quiet. What the count had caught was a DIFFERENT process re-launching
+# itself at that instant - a second suite was running on the same box - because every re-launch on
+# the machine stages into the one directory this assertion was reading. The same run that produced
+# the FAIL had already been reported as pass=16 fail=0 by a suite that happened to reach the case
+# a few seconds earlier.
+#
+# So the assertion was reading a directory shared with every other process on the machine and
+# attributing whatever it found there to the script under test. That is a false RED, and a false RED
+# is not a lesser fault than a false GREEN here: the tree gate is what decides whether work is safe
+# to commit, and a gate that reds at random is one people learn to re-run until it agrees with them.
+# Pointing TMP/TEMP at a directory created for this run makes the count describe only the child
+# processes this test started.
 
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -106,6 +129,17 @@ $stubAd = Join-Path $stubRoot 'ActiveDirectory'
 $savedModulePath = $env:PSModulePath
 $env:PSModulePath = $stubRoot + ';' + $savedModulePath
 
+# Every child started below inherits this environment - Invoke-Host uses UseShellExecute=$false and
+# never asks for a new one - and [IO.Path]::GetTempPath(), which is what the script uses to place
+# the staged parameter file, reads TMP before TEMP. Redirecting both is therefore enough to move
+# the whole re-launch hand-off into a directory nothing else on the machine writes to.
+$argStage = Join-Path $work 'argstage'
+[void] (New-Item -ItemType Directory -Path $argStage -Force)
+$savedTmp = $env:TMP
+$savedTemp = $env:TEMP
+$env:TMP = $argStage
+$env:TEMP = $argStage
+
 function Invoke-Host {
     <#
         Runs the shipped script as a real process on the requested host. stdout and stderr are
@@ -134,7 +168,7 @@ function Get-Flat {
     ($Text -replace '\s+', ' ').Trim()
 }
 
-$tempDir = [IO.Path]::GetTempPath()
+$tempDir = $argStage
 $leftoverBefore = @(Get-ChildItem -LiteralPath $tempDir -Filter 'mdi-relaunch-*.xml' -File -ErrorAction SilentlyContinue).Count
 
 try {
@@ -214,6 +248,8 @@ try {
     }
 } finally {
     $env:PSModulePath = $savedModulePath
+    $env:TMP = $savedTmp
+    $env:TEMP = $savedTemp
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 }
 
