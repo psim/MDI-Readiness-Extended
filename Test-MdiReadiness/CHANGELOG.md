@@ -15,6 +15,29 @@ The version is defined once, in the `$settings` block of the script, and appears
 footer, in the `-AsJson` output and in each baseline history entry, so any report or trend can be
 traced back to the build that produced it.
 
+## [1.1.5] - 2026-08-16
+
+Correctness release, and the end of a known blind spot: every function in the script is now named by
+the regression suite.
+
+No parameter, report section or JSON field changed, so an existing `-BaselinePath` history and any
+`-AsJson` consumer keep working.
+
+### Fixed
+
+- A domain controller whose name parses as a legacy address form - `2019`, `10.1`, an octal or hex
+  octet - was keyed as a fabricated IP address instead of its FQDN, splitting one server into two
+  half-populated rows and aiming its port probes at an address nobody owns.
+- A schema version the lookup table does not name was rendered as `n/a`, discarding a number the run
+  had actually read and making a measured version indistinguishable from an unread one.
+- Endpoint merging asserted that addresses had been resolved even when the source said they had not,
+  which left the caller's DNS-retry path unreachable.
+
+### Added
+
+- The regression suite now covers every function in the script. Each new test was mutation-tested:
+  the defect was reintroduced, the test confirmed red, then restored and confirmed green.
+
 ## [1.1.4] - 2026-08-16
 
 Correctness release. The same family as 1.1.1 through 1.1.3: a value the run could not read being
