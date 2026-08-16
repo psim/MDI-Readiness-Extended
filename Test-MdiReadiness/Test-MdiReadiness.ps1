@@ -1076,8 +1076,29 @@ function ConvertTo-mdiCanonicalIPAddress {
     $ip = $null
     if ($Value -is [Net.IPAddress]) {
         $ip = $Value
-    } elseif (-not [Net.IPAddress]::TryParse(([string] $Value).Trim(), [ref] $ip)) {
-        return $null
+    } else {
+        # [Net.IPAddress]::TryParse is the legacy inet_addr parser. It accepts a bare integer
+        # ('2019' -> 0.0.7.227), an abbreviated form ('10.1' -> 10.0.0.1), an octal octet
+        # ('010.1.2.3' -> 8.1.2.3) and a hexadecimal literal ('0x0a010203' -> 10.1.2.3). None of those
+        # are addresses this tool is ever handed. They are host NAMES that happen to be numeric, or an
+        # address written ambiguously - and accepting them turns a name into a fabricated address, and
+        # one address into a DIFFERENT one, silently: the answer is well formed, so there is no error
+        # to report and nothing downstream can tell it was never measured.
+        #
+        # ConvertTo-mdiCanonicalComputerName asks this function "is this an address?" BEFORE it
+        # qualifies a short name with its domain, so a domain controller named 2019 was keyed as the
+        # address 0.0.7.227 rather than 2019.contoso.com. It then never matched the same host
+        # discovered elsewhere - two half-populated rows for one server, either of which could carry
+        # the healthy verdict - and every port probe for it was aimed at an address no one owns.
+        #
+        # Only a strict four-part dotted-decimal literal is IPv4. Anything else without a colon is a
+        # name, and DNS decides what it means - not inet_addr.
+        $text = ([string] $Value).Trim()
+        if ($text -notmatch ':' -and
+            $text -notmatch '^(25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)){3}$') {
+            return $null
+        }
+        if (-not [Net.IPAddress]::TryParse($text, [ref] $ip)) { return $null }
     }
     if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6 -and $ip.IsIPv4MappedToIPv6) {
         $ip = $ip.MapToIPv4()
@@ -3226,7 +3247,37 @@ function Merge-mdiDomainControllerEndpoint {
             [void] $ordered.Add($entry)
         }
 
+        # AddressResolutionComplete is a MEASUREMENT, not a constant. It used to be stamped $true on
+        # every merged entry regardless of what the source said, which is a definite answer produced
+        # without reading anything: a source carrying AddressResolutionComplete=$false - "these
+        # addresses are NOT the resolved set, go and resolve them" - came out of the merge claiming
+        # the opposite. Measured: one record in with $false and no addresses, out with $true.
+        #
+        # The consumer in Get-mdiDomainControllerInventory reads exactly this flag to decide whether
+        # to trust the stored addresses or fall back to Get-mdiComputerAddress, so overwriting it
+        # made that DNS fallback UNREACHABLE for every server - every server reaches it through this
+        # merge. A domain controller whose addresses could not be resolved was therefore reported
+        # "cannot be probed" without the second attempt the code was written to give it.
+        #
+        # The carry is PESSIMISTIC, matching Merge-mdiServerByFqdn: if ANY copy of the host was
+        # incompletely resolved, the merged host is incompletely resolved. A source with no such
+        # property at all is treated as complete, which is what both current producers are - they
+        # resolve addresses before merging - so their behaviour is unchanged.
+        #
+        # The value is required to be a real [bool]. A bare -eq $true would not be enough: PowerShell
+        # converts the right operand to the left operand's type, so the STRING 'True' (which is what
+        # a boolean becomes through an -AsJson round trip) and the INTEGER 1 both compare equal to
+        # $true and would read as a completed measurement. Measured: with -eq $true in place of this
+        # line, those two forms leak through and the regression test loses two assertions.
+        $completeProperty = $source.PSObject.Properties['AddressResolutionComplete']
+        $sourceComplete = if ($null -eq $completeProperty) {
+            $true
+        } else {
+            ($completeProperty.Value -is [bool]) -and $completeProperty.Value
+        }
+
         $entry = $byName[$key]
+        $entry.AddressResolutionComplete = ($entry.AddressResolutionComplete -and $sourceComplete)
         $addresses = @(@($entry.Addresses) + @($source.Addresses) + @($source.IP) | ForEach-Object {
                 $canonical = ConvertTo-mdiCanonicalIPAddress -Value $_
                 if ($null -ne $canonical -and (Test-mdiUsableComputerAddress -Value $canonical)) { $canonical }
@@ -10042,7 +10093,19 @@ function Get-DomainSchemaVersion {
 
     $return = @{
         schemaVersion = $schemaVersion
-        details       = $(if ($schemaVersion -gt 0) { $schemaVersions[$schemaVersion] } else { 'Not tested - the schema version could not be read' })
+        details       = $(if ($schemaVersion -gt 0) {
+                # A version the directory ANSWERED with, but that this table has no name for, is still a
+                # measured version. Returning $null for it made it indistinguishable from a failed read:
+                # the report renders a falsy details as the literal 'n/a', so the number this run did
+                # obtain was thrown away and the operator was told nothing was measured.
+                #
+                # That is the same complaint the comment on 90 above records, and adding 90 and 91 only
+                # fixed the two versions that were known to be missing at the time. Every future schema
+                # version reintroduced it. Handled generally here so the table is a source of NAMES, not
+                # the thing that decides whether a reading counts as one.
+                if ($schemaVersions.ContainsKey($schemaVersion)) { $schemaVersions[$schemaVersion] }
+                else { 'Unrecognised schema version - this script has no name for it' }
+            } else { 'Not tested - the schema version could not be read' })
     }
     $return
 }

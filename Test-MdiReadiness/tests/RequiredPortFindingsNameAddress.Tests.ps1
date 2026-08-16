@@ -15,8 +15,8 @@ $ErrorActionPreference = 'Stop'
 $canonical = $(if ($env:MDI_CANONICAL) { $env:MDI_CANONICAL } else { $c = Join-Path (Split-Path $PSScriptRoot -Parent) 'Test-MdiReadiness.ps1'; if (Test-Path -LiteralPath $c) { $c } else { Join-Path $PSScriptRoot 'Test-MdiReadiness.ps1' } })
 $loaded = Join-Path $PSScriptRoot 'Test-MdiReadiness.ps1'
 if (-not (Test-Path $loaded)) { $loaded = Join-Path (Split-Path $PSScriptRoot -Parent) 'Test-MdiReadiness.ps1' }
-$loadedHash = (Get-FileHash -LiteralPath $loaded -Algorithm SHA256).Hash
-$canonicalHash = $(if (Test-Path -LiteralPath $canonical) { (Get-FileHash -LiteralPath $canonical -Algorithm SHA256).Hash } else { '<canonical not found>' })
+$loadedHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($loaded))).Replace('-','')
+$canonicalHash = $(if (Test-Path -LiteralPath $canonical) { [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($canonical))).Replace('-','') } else { '<canonical not found>' })
 "LOADED_PATH=$loaded"
 "LOADED_SHA256=$loadedHash"
 "CANONICAL_SHA256=$canonicalHash"

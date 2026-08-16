@@ -93,9 +93,22 @@ try {
     }
 
     # The control must genuinely work, or every assertion below is measuring a broken harness.
-    $plainResult = [string] (Get-Version -ExecutablePath $plainExe)
+    #
+    # Retried, because the provider underneath is WMI. Get-mdiSensorVersion queries CIM_DataFile,
+    # and that query intermittently returns nothing while the machine is under load - this file ran
+    # ZERO assertions twice in a 220-file suite while passing three times out of three standalone,
+    # which the runner reports as "no assertions" and the gate reads as a red tree. The guard itself
+    # is right and is kept: a control that cannot read a version must still stop the file rather
+    # than let the assertions below measure a broken harness. Only a transient miss is absorbed, and
+    # a provider that is genuinely unreachable still throws on the final attempt.
+    $plainResult = ''
+    foreach ($attempt in 1..5) {
+        $plainResult = [string] (Get-Version -ExecutablePath $plainExe)
+        if (-not [string]::IsNullOrWhiteSpace($plainResult) -and $plainResult -ne 'N/A') { break }
+        if ($attempt -lt 5) { Start-Sleep -Milliseconds (250 * $attempt) }
+    }
     if ([string]::IsNullOrWhiteSpace($plainResult) -or $plainResult -eq 'N/A') {
-        throw "the ordinary-path control returned '$plainResult' - the harness is not reaching the real provider"
+        throw "the ordinary-path control returned '$plainResult' after 5 attempts - the harness is not reaching the real provider"
     }
 
     Write-Host 'A legal install path containing an apostrophe must still yield the version' -ForegroundColor Cyan
