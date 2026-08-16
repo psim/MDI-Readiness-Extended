@@ -47,6 +47,24 @@
 
 The Test-MdiReadiness.ps1 script will query your domain, domain controllers and CA servers to report if the different **Microsoft Defender for Identity** prerequisites are in place or not. It creates an html report and a detailed json file with all the collected data.
 
+## What you need to download
+
+**`Test-MdiReadiness.ps1` on its own.** It is a single self-contained script with no modules, no
+dependencies on anything else in this repository, and no installation step — copy that one file to a
+domain-joined machine and run it. The HTML report it produces is self-contained too, so it opens on
+a domain controller with no internet access.
+
+Grab it from the [latest release](https://github.com/psim/MDI-Readiness-Extended/releases/latest), or
+from `Test-MdiReadiness/Test-MdiReadiness.ps1` in the source tree.
+
+The rest of this folder is evidence, not payload, and you do not need any of it to run the tool:
+
+| Path | What it is |
+|---|---|
+| `tests/` | The behavioural regression suite — one file per defect fixed, each mutation-tested. Read it if you want to check that a fix is real, or before contributing. |
+| `docs/` | The report screenshots used in this README. |
+| `CHANGELOG.md` | What changed in each version, and why. |
+
 It will check the domain for the following items:
 
 - [Object Auditing](https://aka.ms/mdi/objectauditing)
