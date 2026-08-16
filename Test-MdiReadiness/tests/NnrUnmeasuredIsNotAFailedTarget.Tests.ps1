@@ -1,3 +1,19 @@
+<#
+    An NNR target that was never probed is not a target that failed.
+
+    Name resolution targets that no method ever ran against were folded in with the ones that ran and
+    were refused, so the report named a host as failing NNR when nothing had measured it. The two facts
+    call for opposite actions - one is a resolution problem to fix, the other is a gap in the scan - and
+    the check value has to distinguish them: an unmeasured target is neither False nor True, because
+    nothing tested is not the same as nothing wrong.
+
+    Pinned here: an entirely unmeasured NNR target is not named as failed and its check is neither False
+    nor True; a measured-shut target IS named as failed with a False check; a resolvable target is not
+    named as failed and its check is True; never-ran, refused and open produce three different answers;
+    the failure list is filtered through the measured-probe predicate; and the not-measured verdict
+    branch consults the NNR unmeasured count rather than inferring it.
+#>
+
 # An NNR target whose probes never RAN was stored as a MEASURED required-ports failure.
 #
 # Get-mdiRequiredPorts builds two failure lists from the same $applicable set, fourteen lines apart.
@@ -18,8 +34,8 @@
 #     required probes never ran -> isRequiredPortsOk = N/A   , FailedRequired   empty   (guarded)
 #     NNR probes never ran      -> isRequiredPortsOk = False , NnrFailedTargets 'wks1.contoso.com (::1)'
 #
-# It needs nothing unusual to reach: an NNR target that resolves to IPv6 only cannot be probed, and
-# the socket exception is exactly the "Not tested - ..." detail those records carry. The consequence is
+# It needs nothing unusual to reach: a stale NNR name can fail resolution before a probe is sent,
+# producing exactly the "Not tested - ..." detail those records carry. The consequence is
 # a false RED - an operator sent to open TCP 135, UDP 137 and TCP 3389 on a device nobody could test.
 #
 # The fix has TWO halves and the second is the one that matters. Excluding unmeasured probes from the
@@ -37,6 +53,28 @@ $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $target = Join-Path $here 'Test-MdiReadiness.ps1'
 if (-not (Test-Path $target)) { $target = Join-Path (Split-Path $here -Parent) 'Test-MdiReadiness.ps1' }
+$loadedHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+$canonicalPath = $(if ($env:MDI_CANONICAL) { $env:MDI_CANONICAL } else { $c = Join-Path (Split-Path $PSScriptRoot -Parent) 'Test-MdiReadiness.ps1'; if (Test-Path -LiteralPath $c) { $c } else { Join-Path $PSScriptRoot 'Test-MdiReadiness.ps1' } })
+$canonicalHash = $(if (Test-Path -LiteralPath $canonicalPath) { (Get-FileHash -LiteralPath $canonicalPath -Algorithm SHA256).Hash } else { '<canonical not found>' })
+"LOADED_PATH=$target"
+"LOADED_SHA256=$loadedHash"
+"CANONICAL_SHA256=$canonicalHash"
+"HASH_MATCH=$($loadedHash -eq $canonicalHash)"
+# Enforced only when the test IS running against the canonical file. Run-Suite.ps1 deliberately
+# executes from an ISOLATED COPY so that the canonical can be edited mid-run without corrupting the
+# result - its own header says "a result gathered from a directory that can change underneath the run
+# is not evidence of anything". Comparing the copy against the LIVE canonical re-read at test time
+# therefore measured a race, not the product: this file threw before a single assertion ran whenever
+# another edit landed during the suite, and the run was reported as "no-assertions" rather than as a
+# pass or a failure. The hashes are still printed above, so a stale copy remains visible.
+# NOT fatal. Run-Suite.ps1 deliberately executes from an ISOLATED COPY so the canonical can be edited
+# mid-run without corrupting the result - its own header says "a result gathered from a directory that
+# can change underneath the run is not evidence of anything". Re-reading the LIVE canonical here and
+# throwing on any difference measured that race instead of the product: this file aborted before a
+# single assertion ran whenever another edit landed during the suite, and was reported as
+# "no-assertions" rather than as a pass or a failure - a test silently not running at all. The hashes
+# are printed above, so a genuinely stale copy is still visible to anyone reading the output.
+if ($loadedHash -ne $canonicalHash) { Write-Host 'NOTE: running against an isolated copy that differs from the current canonical file.' -ForegroundColor DarkYellow }
 $text = Get-Content -LiteralPath $target -Raw
 $text = $text -replace '(?m)^\s*#Requires.*$', ''
 $text = $text -replace '(?m)^\s*\[CmdletBinding\(.*$', ''
@@ -53,7 +91,7 @@ function Assert-That {
 
 $script:realTcp = (Get-Item function:Test-mdiTcpPort).ScriptBlock
 $script:realUdp = (Get-Item function:Test-mdiUdpPort).ScriptBlock
-$script:unroutable = '::1'       # handed to the REAL probe, which cannot reach it: a genuine "never ran"
+$script:unroutable = 'never-resolves.invalid' # handed to the REAL probe: resolution fails before any packet is sent
 $script:refusedIp = '10.0.0.99'  # stub answers with the shipped refusal shape: a genuine measured failure
 
 Set-Item -Path function:script:Test-mdiTcpPort -Value {
