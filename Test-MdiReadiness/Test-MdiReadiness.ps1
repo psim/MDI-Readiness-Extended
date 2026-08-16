@@ -455,14 +455,46 @@ if ($PSVersionTable.PSEdition -eq 'Core') {
     # nowhere near a command-line parser, so nothing the caller typed is ever re-interpreted.
     $argFile = Join-Path ([IO.Path]::GetTempPath()) ("mdi-relaunch-{0}.xml" -f [guid]::NewGuid().ToString('N'))
     try {
-        $PSBoundParameters | Export-Clixml -LiteralPath $argFile -Depth 5 -ErrorAction Stop
+        # -WhatIf:$false -Confirm:$false are NOT decoration. Export-Clixml SUPPORTS ShouldProcess, so
+        # it inherits the caller's -WhatIf - and this file is staged by the re-launcher, not requested
+        # by the operator, so the caller's preference has no business reaching it. Measured on
+        # PowerShell 7.6.5 before this was fixed:
+        #
+        #     pwsh -File Test-MdiReadiness.ps1 -Path <folder> -Domain contoso.com -WhatIf
+        #     -> What if: Performing the operation "Export-Clixml" on target "...\mdi-relaunch-*.xml"
+        #     -> Import-Clixml : Could not find file '...\mdi-relaunch-*.xml'
+        #     -> Test-MdiReadiness did not complete: Cannot bind argument to parameter 'Path'
+        #        because it is an empty string.
+        #     -> exit 255
+        #
+        # The identical command line under powershell.exe previewed the SCAN - "What if: Performing
+        # the operation Create MDI related configuration reports" - and exited 0. So one -WhatIf
+        # produced two different exit codes on the two supported hosts; the operator was shown a
+        # preview of an internal temporary file instead of a preview of the scan; the branch that
+        # exists to say "No scan was performed because -WhatIf was specified" was never reached; and
+        # every parameter typed on the command line was lost, because the child splatted a $null.
+        #
+        # -WhatIf itself still travels to the child INSIDE the parameter file - it is a bound
+        # parameter like any other - so the re-launched run performs the dry run that was asked for.
+        $PSBoundParameters | Export-Clixml -LiteralPath $argFile -Depth 5 -ErrorAction Stop -WhatIf:$false -Confirm:$false
     } catch {
         Write-Error ("This script requires Windows PowerShell 5.1 and could not stage its parameters for the re-launch: {0}" -f $_.Exception.Message)
         exit 255
     }
 
     Write-Verbose ("Re-launching under Windows PowerShell 5.1: {0}" -f $windowsPowerShell)
-    Write-Host "PowerShell $($PSVersionTable.PSVersion) detected. Re-launching under Windows PowerShell 5.1, which this script requires." -ForegroundColor Yellow
+    # Yellow on the console for a human, but NEVER on stdout when -AsJson was asked for. Under -AsJson
+    # stdout is reserved for the JSON document - that is the entire reason Write-mdiConsole exists
+    # further down this file - and this notice is written long before that helper is defined, so it
+    # has to make the same choice for itself. Measured: `pwsh -File Test-MdiReadiness.ps1 -AsJson`
+    # put "PowerShell 7.6.5 detected. Re-launching..." on STDOUT, ahead of the child's document, and
+    # the documented caller `Test-MdiReadiness.ps1 -AsJson | ConvertFrom-Json` failed with
+    # "Invalid JSON primitive: PowerShell". The same command under powershell.exe left stdout empty,
+    # which is what identified this line as the only polluter. A shop standardised on PowerShell 7 is
+    # exactly the audience this re-launch was written for, so that was every scheduled run they had.
+    $relaunchNotice = "PowerShell $($PSVersionTable.PSVersion) detected. Re-launching under Windows PowerShell 5.1, which this script requires."
+    if ($AsJson) { [Console]::Error.WriteLine($relaunchNotice) }
+    else { Write-Host $relaunchNotice -ForegroundColor Yellow }
 
     # Only two values are interpolated into this command - the script's own path and a temp file name
     # this code generated - and both are single-quote escaped. Every caller-supplied value travels
@@ -477,7 +509,17 @@ if ($PSVersionTable.PSEdition -eq 'Core') {
     # silently read "exactly one issue" for a clean estate, a 200-issue estate and a failed scan alike.
     $escapedScript = $PSCommandPath -replace "'", "''"
     $escapedArgs = $argFile -replace "'", "''"
-    $command = "& { `$p = Import-Clixml -LiteralPath '$escapedArgs'; & '$escapedScript' @p; exit `$LASTEXITCODE }"
+    # The child ABORTS when it cannot read the staged parameters rather than running without them.
+    # Import-Clixml fails non-terminating, so `& script @p` used to run with $p unset - and splatting
+    # $null passes ONE POSITIONAL $null, which this script's -Path (Position 0) rejects with "Cannot
+    # bind argument to parameter 'Path' because it is an empty string". That is only luck. Any shape
+    # where the positional bind succeeds would run a scan carrying NONE of the operator's arguments -
+    # no -Path, no -Domain, no -Skip switches, no -WhatIf - against production, while the console
+    # showed the command line they actually typed. 255 is the documented "the scan did not run" code,
+    # which is precisely what happened, and it must not be confused with an issue count.
+    $command = "& { try { `$p = Import-Clixml -LiteralPath '$escapedArgs' -ErrorAction Stop } catch { " +
+    "[Console]::Error.WriteLine('Test-MdiReadiness could not read the parameter file staged for its Windows PowerShell 5.1 re-launch: ' + `$_.Exception.Message); " +
+    "exit 255 }; & '$escapedScript' @p; exit `$LASTEXITCODE }"
 
     try {
         & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -Command $command
@@ -487,7 +529,10 @@ if ($PSVersionTable.PSEdition -eq 'Core') {
         # the re-launcher's success instead of the scan's verdict.
         exit $LASTEXITCODE
     } finally {
-        Remove-Item -LiteralPath $argFile -Force -ErrorAction SilentlyContinue
+        # -WhatIf:$false for the same reason as the Export above: the caller's -WhatIf must not turn
+        # the re-launcher's own cleanup into a preview, or every dry run started from PowerShell 7
+        # leaves a file containing the caller's arguments behind in the temp directory.
+        Remove-Item -LiteralPath $argFile -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
     }
 }
 
@@ -1024,6 +1069,73 @@ function Test-mdiIsNotRunError {
     return $false
 }
 
+function ConvertTo-mdiCanonicalIPAddress {
+    param ([Parameter(Mandatory = $false)] [AllowNull()] [object] $Value)
+
+    if ($null -eq $Value) { return $null }
+    $ip = $null
+    if ($Value -is [Net.IPAddress]) {
+        $ip = $Value
+    } elseif (-not [Net.IPAddress]::TryParse(([string] $Value).Trim(), [ref] $ip)) {
+        return $null
+    }
+    if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6 -and $ip.IsIPv4MappedToIPv6) {
+        $ip = $ip.MapToIPv4()
+    }
+    $ip.IPAddressToString
+}
+
+function ConvertTo-mdiCanonicalComputerName {
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Value,
+        [Parameter(Mandatory = $false)] [AllowNull()] [string] $Domain = $null
+    )
+
+    if ($null -eq $Value) { return $null }
+    $name = ([string] $Value).Trim().TrimEnd('.').Trim()
+    if ([string]::IsNullOrWhiteSpace($name)) { return $null }
+
+    $address = ConvertTo-mdiCanonicalIPAddress -Value $name
+    if ($null -ne $address) { return $address }
+
+    $name = $name.ToLowerInvariant()
+    if ($name -notmatch '\.') {
+        $domainName = ([string] $Domain).Trim().TrimEnd('.').Trim().ToLowerInvariant()
+        if (-not [string]::IsNullOrWhiteSpace($domainName)) { $name = $name + '.' + $domainName }
+    }
+    $name
+}
+
+function Get-mdiIPAddressSortKey {
+    param ([Parameter(Mandatory = $false)] [AllowNull()] [object] $Value)
+
+    $canonical = ConvertTo-mdiCanonicalIPAddress -Value $Value
+    if ($null -eq $canonical) { return '9|' + ([string] $Value).ToLowerInvariant() }
+    $ip = [Net.IPAddress]::Parse($canonical)
+    $family = if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) { 0 } else { 1 }
+    $scope = if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) { [uint64] $ip.ScopeId } else { 0 }
+    '{0}|{1}|{2:D20}' -f $family, ([BitConverter]::ToString($ip.GetAddressBytes())), $scope
+}
+
+function Test-mdiUsableComputerAddress {
+    param ([Parameter(Mandatory = $false)] [AllowNull()] [object] $Value)
+
+    $canonical = ConvertTo-mdiCanonicalIPAddress -Value $Value
+    if ($null -eq $canonical) { return $false }
+    $ip = [Net.IPAddress]::Parse($canonical)
+    if ([Net.IPAddress]::IsLoopback($ip)) { return $false }
+    if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
+        $octets = $ip.GetAddressBytes()
+        return $octets[0] -ne 0 -and $octets[0] -ne 127 -and
+            -not ($octets[0] -eq 169 -and $octets[1] -eq 254) -and $octets[0] -lt 224
+    }
+    if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) {
+        return -not $ip.Equals([Net.IPAddress]::IPv6Any) -and
+            -not $ip.IsIPv6LinkLocal -and -not $ip.IsIPv6Multicast
+    }
+    $false
+}
+
 function Test-mdiTcpPort {
     param (
         [Parameter(Mandatory = $true)] [string] $ComputerName,
@@ -1032,11 +1144,18 @@ function Test-mdiTcpPort {
         [switch] $IsRetry
     )
 
-    $client = New-Object -TypeName System.Net.Sockets.TcpClient
+    $canonicalAddress = ConvertTo-mdiCanonicalIPAddress -Value $ComputerName
+    $remoteAddress = if ($null -ne $canonicalAddress) { [Net.IPAddress]::Parse($canonicalAddress) } else { $null }
+    $client = if ($null -ne $remoteAddress) {
+        New-Object -TypeName System.Net.Sockets.TcpClient -ArgumentList $remoteAddress.AddressFamily
+    } else {
+        New-Object -TypeName System.Net.Sockets.TcpClient
+    }
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $async = $null
     try {
-        $async = $client.BeginConnect($ComputerName, $Port, $null, $null)
+        $connectTarget = if ($null -ne $remoteAddress) { $remoteAddress } else { $ComputerName }
+        $async = $client.BeginConnect($connectTarget, $Port, $null, $null)
         if ($async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
             try {
                 $client.EndConnect($async)
@@ -1155,8 +1274,8 @@ function Test-mdiTcpPort {
             # Two ways the port was never measured, one wording: access denied / no route, and NO
             # SocketException anywhere in the chain. To MEASURE a port you have to get a socket answer
             # (refusal, reset, timeout) or a successful connect; anything else failed before the wire.
-            # An IPv6 address handed to an IPv4 probe socket lands there as a bare ArgumentException
-            # with no error code, and was reported as a measured blocked required port. Keyed on the
+            # A local argument or socket-construction failure can land here without a SocketException and
+            # was once reported as a measured blocked required port. Keyed on the
             # ABSENCE of a socket error, so an ordinary bad argument is not excused and no localised
             # message is matched.
             'Not tested - {0}' -f $message
@@ -1197,22 +1316,18 @@ function Test-mdiUdpPort {
 
     # UDP has no handshake, so a plain 'connect' proves nothing. Each UDP port is probed with a real, protocol-specific
     # request and the reply is what proves the port is open end to end.
-    $udp = New-Object -TypeName System.Net.Sockets.UdpClient
+    $udp = $null
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        $udp.Client.ReceiveTimeout = $TimeoutMs
-        $udp.Client.SendTimeout = $TimeoutMs
-        # Resolved before connecting so that a slow or dead DNS server cannot block for the operating
-        # system's own resolver timeout, which is far longer than $TimeoutMs and would silently blow the
-        # time budget for the whole scan. An address literal is passed through untouched.
-        $target = $ComputerName
-        $parsed = $null
-        if (-not [Net.IPAddress]::TryParse($ComputerName, [ref] $parsed)) {
+        # Resolve before creating the socket: its address family must match the selected endpoint.
+        $canonicalAddress = ConvertTo-mdiCanonicalIPAddress -Value $ComputerName
+        if ($null -eq $canonicalAddress) {
             try {
                 $addresses = @([Net.Dns]::GetHostAddresses($ComputerName) |
-                        Where-Object { $_.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork })
-                if ($addresses.Count -eq 0) { throw 'no IPv4 address' }
-                $target = [string] $addresses[0]
+                        ForEach-Object { ConvertTo-mdiCanonicalIPAddress -Value $_ } |
+                        Where-Object { $_ } | Sort-Object -Unique)
+                if ($addresses.Count -eq 0) { throw 'the name resolved to no IP addresses' }
+                $canonicalAddress = [string] $addresses[0]
             } catch {
                 $stopwatch.Stop()
                 # "Not tested" wording on purpose: the probe never left the machine, so nothing was
@@ -1224,9 +1339,18 @@ function Test-mdiUdpPort {
                 }
             }
         }
-        $udp.Connect($target, $Port)
+        $targetAddress = [Net.IPAddress]::Parse($canonicalAddress)
+        $udp = New-Object -TypeName System.Net.Sockets.UdpClient -ArgumentList $targetAddress.AddressFamily
+        $udp.Client.ReceiveTimeout = $TimeoutMs
+        $udp.Client.SendTimeout = $TimeoutMs
+        $udp.Connect($targetAddress, $Port)
         [void] $udp.Send($Payload, $Payload.Length)
-        $remoteEndpoint = New-Object -TypeName System.Net.IPEndPoint -ArgumentList ([Net.IPAddress]::Any, 0)
+        $anyAddress = if ($targetAddress.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) {
+            [Net.IPAddress]::IPv6Any
+        } else {
+            [Net.IPAddress]::Any
+        }
+        $remoteEndpoint = New-Object -TypeName System.Net.IPEndPoint -ArgumentList ($anyAddress, 0)
         $response = $udp.Receive([ref] $remoteEndpoint)
         $stopwatch.Stop()
         if ($response.Length -eq 0) {
@@ -1318,9 +1442,8 @@ function Test-mdiUdpPort {
     } catch {
         $stopwatch.Stop()
         # Every socket answer is taken by the typed catch above, so this one only ever sees failures
-        # that carry no SocketException at all - and none of those reached the wire. An IPv6 endpoint
-        # handed to an IPv4 socket arrives here, and used to be recorded as a measured blocked port.
-        # Stamped with the script's own English "Not tested" marker so the classifiers do not depend
+        # that carry no SocketException at all - and none of those reached the wire. Stamped with the
+        # script's own English "Not tested" marker so the classifiers do not depend
         # on the localised Windows text.
         $detail = 'Not tested - {0}' -f $_.Exception.Message
         [PSCustomObject]@{ Success = $false; Detail = $detail; Response = $null; LatencyMs = $null }
@@ -1596,6 +1719,15 @@ function Test-mdiNnrNetBios {
         [int] $TimeoutMs = 1500
     )
 
+    $canonicalAddress = ConvertTo-mdiCanonicalIPAddress -Value $ComputerName
+    if ($null -ne $canonicalAddress -and
+        [Net.IPAddress]::Parse($canonicalAddress).AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) {
+        return [PSCustomObject]@{ Success = $false
+            Detail = 'Not tested - NetBIOS node status uses IPv4 only and does not apply to an IPv6 target'
+            LatencyMs = $null
+        }
+    }
+
     # The identifier is the first two bytes of the packet, so it is read back from the payload rather
     # than being returned separately. Passing it to the probe makes a reply from something other than
     # the NetBIOS name service - a firewall, a captive portal, an unrelated datagram - fail validation
@@ -1761,7 +1893,11 @@ function Test-mdiReverseDns {
         }
         $hostEntry = $lookup.HostEntry
         $stopwatch.Stop()
-        if ($hostEntry.HostName -and $hostEntry.HostName -ne $IPAddress) {
+        $inputAddress = ConvertTo-mdiCanonicalIPAddress -Value $IPAddress
+        $returnedAddress = ConvertTo-mdiCanonicalIPAddress -Value $hostEntry.HostName
+        $returnedTheInputAddress = $null -ne $inputAddress -and $null -ne $returnedAddress -and
+            $inputAddress -eq $returnedAddress
+        if ($hostEntry.HostName -and -not $returnedTheInputAddress) {
             [PSCustomObject]@{ Success = $true; Detail = ('Resolved to {0}' -f $hostEntry.HostName); LatencyMs = [int] $stopwatch.ElapsedMilliseconds }
         } else {
             [PSCustomObject]@{ Success = $false; Detail = 'No PTR record - verify the Reverse Lookup Zone exists and is populated'; LatencyMs = [int] $stopwatch.ElapsedMilliseconds }
@@ -1914,6 +2050,8 @@ function Invoke-mdiPortProbePlan {
 
     $addResult = {
         param($Probe, $Target, $TargetIP, $Outcome, $Applicable = $true)
+        $canonicalTargetIP = ConvertTo-mdiCanonicalIPAddress -Value $TargetIP
+        if ($null -ne $canonicalTargetIP) { $TargetIP = $canonicalTargetIP }
         [void] $results.Add([PSCustomObject]@{
                 Id          = $Probe.Id
                 Name        = $Probe.Name
@@ -2190,7 +2328,7 @@ function Get-mdiPortProbeScriptText {
     # Split out from Get-mdiPortProbeCommandLine so the same script can either be embedded in the command
     # line or written to the server as a file when it is too large to embed.
     $functionNames = @(
-        'Test-mdiIsNotRunError',
+        'ConvertTo-mdiCanonicalIPAddress', 'Test-mdiIsNotRunError',
         'Test-mdiTcpPort', 'Test-mdiUdpPort', 'New-mdiNetBiosNodeStatusPacket', 'New-mdiDnsQueryPacket',
         'New-mdiCldapPingPacket', 'Test-mdiNnrNetBios', 'Test-mdiReverseDns', 'Get-mdiPtrHostEntry',
         'Test-mdiCloudConnectivity',
@@ -2431,11 +2569,17 @@ function Get-mdiRequiredPorts {
         # same run reported a port open or blocked at random and a blocked interface was masked by an open
         # one. Every address the server answers on is probed and recorded, so a per-address failure - the
         # blind spot on a multi-homed domain controller - is visible instead of hidden behind the FQDN.
+        $computerAddress = ConvertTo-mdiCanonicalIPAddress -Value $ComputerName
         $fallbackAddresses = @(Get-mdiComputerAddress -ComputerName $ComputerName)
         $planAddresses = @(@($Plan.DomainControllers) + @($Plan.NnrTargets) |
-                Where-Object { $_ -and $_.Name -eq $ComputerName -and $_.IP -and ($_.IP -ne $ComputerName) } |
-                ForEach-Object { [string] $_.IP })
-        $fallbackAddresses = @(@($fallbackAddresses + $planAddresses) | Where-Object { $_ } | Select-Object -Unique)
+                Where-Object { $_ -and $_.Name -eq $ComputerName -and $_.IP } |
+                ForEach-Object {
+                    $address = ConvertTo-mdiCanonicalIPAddress -Value $_.IP
+                    if ($null -ne $address -and ($null -eq $computerAddress -or $address -ne $computerAddress)) { $address }
+                })
+        $fallbackAddresses = @(@($fallbackAddresses + $planAddresses) |
+                ForEach-Object { ConvertTo-mdiCanonicalIPAddress -Value $_ } |
+                Where-Object { $_ } | Select-Object -Unique)
         # Last resort only: if the name resolved to nothing at all, keep it so the probe still leaves the
         # machine. This is the single case where the NIC cannot be pinned, and it is a genuine DNS failure.
         if ($fallbackAddresses.Count -eq 0) { $fallbackAddresses = @($ComputerName) }
@@ -2447,7 +2591,10 @@ function Get-mdiRequiredPorts {
         # required port. They are kept only when the server being tested is itself a domain controller - which
         # is established from the sample by name or by any address the server answers on.
         $isDomainController = @($Plan.DomainControllers | Where-Object {
-                $_.Name -eq $ComputerName -or $_.IP -eq $ComputerName -or ($fallbackAddresses -contains $_.IP)
+                $dcAddress = ConvertTo-mdiCanonicalIPAddress -Value $_.IP
+                $_.Name -eq $ComputerName -or
+                    ($null -ne $computerAddress -and $dcAddress -eq $computerAddress) -or
+                    ($null -ne $dcAddress -and $fallbackAddresses -contains $dcAddress)
             }).Count -gt 0
         $fallbackScopes = if ($isDomainController) { @('NetworkDevice', 'DomainController') } else { @('NetworkDevice') }
 
@@ -2646,7 +2793,8 @@ function Get-mdiRequiredPorts {
             # The direction is stated in the finding itself, not only in ProbedFrom, because these
             # strings are what the operator reads in the Issues table and pastes into a change request.
             FailedRequired   = @(foreach ($failure in $mandatoryFailures) {
-                    $line = [string] $failure.Protocol + '/' + [string] $failure.Port + ' to ' + [string] $failure.Target + ': ' + [string] $failure.Detail
+                    $targetLabel = Get-mdiTargetLabel -Target ([string] $failure.Target) -TargetIP ([string] $failure.TargetIP)
+                    $line = [string] $failure.Protocol + '/' + [string] $failure.Port + ' to ' + $targetLabel + ': ' + [string] $failure.Detail
                     if ($usedFallback) { 'Not tested in the required direction - measured inbound from this computer instead: ' + $line } else { $line }
                 })
             NnrFailedTargets = @(foreach ($target in $nnrFailedTargets) {
@@ -2714,14 +2862,16 @@ function Resolve-mdiNnrTarget {
                 $name = $_
                 $knownIp = $null
                 try {
-                    $adParams = @{ Identity = $name; Properties = 'DNSHostName', 'IPv4Address'; ErrorAction = 'Stop' }
+                    $adParams = @{ Identity = $name; Properties = 'DNSHostName', 'IPv4Address', 'IPv6Address'; ErrorAction = 'Stop' }
                     if ($Domain) { $adParams['Server'] = $Domain }
                     $computer = Get-ADComputer @adParams
                     $name = if ($computer.DNSHostName) { $computer.DNSHostName } else { $computer.Name }
-                    $knownIp = [string] $computer.IPv4Address
+                    $knownIp = @([string] $computer.IPv4Address, [string] $computer.IPv6Address)
                 } catch {
                     Write-mdiVerbose "Unable to find '$name' in Active Directory, resolving it with DNS"
                 }
+
+                $name = ConvertTo-mdiCanonicalComputerName -Value $name -Domain $Domain
 
                 # Every address, not the first one. NNR resolves whatever source address the sensor
                 # observed, so a multi-homed host that answers on one NIC and is filtered on another
@@ -2792,6 +2942,23 @@ function Resolve-mdiLdapTarget {
     @($targets)
 }
 
+function Get-mdiAddresslessDomainController {
+    param (
+        [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $Inventory
+    )
+
+    @($Inventory | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_.Name) } |
+        Group-Object -Property {
+            ConvertTo-mdiCanonicalComputerName -Value $_.Name -Domain $_.Domain
+        } | Where-Object {
+            @($_.Group | ForEach-Object { @($_.Addresses) + @($_.IP) } | Where-Object {
+                    Test-mdiUsableComputerAddress -Value $_
+                }).Count -eq 0
+        } | ForEach-Object {
+            ConvertTo-mdiCanonicalComputerName -Value $_.Group[0].Name -Domain $_.Group[0].Domain
+        } | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } | Select-Object -Unique)
+}
+
 function Get-mdiForestDomainFromLdap {
     param (
         [Parameter(Mandatory = $false)] [string] $Domain = $null,
@@ -2860,18 +3027,34 @@ function Get-mdiForestDomainFromLdap {
 
         if (@($domains).Count -eq 0) { return $null }
 
-        # The forest is named after its root domain, whose DN is turned back into a DNS name. If rootDSE
-        # did not carry it, the shortest domain name is the root: every other domain in a forest is a
-        # child or tree-root suffixed beneath it.
-        $forestName = if (-not [string]::IsNullOrWhiteSpace($rootNc)) {
-            (($rootNc -split ',' | Where-Object { $_ -match '^DC=' } | ForEach-Object { $_ -replace '^DC=', '' }) -join '.')
-        } else {
-            @($domains | Sort-Object { $_.Length })[0]
+        # The configuration naming context is rooted at the forest-root domain, so it is the
+        # authoritative fallback when rootDomainNamingContext is absent. Choosing the shortest DNS
+        # name instead misidentifies a multi-tree forest whenever a secondary tree has a shorter name.
+        $forestNc = if (-not [string]::IsNullOrWhiteSpace($rootNc)) { $rootNc } else { $configNc }
+        $forestName = (($forestNc -split ',' | Where-Object { $_ -match '^DC=' } |
+                ForEach-Object { $_ -replace '^DC=', '' }) -join '.')
+        if ([string]::IsNullOrWhiteSpace($forestName)) {
+            # Defensive only: configurationNamingContext was required above, but retain a usable
+            # identity for an exotic directory whose naming context has no DNS components.
+            $forestName = @($domains | Sort-Object { $_.Length })[0]
         }
 
+        $ldapProblems = @()
+        if ($unnamed -gt 0) { $ldapProblems += 'one or more domain records could not be named' }
+        $normalisedDomains = @($domains | ForEach-Object { ([string] $_).Trim().TrimEnd('.') })
+        if ($normalisedDomains -notcontains ([string] $forestName).Trim().TrimEnd('.')) {
+            # RootDSE/configurationNamingContext names a domain that every complete forest crossRef
+            # walk must contain. This catches a fully named but truncated FindAll result.
+            $ldapProblems += ('the forest root domain {0} is absent from the returned domain list' -f $forestName)
+            Write-mdiWarning ('The LDAP forest list does not contain its root domain {0}. The forest list is incomplete.' -f $forestName)
+        }
+        $ldapComplete = ($ldapProblems.Count -eq 0)
+
         [PSCustomObject]@{
-            Name    = $forestName
-            Domains = @($domains)
+            Name     = $forestName
+            Domains  = @($domains)
+            Complete = $ldapComplete
+            Error    = $(if ($ldapComplete) { $null } else { $ldapProblems -join '; ' })
         }
     } catch {
         Write-mdiVerbose ('LDAP forest enumeration failed: {0}' -f $_.Exception.Message)
@@ -2897,17 +3080,52 @@ function Get-mdiForestDomain {
         $forestParams = @{ ErrorAction = 'Stop' }
         if ($Domain) { $forestParams['Server'] = $Domain }
         $adForest = Get-ADForest @forestParams
-        if (@($adForest.Domains).Count -gt 0) {
-            Write-mdiVerbose ('Found forest {0} with {1} domain(s): {2}' -f $adForest.Name, @($adForest.Domains).Count, ($adForest.Domains -join ', '))
+        # Count unusable rows before returning. The LDAP walker carries the identical loss through
+        # UnnamedCount; accepting a mixed ADWS result as complete let Main discard its blank entries
+        # while the report still certified that the whole forest had been enumerated.
+        $adwsUnnamed = 0
+        $adwsDomains = @(foreach ($entry in @($adForest.Domains)) {
+                $domainName = [string] $entry
+                if ([string]::IsNullOrWhiteSpace($domainName)) { $adwsUnnamed++; continue }
+                $domainName.Trim()
+            })
+        if ($adwsDomains.Count -gt 0) {
+            $adwsName = ([string] $adForest.Name).Trim().TrimEnd('.')
+            $adwsRoot = ([string] $adForest.RootDomain).Trim().TrimEnd('.')
+            $forestName = if (-not [string]::IsNullOrWhiteSpace($adwsName)) { $adwsName } else { $adwsRoot }
+            $normalisedDomains = @($adwsDomains | ForEach-Object { ([string] $_).Trim().TrimEnd('.') })
+            $problems = @()
+            if ($adwsUnnamed -gt 0) { $problems += 'one or more domain records could not be named' }
+            if ([string]::IsNullOrWhiteSpace($forestName)) {
+                $problems += 'the forest root name could not be read'
+            } elseif ($normalisedDomains -notcontains $forestName) {
+                # Name/RootDomain is itself a domain in every valid ADForest result. Its absence proves
+                # the returned Domains collection is partial even when every row it did return is named.
+                $problems += ('the forest root domain {0} is absent from the returned domain list' -f $forestName)
+            }
+            if (-not [string]::IsNullOrWhiteSpace($adwsName) -and
+                -not [string]::IsNullOrWhiteSpace($adwsRoot) -and $adwsName -ne $adwsRoot) {
+                $problems += ('the forest name {0} disagrees with RootDomain {1}' -f $adwsName, $adwsRoot)
+            }
+            $complete = ($problems.Count -eq 0)
+            $discoveryError = if ($complete) { $null } else { $problems -join '; ' }
+            if (-not $complete) {
+                Write-mdiWarning ('Active Directory Web Services returned an incomplete forest list: {0}.' -f $discoveryError)
+            }
+            Write-mdiVerbose ('Found forest {0} with {1} domain(s): {2}' -f $forestName, $adwsDomains.Count, ($adwsDomains -join ', '))
             return [PSCustomObject]@{
-                Name     = $adForest.Name
-                Domains  = @($adForest.Domains)
+                Name     = $forestName
+                Domains  = $adwsDomains
                 Method   = 'ADWS'
-                Complete = $true
-                Error    = $null
+                Complete = $complete
+                Error    = $discoveryError
             }
         }
-        $reason = 'the query succeeded but returned no domains'
+        $reason = if ($adwsUnnamed -gt 0) {
+            'the query returned domain records but none carried a usable DNS name'
+        } else {
+            'the query succeeded but returned no domains'
+        }
     } catch {
         $reason = $_.Exception.Message
     }
@@ -2920,12 +3138,24 @@ function Get-mdiForestDomain {
         # Complete only when EVERY domain record could be named. A partial enumeration is exactly the
         # "quietly examined one domain out of five and then reported READY" case this property exists
         # for - the fact that some domains came back does not make the list the real forest.
+        $ldapComplete = ($ldapUnnamed -eq 0)
+        if ($null -ne $viaLdap.PSObject.Properties['Complete']) {
+            $ldapComplete = (ConvertTo-mdiBoolean $viaLdap.Complete) -eq $true
+        }
+        $ldapError = if ($null -ne $viaLdap.PSObject.Properties['Error'] -and
+            -not [string]::IsNullOrWhiteSpace([string] $viaLdap.Error)) {
+            [string] $viaLdap.Error
+        } elseif ($ldapUnnamed -gt 0) {
+            'one or more domain records could not be named'
+        } else {
+            $null
+        }
         return [PSCustomObject]@{
             Name     = $viaLdap.Name
             Domains  = @($viaLdap.Domains)
             Method   = 'LDAP'
-            Complete = ($ldapUnnamed -eq 0)
-            Error    = $(if ($ldapUnnamed -gt 0) { 'one or more domain records could not be named' } else { $null })
+            Complete = $ldapComplete
+            Error    = $ldapError
         }
     }
 
@@ -2942,58 +3172,69 @@ function Get-mdiForestDomain {
 function Get-mdiComputerAddress {
     param (
         [Parameter(Mandatory = $true)] [string] $ComputerName,
-        [Parameter(Mandatory = $false)] [AllowNull()] [string] $KnownAddress = $null
+        [Parameter(Mandatory = $false)] [AllowNull()] [string[]] $KnownAddress = $null
     )
 
     <#
-        Every IPv4 address a computer answers on, not just the first one.
-
-        A multi-homed domain controller is the case this exists for, and it is not a corner case: DCs
-        routinely carry a second NIC for backup, management, cluster heartbeat or a DMZ leg.
-
-        Both of the ways this script previously learned an address return exactly one:
-          - Get-ADComputer's IPv4Address property is a single value, and which one it holds depends on
-            registration order, not on which interface matters.
-          - [Net.Dns]::GetHostAddresses(...)[0] takes an arbitrary entry out of several A
-            records - and a different one on each call when DNS round-robins, so two runs against an
-            unchanged environment disagreed with each other.
-
-        Probing only that one address is the exact blind spot behind the "Low success rate of active
-        name resolution" health alert this tool was extended to diagnose. Network Name Resolution
-        works on whatever source address the sensor observes in traffic, so a second NIC on a subnet
-        where TCP 135/3389 or UDP 137 is filtered - or which has no reverse lookup zone - fails every
-        resolution attempt for that host while a single-address probe reports the DC as fully open.
-        The report was green and the portal alert stayed lit, with nothing to connect the two.
-
-        Addresses are sorted numerically so that two runs of the same environment produce the same
-        report: sorting dotted quads as text puts .10 before .9. Casting to [version] orders them
-        correctly because an IPv4 address is four numeric components, and anything that does not look
-        like one is pushed to the end rather than throwing inside the sort.
+        Returns every usable IPv4 and IPv6 service address for the computer. Values are parsed once,
+        IPv4-mapped IPv6 is folded to IPv4, and equivalent text spellings therefore cannot become
+        different probe targets. Loopback, unspecified, link-local, multicast, APIPA and malformed
+        values are not remote computer endpoints.
     #>
     $addresses = New-Object -TypeName System.Collections.ArrayList
-    if (-not [string]::IsNullOrWhiteSpace($KnownAddress)) { [void] $addresses.Add($KnownAddress.Trim()) }
+    foreach ($known in @($KnownAddress)) {
+        if (-not [string]::IsNullOrWhiteSpace([string] $known)) { [void] $addresses.Add($known) }
+    }
 
     try {
         foreach ($address in [Net.Dns]::GetHostAddresses($ComputerName)) {
-            if ($address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
-                [void] $addresses.Add($address.IPAddressToString)
-            }
+            [void] $addresses.Add($address)
         }
     } catch {
         Write-mdiVerbose ('Could not resolve the addresses of {0}: {1}' -f $ComputerName, $_.Exception.Message)
     }
 
-    # APIPA and loopback are never a real service address, and a DC that has one is telling us its DNS
-    # registration is stale rather than that it is reachable there.
-    $usable = @($addresses | Where-Object {
-            -not [string]::IsNullOrWhiteSpace($_) -and
-            $_ -notmatch '^169\.254\.' -and $_ -ne '127.0.0.1' -and $_ -ne '0.0.0.0'
-        } | Select-Object -Unique)
+    $usable = @(@(foreach ($address in $addresses) {
+                $canonical = ConvertTo-mdiCanonicalIPAddress -Value $address
+                if ($null -ne $canonical -and (Test-mdiUsableComputerAddress -Value $canonical)) { $canonical }
+            }) | Select-Object -Unique)
 
-    @($usable | Sort-Object -Property @{ Expression = {
-                if ($_ -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$') { [version] $_ } else { [version] '255.255.255.255' }
+    @($usable | Sort-Object -Property @{ Expression = { Get-mdiIPAddressSortKey -Value $_ } })
+}
+
+function Merge-mdiDomainControllerEndpoint {
+    param (
+        [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $Server,
+        [Parameter(Mandatory = $true)] [string] $Domain
+    )
+
+    $byName = @{}
+    $ordered = New-Object -TypeName System.Collections.ArrayList
+    foreach ($source in @($Server)) {
+        if ($null -eq $source) { continue }
+        $name = ConvertTo-mdiCanonicalComputerName -Value $source.Name -Domain $Domain
+        if ([string]::IsNullOrWhiteSpace([string] $name)) { continue }
+        $key = $name.ToLowerInvariant()
+        if (-not $byName.ContainsKey($key)) {
+            $entry = [PSCustomObject]@{
+                Name                      = $name
+                IP                        = $null
+                Addresses                 = @()
+                AddressResolutionComplete = $true
             }
-        }, @{ Expression = { $_ } })
+            $byName[$key] = $entry
+            [void] $ordered.Add($entry)
+        }
+
+        $entry = $byName[$key]
+        $addresses = @(@($entry.Addresses) + @($source.Addresses) + @($source.IP) | ForEach-Object {
+                $canonical = ConvertTo-mdiCanonicalIPAddress -Value $_
+                if ($null -ne $canonical -and (Test-mdiUsableComputerAddress -Value $canonical)) { $canonical }
+            } | Select-Object -Unique | Sort-Object -Property @{ Expression = { Get-mdiIPAddressSortKey -Value $_ } })
+        $entry.Addresses = @($addresses)
+        $entry.IP = if ($addresses.Count -gt 0) { $addresses[0] } else { $null }
+    }
+    $ordered.ToArray()
 }
 
 function Get-mdiDomainControllerFromLdap {
@@ -3041,8 +3282,9 @@ function Get-mdiDomainControllerFromLdap {
                 $hostName = $null
                 if ($entry.Properties['dnshostname'].Count -gt 0) { $hostName = [string] $entry.Properties['dnshostname'][0] }
                 if ([string]::IsNullOrWhiteSpace($hostName) -and $entry.Properties['name'].Count -gt 0) {
-                    $hostName = '{0}.{1}' -f [string] $entry.Properties['name'][0], $Domain
+                    $hostName = [string] $entry.Properties['name'][0]
                 }
+                $hostName = ConvertTo-mdiCanonicalComputerName -Value $hostName -Domain $Domain
                 if ([string]::IsNullOrWhiteSpace($hostName)) {
                     # COUNTED, not silently skipped. This branch is the LDAP twin of the ADWS
                     # $blankName++ in Resolve-mdiDomainController, and it used to be a bare `continue`.
@@ -3107,15 +3349,27 @@ function Resolve-mdiDomainController {
         $viaAdws = @($adwsRows | ForEach-Object {
                 $dnsName = [string] $_.HostName
                 if ([string]::IsNullOrWhiteSpace($dnsName)) {
-                    $shortName = [string] $_.Name
-                    if ([string]::IsNullOrWhiteSpace($shortName)) { $blankName++; return }
-                    $dnsName = if ($shortName -like '*.*') { $shortName } else { '{0}.{1}' -f $shortName, $Domain }
+                    $dnsName = [string] $_.Name
+                    if ([string]::IsNullOrWhiteSpace($dnsName)) { $blankName++; return }
                 }
+                $dnsName = ConvertTo-mdiCanonicalComputerName -Value $dnsName -Domain $Domain
+                # @() around the WHOLE pipeline, not just the array literal. Where-Object emits a bare
+                # string when exactly one address survives, and indexing a string returns a CHARACTER:
+                # a domain controller with one address reported IP = '1' - the first character of
+                # '10.0.0.2' - which then travelled into the NNR targets and the port-probe plan as the
+                # address to reach the server on. Measured: NAME=[dc1.contoso.com] IP=[1] IPTYPE=[Char].
+                $knownAddresses = @(
+                    @([string] $_.IPv4Address, [string] $_.IPv6Address) |
+                        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+                )
+                $addresses = @(Get-mdiComputerAddress -ComputerName $dnsName -KnownAddress $knownAddresses)
                 [PSCustomObject]@{
-                    Name = $dnsName
-                    IP   = [string] $_.IPv4Address
+                    Name      = $dnsName
+                    IP        = if ($addresses.Count -gt 0) { $addresses[0] } else { $null }
+                    Addresses = @($addresses)
                 }
             })
+        $viaAdws = @(Merge-mdiDomainControllerEndpoint -Server $viaAdws -Domain $Domain)
         if ($blankName -gt 0) {
             Write-mdiWarning ('{0} domain controller record(s) in {1} carry neither a DNS host name nor a name and could not be scanned.' -f $blankName, $Domain)
         }
@@ -3143,6 +3397,7 @@ function Resolve-mdiDomainController {
     Write-mdiVerbose ('Active Directory Web Services could not enumerate the domain controllers of {0} ({1}), falling back to LDAP' -f $Domain, $reason)
     $ldapUnnamed = 0
     $viaLdap = @(Get-mdiDomainControllerFromLdap -Domain $Domain -UnnamedCount ([ref] $ldapUnnamed))
+    $viaLdap = @(Merge-mdiDomainControllerEndpoint -Server $viaLdap -Domain $Domain)
     # The same warning the ADWS branch raises, for the same fact. It was absent here, so over LDAP the
     # loss was invisible on every surface at once: no warning, no placeholder row, no unread check.
     if ($ldapUnnamed -gt 0) {
@@ -3177,7 +3432,13 @@ function Get-mdiDomainControllerInventory {
     # being visible to the verdict.
     @(foreach ($domainName in $Domain) {
             $resolved = Resolve-mdiDomainController -Domain $domainName
-            if ($resolved.Servers.Count -eq 0) {
+            # Servers.Count -eq 0 is not by itself a failed enumeration. The directory can ANSWER and
+            # return records that carry no usable name, in which case Unnamed holds how many - and this
+            # branch then reported "Unable to enumerate the domain controllers of contoso.com over
+            # Active Directory Web Services or LDAP: " with nothing after the colon, because there was
+            # no error to interpolate. It also collapsed a domain that answered with 2 unnamable
+            # records into a single Enumerated=$false row, so the estate lost them entirely.
+            if ($resolved.Servers.Count -eq 0 -and [int] $resolved.Unnamed -eq 0) {
                 Write-mdiWarning ('Unable to enumerate the domain controllers of {0} over Active Directory Web Services or LDAP: {1}' -f $domainName, $resolved.Error)
                 [PSCustomObject]@{
                     Name        = $null
@@ -3194,33 +3455,42 @@ function Get-mdiDomainControllerInventory {
                 # One entry per address. A multi-homed domain controller has to be probed on each one:
                 # NNR resolves the address the sensor saw in traffic, and the second NIC is exactly the
                 # one likely to sit on a subnet with no reverse lookup zone or a tighter firewall.
-                $addresses = @(Get-mdiComputerAddress -ComputerName $dc.Name -KnownAddress $dc.IP)
-                if ($addresses.Count -eq 0) { $addresses = @($dc.IP) | Where-Object { $_ } }
+                $dcName = ConvertTo-mdiCanonicalComputerName -Value $dc.Name -Domain $domainName
+                $knownAddresses = @(@($dc.Addresses) + @($dc.IP) |
+                        Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })
+                $addresses = @(if ($dc.AddressResolutionComplete -eq $true) {
+                        @($knownAddresses | ForEach-Object {
+                                $canonical = ConvertTo-mdiCanonicalIPAddress -Value $_
+                                if ($null -ne $canonical -and (Test-mdiUsableComputerAddress -Value $canonical)) { $canonical }
+                            }) | Select-Object -Unique | Sort-Object -Property @{ Expression = { Get-mdiIPAddressSortKey -Value $_ } }
+                    } else {
+                        Get-mdiComputerAddress -ComputerName $dcName -KnownAddress $knownAddresses
+                    })
                 if ($addresses.Count -eq 0) {
-                    # The domain controller was enumerated from the directory but no IPv4 address for it
-                    # could be found: an IPv6-only host, a stale or missing A record, or a DNS server
-                    # that did not answer. The foreach below iterates an empty list, so the server was
+                    # The domain controller was enumerated from the directory but no usable IP address for it
+                    # could be found: its records may be stale, unusable, or the DNS server may not have
+                    # answered. The foreach below iterates an empty list, so the server was
                     # silently dropped - never probed, never counted, and never reported as unreachable.
                     # A domain controller vanishing from the inventory is the most damaging outcome this
                     # tool has, because the report still reads as a complete scan of the estate.
                     #
                     # Emitted with a null IP so the probe planner skips it (there is nothing to probe)
                     # while the verdict and the report still see a server that could not be tested.
-                    Write-mdiWarning ('No IPv4 address could be resolved for {0}, so it cannot be probed. It is reported as not tested rather than omitted from the scan.' -f $dc.Name)
+                    Write-mdiWarning ('No usable IP address could be resolved for {0}, so it cannot be probed. It is reported as not tested rather than omitted from the scan.' -f $dcName)
                     [PSCustomObject]@{
-                        Name       = $dc.Name
+                        Name       = $dcName
                         IP         = $null
                         Addresses  = @()
                         MultiHomed = $false
                         Domain     = $domainName
                         Enumerated = $true
-                        Error      = ('No IPv4 address could be resolved for {0}' -f $dc.Name)
+                        Error      = ('No usable IP address could be resolved for {0}' -f $dcName)
                     }
                     continue
                 }
                 foreach ($address in $addresses) {
                     [PSCustomObject]@{
-                        Name       = $dc.Name
+                        Name       = $dcName
                         IP         = $address
                         Addresses  = $addresses
                         MultiHomed = ($addresses.Count -gt 1)
@@ -3228,6 +3498,33 @@ function Get-mdiDomainControllerInventory {
                         Enumerated = $true
                         Error      = $null
                     }
+                }
+            }
+            # Records the directory RETURNED but could not name. They belong to the estate and were not
+            # examined, so they are emitted here for exactly the reason the unresolvable-address branch
+            # above gives: a domain controller vanishing from the inventory is the most damaging outcome
+            # this tool has, because the report still reads as a complete scan of the estate.
+            #
+            # Resolve-mdiDomainController already counts them, and the per-domain readiness pass already
+            # emits a placeholder for each, so dropping them HERE made two surfaces disagree about the
+            # size of one domain in a run where nothing failed: the inventory reported 2 controllers for
+            # a domain whose readiness section reported 4 rows, and the console printed "Found 2 domain
+            # controller(s)" for an estate of four. Measured on both transports, with enumeration
+            # succeeding and no error raised anywhere.
+            #
+            # Enumerated is $true because the directory ANSWERED - this is not a failed enumeration, it
+            # is a record that answered without a usable name. Name and IP are null because there is
+            # nothing to connect to, which is also what keeps the probe planner from targeting them.
+            $unnamedRecords = [int] $resolved.Unnamed
+            for ($u = 1; $u -le $unnamedRecords; $u++) {
+                [PSCustomObject]@{
+                    Name       = $null
+                    IP         = $null
+                    Addresses  = @()
+                    MultiHomed = $false
+                    Domain     = $domainName
+                    Enumerated = $true
+                    Error      = ('Domain controller record {0} of {1} in {2} carries neither a DNS host name nor a name, so it could not be scanned' -f $u, $unnamedRecords, $domainName)
                 }
             }
         })
@@ -3373,6 +3670,76 @@ function Test-mdiV3DetailMeasured {
         [Parameter(Mandatory = $false)] [AllowNull()] $Detail
     )
     -not ([string] $Detail -like 'Not tested*')
+}
+
+function Test-mdiServiceTokenKnown {
+    <#
+        Whether a Win32_Service State or StartMode token actually SAYS something.
+
+        The service control manager returns the literal string 'Unknown' when it could not determine
+        a service's state or start mode, and WMI can answer a query without carrying the property at
+        all, leaving it null or empty. Neither is a measurement, and comparing either to 'Running' or
+        to 'Auto' silently converts "nobody could tell" into a measured failure.
+
+        Stated once and read by both callers. Get-mdiSensorHealth already refused to judge an Unknown
+        token - it returns 'N/A' with "the service control manager reported ... as Unknown ... so the
+        sensor state could not be determined" - while the v3 Sense check compared the same token to
+        'Running' and published a measured False, an actionable blocker, and an empty UnknownChecks
+        list for the very same server. Two copies of one rule is how they drift apart.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $Token
+    )
+    $text = ([string] $Token).Trim()
+    if ([string]::IsNullOrEmpty($text)) { return $false }
+    $text -ne 'Unknown'
+}
+
+function Get-mdiVersionAtLeast {
+    <#
+        Whether a reported version is at least Minimum, as a TRI-STATE.
+
+        [version] fills the components a string did not carry with -1, so a version that ties the
+        minimum on every component it actually carries always compares LESS. A sensor reporting
+        '2.254' against a minimum of '2.254.19112.470' was therefore a measured FAILURE - "upgrade
+        the v2.x sensor before migrating" - decided by two components that were never read. The
+        caller already refuses to turn an UNPARSEABLE version into $false for exactly this reason;
+        a truncated version parses cleanly, so it walked straight past that guard.
+
+        Only the components present on BOTH sides are compared. Where those settle the ordering, that
+        ordering is the answer whatever the missing components hold - '2.255' is newer than
+        '2.254.19112.470' and '2.253' is older, neither needs a build number. Where they all tie and
+        the reported version is shorter than the minimum, the components that would decide it were
+        never read, so the answer is 'N/A' rather than an invented failure.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $Version,
+        [Parameter(Mandatory = $true)] [string] $Minimum
+    )
+
+    $parsedVersion = $null
+    if (-not [version]::TryParse(([string] $Version).Trim(), [ref] $parsedVersion)) { return 'N/A' }
+    $parsedMinimum = $null
+    if (-not [version]::TryParse(([string] $Minimum).Trim(), [ref] $parsedMinimum)) { return 'N/A' }
+
+    $actual = @($parsedVersion.Major, $parsedVersion.Minor, $parsedVersion.Build, $parsedVersion.Revision)
+    $expected = @($parsedMinimum.Major, $parsedMinimum.Minor, $parsedMinimum.Build, $parsedMinimum.Revision)
+
+    for ($i = 0; $i -lt 4; $i++) {
+        # -1 marks a component the string never carried. It is not a zero and it is not a low
+        # number; it is the point past which nothing was measured on that side.
+        if ($actual[$i] -lt 0 -or $expected[$i] -lt 0) { break }
+        if ($actual[$i] -gt $expected[$i]) { return $true }
+        if ($actual[$i] -lt $expected[$i]) { return $false }
+    }
+
+    # Every comparable component tied. A reported version at least as long as the minimum is then
+    # genuinely equal to it, which meets it. A shorter one leaves components the minimum still cares
+    # about unread, and those decide the answer.
+    $actualPresent = @($actual | Where-Object { $_ -ge 0 }).Count
+    $expectedPresent = @($expected | Where-Object { $_ -ge 0 }).Count
+    if ($actualPresent -ge $expectedPresent) { return $true }
+    'N/A'
 }
 
 function Get-mdiSensorV3Readiness {
@@ -3522,11 +3889,28 @@ function Get-mdiSensorV3Readiness {
     # A null service means "not installed" only when the query ANSWERED. When WMI is unavailable, or
     # the service list itself could not be read, it means nothing was learned, so reporting the
     # service as missing would be an invention.
-    $isSenseRunning = if (-not $wmiReadable -or -not $senseReadable) { 'N/A' } else { $senseState -eq 'Running' }
+    #
+    # An indeterminate STATE is the same kind of gap one level down. The service control manager
+    # returns the literal 'Unknown' when it could not determine a service's state, and WMI can answer
+    # without carrying the property at all. Comparing either to 'Running' yields $false, so a server
+    # whose Sense state nobody could establish published a MEASURED failure - "Sense service is
+    # Unknown (start mode: Auto) - it must be running" - as an actionable blocker, dropped
+    # isSensorV3Ready to False, and still reported UnknownChecks as empty. Get-mdiSensorHealth
+    # already returns 'N/A' for that exact token, so the same server was called unreadable by one
+    # check and definitively broken by another. See Test-mdiServiceTokenKnown.
+    $senseStateKnown = Test-mdiServiceTokenKnown -Token $senseState
+    $isSenseRunning = if (-not $wmiReadable -or -not $senseReadable) { 'N/A' }
+    elseif ($null -eq $senseService) { $false }
+    elseif (-not $senseStateKnown) { 'N/A' }
+    else { $senseState -eq 'Running' }
     & $addCheck 'Defender for Endpoint (Sense) service is running' $isSenseRunning $(
         if (-not $wmiReadable) { 'Not tested - {0}' -f $unreadable }
         elseif (-not $senseReadable) { 'Not tested - the service list could not be read on this server: {0}' -f [string] $senseResult.Error }
         elseif ($null -eq $senseService) { 'The Sense service is not installed - onboard the server to Microsoft Defender for Endpoint' }
+        elseif (-not $senseStateKnown) {
+            if ([string]::IsNullOrWhiteSpace([string] $senseState)) { 'Not tested - the Sense service was found but the service control manager did not report its state on this server, so whether it is running could not be determined' }
+            else { 'Not tested - the service control manager reported the Sense service state as Unknown on this server, so whether it is running could not be determined' }
+        }
         elseif ($isSenseRunning -eq $true) { 'Sense service is running (start mode: {0})' -f $senseStartMode }
         else { 'Sense service is {0} (start mode: {1}) - it must be running' -f $senseState, $senseStartMode }
     )
@@ -3568,6 +3952,7 @@ function Get-mdiSensorV3Readiness {
     # tested' marker routes it to the unmeasured path, which is what keeps it out of MigrationEligible.
     $isV2VersionOk = 'N/A'
     $v2VersionUnparseable = $false
+    $v2VersionIndecisive = $false
     if ($hasV2Sensor -and $v2Version) {
         $parsedVersion = $null
         # Trimmed for DISPLAY, not for parsing: [version]::TryParse already tolerates surrounding
@@ -3576,7 +3961,14 @@ function Get-mdiSensorV3Readiness {
         # "v2.x sensor   2.254.19112.470   meets the minimum version".
         $v2VersionText = ([string] $v2Version).Trim()
         if ([version]::TryParse($v2VersionText, [ref] $parsedVersion)) {
-            $isV2VersionOk = ($parsedVersion -ge [version] $v3.MinV2VersionForMigration)
+            # Tri-state, not a bare -ge. The version is whatever CIM_DataFile.Version carried, which
+            # is the binary's version resource and is not guaranteed to hold four components. A short
+            # value ties the minimum as far as it goes and then loses on the components [version]
+            # filled with -1, so '2.254' reported the measured failure "upgrade the v2.x sensor
+            # before migrating" on the strength of two numbers nobody read - the very outcome the
+            # unparseable guard above exists to prevent, reached by a value that parses.
+            $isV2VersionOk = Get-mdiVersionAtLeast -Version $v2VersionText -Minimum $v3.MinV2VersionForMigration
+            $v2VersionIndecisive = ([string] $isV2VersionOk -eq 'N/A')
         } else {
             $isV2VersionOk = 'N/A'
             $v2VersionUnparseable = $true
@@ -3588,6 +3980,7 @@ function Get-mdiSensorV3Readiness {
         elseif (-not $hasV2Sensor) { 'No v2.x sensor is installed - the server can be activated directly with the v3.x sensor' }
         elseif (-not $v2Version) { 'Not tested - a v2.x sensor is installed but its version could not be determined, so whether it can be migrated in place is unknown' }
         elseif ($v2VersionUnparseable) { 'Not tested - the reported v2.x sensor version "{0}" is not a recognisable version number, so it could not be compared with the minimum ({1})' -f ([string] $v2Version).Trim(), [string] $v3.MinV2VersionForMigration }
+        elseif ($v2VersionIndecisive) { 'Not tested - the reported v2.x sensor version "{0}" carries fewer parts than the minimum ({1}) and matches it as far as it goes, so whether it meets the minimum could not be established' -f ([string] $v2Version).Trim(), [string] $v3.MinV2VersionForMigration }
         elseif ($isV2VersionOk -eq $true) { 'v2.x sensor {0} meets the minimum version for in-place migration ({1})' -f ([string] $v2Version).Trim(), [string] $v3.MinV2VersionForMigration }
         else { 'v2.x sensor {0} is older than {1} - upgrade the v2.x sensor before migrating' -f ([string] $v2Version).Trim(), [string] $v3.MinV2VersionForMigration }
     ) 'Migration'
@@ -3689,12 +4082,31 @@ function Get-mdiSensorV3Readiness {
     elseif ($unknowns.Count -gt 0) { 'N/A' }
     else { $true }
 
+    # Tri-state for the same reason isSensorV3Ready is, and it was not. The old expression was a bare
+    # boolean AND, so every way of NOT being able to answer collapsed into a measured $false: a server
+    # whose every WMI, registry and service read failed reported MigrationEligible=$false - a flat "No,
+    # not eligible for in-place migration" - on the same page whose own prerequisites row read
+    # "Not tested", and emitted that same false into -AsJson where it is indistinguishable from a
+    # server genuinely measured as ineligible. Get-mdiSensorV3Html has had a three-way renderer for
+    # this field all along; it never rendered "Not determined" because a definite boolean was all the
+    # producer ever gave it. Two surfaces of the same fact disagreeing, from evidence nobody collected.
+    #
+    # Order matters: a DEFINITE disqualifier outranks an unknown. A failed required check, or a
+    # migration prerequisite measured as failing, settles the answer whatever else could not be read;
+    # so does an ANSWERED service query that found no v2.x sensor, since there is then nothing to
+    # migrate in place. Only when nothing definite disqualifies the server and something needed was
+    # unreadable is the honest answer "not established".
+    $migrationEligible = if ($v3Ready -eq $false -or $migrationWarnings.Count -gt 0) { $false }
+    elseif ($v2Readable -and -not $hasV2Sensor) { $false }
+    elseif ($v3Ready -ne $true -or $migrationUnknowns.Count -gt 0 -or -not $v2Readable) { 'N/A' }
+    else { $true }
+
     [PSCustomObject]@{
         isSensorV3Ready = $v3Ready
         details         = [PSCustomObject]@{
             SensorState        = $sensorState
             SensorV2Version    = $v2Version
-            MigrationEligible  = ($v3Ready -eq $true) -and ($migrationWarnings.Count -eq 0) -and ($migrationUnknowns.Count -eq 0) -and $hasV2Sensor
+            MigrationEligible  = $migrationEligible
             Blockers           = $blockerMessages
             ActionableBlockers = $actionableBlockers
             UnknownChecks      = @(foreach ($u in $unknowns) { [string] $u.Name })
@@ -4602,22 +5014,9 @@ function Get-mdiDomainCheckIssueText {
 
 function Get-mdiTargetLabel {
     <#
-        How a probe target is NAMED in operator-facing text.
-
-        A multi-homed host is discovered once per address and probed per address, so the host name
-        alone does not identify what was measured. Two rows for the same protocol, port and host came
-        out byte-for-byte identical - measured on the shipped issue list: two unmeasured required-port
-        rows with exactly ONE distinct string between them. An operator sees what looks like the table
-        repeating itself, cannot tell which NIC each row is about, and cannot tell whether one of them
-        has already been dealt with.
-
-        Stated once because four surfaces need it - the measured NNR row, the untested NNR row, the
-        unmeasured required-port row and the remediation generator's coverage key - and the wording
-        has already drifted apart once in this file.
-
-        The address is appended only when it ADDS something: a single-homed target, a target with no
-        address recorded, or one discovered BY address (where both fields hold the same value) keeps
-        the plain name, because "10.0.0.5 (10.0.0.5)" is noise.
+        Returns the operator-facing identity of a probe target. Numeric addresses are canonicalised
+        before comparison and display, so equivalent IPv6 spellings are one endpoint rather than a
+        fabricated "name (different address)" pair.
     #>
     param (
         [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [string] $Target,
@@ -4626,6 +5025,10 @@ function Get-mdiTargetLabel {
 
     $name = ([string] $Target).Trim()
     $address = ([string] $TargetIP).Trim()
+    $canonicalName = ConvertTo-mdiCanonicalIPAddress -Value $name
+    $canonicalAddress = ConvertTo-mdiCanonicalIPAddress -Value $address
+    if ($null -ne $canonicalName) { $name = $canonicalName }
+    if ($null -ne $canonicalAddress) { $address = $canonicalAddress }
     if ([string]::IsNullOrEmpty($name)) {
         if (-not [string]::IsNullOrEmpty($address)) { return $address }
         return ''
@@ -4720,8 +5123,9 @@ function Get-mdiPortIssueText {
     #>
     param ([Parameter(Mandatory = $true)] [object] $Record)
 
+    $targetLabel = Get-mdiTargetLabel -Target ([string] $Record.Target) -TargetIP ([string] $Record.TargetIP)
     'A required network probe was measured as blocked: {0}/{1} to {2}: {3}' -f
-    [string] $Record.Protocol, [string] $Record.Port, [string] $Record.Target, [string] $Record.Detail
+    [string] $Record.Protocol, [string] $Record.Port, $targetLabel, [string] $Record.Detail
 }
 
 function Get-mdiV3ActionableBlocker {
@@ -5320,6 +5724,7 @@ function New-mdiRemediationScript {
     }
     $sensorIps = @()
     $blockedTargets = @()
+    $blockedTargetLabels = @()
     # Sensor servers that contributed no usable address. Declared out here because the comment the
     # operator reads, the console warning and the section guard all need it.
     $sensorNoAddress = @()
@@ -5392,6 +5797,9 @@ function New-mdiRemediationScript {
         $sensorHosts = @($sensorWithAddress)
         $sensorNoAddress = @($sensorNoAddressList)
         $blockedTargets = @($blockedNnr | Select-Object -ExpandProperty Target -Unique | Sort-Object)
+        $blockedTargetLabels = @($blockedNnr | ForEach-Object {
+                Get-mdiTargetLabel -Target $_.Target -TargetIP $_.TargetIP
+            } | Select-Object -Unique | Sort-Object)
     }
 
     # Guarded rather than assumed. The generated rules scope inbound access with -RemoteAddress
@@ -5416,7 +5824,7 @@ function New-mdiRemediationScript {
         & $add '# https://aka.ms/mdi/nnr/troubleshooting'
         & $add '# These rules must exist on EVERY device the sensors observe, not only on the targets listed here.'
         & $add '# Prefer deploying them through Group Policy; the commands below fix the sampled targets only.'
-        & $add ('# Sampled targets that failed: {0}' -f (& $cmt ($blockedTargets -join ', ')))
+        & $add ('# Sampled target endpoints that failed: {0}' -f (& $cmt ($blockedTargetLabels -join ', ')))
         & $add ''
         & $add '# Scoped to the sensor servers only, so no port is opened to the whole network.'
         # The count and the list it labels must describe the SAME thing. This line paired
@@ -8235,29 +8643,61 @@ function Get-mdiNtlmAuditing {
                 $unreadable.Count, @($details).Count, ((@($unreadable | ForEach-Object { [string] $_.regKey })) -join ', '))
         }
     }
+    # A value whose KIND could not be established is a value whose type is unknown, and these settings
+    # are only honoured as REG_DWORD. GetValueKind is a second call that can fail on its own (see
+    # Get-mdiRegistryValueSet), and the "fall back to comparing the value alone" path silently FLIPPED
+    # the verdict rather than withholding it: the same registry content - a REG_SZ "2" - answered a
+    # measured False when the kind was readable and a measured True when it was not, so the verdict on
+    # an audit control depended on whether an enrichment call happened to succeed. A pass is the one
+    # answer that must never be reached that way, because it also suppresses the remediation section
+    # that would otherwise have repaired the setting.
+    #
+    # The runtime type is still evidence, so no knowable answer is thrown away: GetValue returns an
+    # Int32 for a REG_DWORD and an Int64 for a REG_QWORD, and a String only for a REG_SZ. An integral
+    # value confirms its own type with the kind unread; only a value confirmed by neither its kind nor
+    # its runtime type is genuinely unknown.
+    $unconfirmedKind = @($details | Where-Object {
+            $null -ne $_.value -and $null -eq $_.valueKind -and
+            -not (($_.value -is [int]) -or ($_.value -is [long]) -or
+                ($_.value -is [uint32]) -or ($_.value -is [uint64]) -or
+                ($_.value -is [int16]) -or ($_.value -is [byte]))
+        })
+    # Anchored. The expected value is a regex so that "1|2" can express two acceptable settings, but
+    # unanchored it also matches anything CONTAINING the expected value: AuditFilter expects 127 and
+    # accepted 1270, AuditNTLMInDomain expects 7 and accepted 17, and RestrictSendingNTLM expects 1|2
+    # and accepted 21. These are DWORDs and hold whatever a script or a mistyped policy wrote, so a
+    # misconfigured audit control read as configured.
+    $wrongValue = @($details | Where-Object {
+            [string] $_.value -notmatch ('^(?:' + $_.expectedValue + ')$')
+        })
+    # The TYPE is checked as well as the text. These settings are REG_DWORD, but nothing verified it,
+    # and GetValue renders a REG_SZ "2" and a REG_DWORD 2 as the same string. LSA reads these values
+    # as DWORDs, so a string one is not honoured: the estate is NOT auditing NTLM, and the report said
+    # it was. That is a false green on an audit control, which is the worst kind - nobody goes looking
+    # - and it also suppressed the remediation, so the script declined to fix the setting it misread.
+    #
+    # A wrong TYPE is a measured failure, not an unread check: the value was read successfully, and
+    # what it says is that the setting is not in effect.
+    $wrongKind = @($details | Where-Object {
+            $null -ne $_.value -and $null -ne $_.valueKind -and
+            [string] $_.valueKind -notin @('DWord', 'QWord')
+        })
+    # A definite disqualifier outranks an unknown: a value that is simply wrong, or a type that was
+    # read and found wrong, settles the answer whatever else could not be confirmed.
+    $ntlmVerdict = if ($wrongValue.Count -gt 0 -or $wrongKind.Count -gt 0) { $false }
+    elseif ($unconfirmedKind.Count -gt 0) { 'N/A' }
+    else { $true }
+
     [PSCustomObject]@{
-        # Anchored. The expected value is a regex so that "1|2" can express two acceptable settings,
-        # but unanchored it also matches anything CONTAINING the expected value: AuditFilter expects
-        # 127 and accepted 1270, AuditNTLMInDomain expects 7 and accepted 17, and RestrictSendingNTLM
-        # expects 1|2 and accepted 21. These are DWORDs and hold whatever a script or a mistyped policy
-        # wrote, so a misconfigured audit control read as configured.
-        # The TYPE is checked as well as the text. These settings are REG_DWORD - the comment above
-        # already said so - but nothing verified it, and GetValue renders a REG_SZ "2" and a
-        # REG_DWORD 2 as the same string. LSA reads these values as DWORDs, so a string one is not
-        # honoured: the estate is NOT auditing NTLM, and the report said it was. Measured with a
-        # stubbed registry: kind=String value="2" returned isNtlmAuditingOk = True, and so did
-        # value="2" with a trailing newline. That is a false green on an audit control, which is the
-        # worst kind - nobody goes looking. It also suppressed the remediation, so the script
-        # declined to fix the setting it had misread.
-        #
-        # A wrong TYPE is a measured failure, not an unread check: the value was read successfully,
-        # and what it says is that the setting is not in effect.
-        isNtlmAuditingOk = @($details | Where-Object {
-                [string] $_.value -notmatch ('^(?:' + $_.expectedValue + ')$') -or
-                ($null -ne $_.value -and $null -ne $_.valueKind -and
-                    [string] $_.valueKind -notin @('DWord', 'QWord'))
-            }).Count -eq 0
-        details          = $details | Select-Object regKey, value
+        isNtlmAuditingOk = $ntlmVerdict
+        details          = $(
+            if ([string] $ntlmVerdict -eq 'N/A') {
+                'Not tested - {0} of {1} registry value(s) were read but their type could not be established, and these settings are only honoured as REG_DWORD: {2}' -f
+                $unconfirmedKind.Count, @($details).Count, ((@($unconfirmedKind | ForEach-Object { [string] $_.regKey })) -join ', ')
+            } else {
+                $details | Select-Object regKey, value
+            }
+        )
     }
 }
 
@@ -8936,6 +9376,34 @@ function Get-mdiAdvancedAuditing {
                     $ComputerName, $unreadableSetting.Count, $expectedRows.Count)
             }
         }
+
+        # One row per subcategory before comparing. Compare-Object counts MULTIPLICITY, so a required
+        # subcategory that appears twice under the SAME Policy Target compares unequal to a single
+        # expected row and the whole policy is reported as a MEASURED failure. Measured on the shipped
+        # function: a domain controller whose eight required subcategories were all correct, with one
+        # of them listed twice carrying the same correct value, returned $false with the sole
+        # difference being '=> {0CCE9211-...} = 3' - a row that MATCHES what was expected. That verdict
+        # writes `auditpol.exe /set` for every required subcategory against a domain controller that
+        # was already correct.
+        #
+        # This is the same multiplicity hazard the per-user filter above documents, but that filter
+        # only engages when there is MORE THAN ONE distinct Policy Target, so a duplicate under a
+        # single target reaches Compare-Object untouched.
+        #
+        # Duplicates that DISAGREE are not collapsed. A subcategory recorded twice with different
+        # values does not have a readable setting - it has two - and picking either one would be
+        # inventing a measurement. That is unmeasured, exactly as an unreadable Setting Value already
+        # is, and never a measured pass or a measured failure.
+        $conflicting = @($actual | Group-Object -Property 'Subcategory GUID' |
+                Where-Object { @($_.Group.'Setting Value' | Select-Object -Unique).Count -gt 1 })
+        if ($conflicting.Count -gt 0) {
+            return [PSCustomObject]@{
+                isAdvancedAuditingOk = 'N/A'
+                details              = ('Not tested - the audit policy backup from {0} records {1} of the {2} subcategories MDI requires more than once with different settings ({3}), so their audit settings are contradictory and were not measured.' -f
+                    $ComputerName, $conflicting.Count, $expectedRows.Count, (($conflicting.Name | Select-Object -First 3) -join ', '))
+            }
+        }
+        $actual = @($actual | Group-Object -Property 'Subcategory GUID' | ForEach-Object { $_.Group[0] })
 
         $compareParams = @{
             ReferenceObject  = $expectedRows
@@ -9657,6 +10125,9 @@ function Get-mdiDomainControllerReadiness {
         Write-mdiVerbose "Using the provided list of Domain Controller(s)"
         $unnamedDc = 0
     }
+    $DomainController = @($DomainController | ForEach-Object {
+            ConvertTo-mdiCanonicalComputerName -Value $_ -Domain $Domain
+        } | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } | Select-Object -Unique)
     $dcs = @($DomainController | ForEach-Object {
             $dcName = [string] $_
             if ([string]::IsNullOrWhiteSpace($dcName)) { return }
@@ -9668,26 +10139,46 @@ function Get-mdiDomainControllerReadiness {
                 # identity, and the FQDN is kept even when the directory lookup yields nothing, so a server
                 # discovered over LDAP is still tested.
                 $identity = $dcName
+                $adObject = $null
                 if ($dcName -match '\w+\.\w+') {
                     $adObject = Get-ADObject -Filter { DNSHostName -eq $dcName } -Server $Domain -ErrorAction SilentlyContinue
                     if ($adObject) { $identity = $adObject }
                 }
 
                 $dcComputer = Get-ADComputer -Identity $identity -Server $Domain `
-                    -Properties 'DNSHostName', 'IPv4Address', 'OperatingSystem' -ErrorAction SilentlyContinue
+                    -Properties 'DNSHostName', 'IPv4Address', 'IPv6Address', 'OperatingSystem' -ErrorAction SilentlyContinue
 
                 $fqdn = if ($dcComputer -and $dcComputer.DNSHostName) { [string] $dcComputer.DNSHostName } else { $dcName }
+                $fqdn = ConvertTo-mdiCanonicalComputerName -Value $fqdn -Domain $Domain
+                # The computer object's DN identifies its AD domain authoritatively. A DC may use an
+                # allowed primary DNS suffix that differs from its AD domain (a disjoint namespace), so
+                # stripping the host label from DNSHostName can assign a scanned DC to the wrong domain.
+                $directoryDomain = $null
+                $directoryDn = if ($dcComputer -and
+                    -not [string]::IsNullOrWhiteSpace([string] $dcComputer.DistinguishedName)) {
+                    [string] $dcComputer.DistinguishedName
+                } elseif ($adObject -and
+                    -not [string]::IsNullOrWhiteSpace([string] $adObject.DistinguishedName)) {
+                    [string] $adObject.DistinguishedName
+                } else { $null }
+                if ($directoryDn) {
+                    $domainLabels = @([regex]::Matches(
+                            $directoryDn,
+                            '(?i)(?:^|,)\s*DC=([^,]+)') | ForEach-Object { $_.Groups[1].Value })
+                    if ($domainLabels.Count -gt 0) { $directoryDomain = $domainLabels -join '.' }
+                }
                 # IPv4Address holds ONE address even when the domain controller is multi-homed, so every
                 # address it answers on is collected. A second NIC is reported rather than hidden: the
                 # sensor captures on all interfaces and resolves whatever address it observes, so an
                 # interface nobody knew about is an interface nobody firewalled or gave a reverse zone.
-                $knownIp = if ($dcComputer) { [string] $dcComputer.IPv4Address } else { $null }
-                $addresses = @(Get-mdiComputerAddress -ComputerName $fqdn -KnownAddress $knownIp)
+                $knownAddresses = if ($dcComputer) { @([string] $dcComputer.IPv4Address, [string] $dcComputer.IPv6Address) } else { @() }
+                $addresses = @(Get-mdiComputerAddress -ComputerName $fqdn -KnownAddress $knownAddresses)
                 @{
                     FQDN      = $fqdn
-                    IP        = if ($addresses.Count -gt 0) { $addresses[0] } else { $knownIp }
+                    IP        = if ($addresses.Count -gt 0) { $addresses[0] } else { $null }
                     Addresses = $addresses
                     OS        = if ($dcComputer) { $dcComputer.OperatingSystem } else { $null }
+                    DirectoryDomain = $directoryDomain
                 }
             } catch {
                 Write-Verbose $_.Exception.Message
@@ -9720,9 +10211,9 @@ function Get-mdiDomainControllerReadiness {
         # the verdict to notice that a domain in scope had contributed no servers at all - which is what
         # an unreachable or unenumerable domain looks like from here.
         #
-        # Taken from the server's OWN name when that name says which domain it is in, and only from the
-        # requested scope when it does not. Assigning the scope unconditionally credited a controller to
-        # whatever domain the caller asked about, regardless of where it actually lives. Measured on the
+        # Taken from the server's authoritative directory DN when available. Assigning the requested scope
+        # unconditionally credited a controller to whatever domain the caller asked about, regardless of
+        # where it actually lives. Measured on the
         # shipped functions with -Domain child.root.test and a target whose authoritative DN is
         # CN=DC01,OU=Domain Controllers,DC=root,DC=test:
         #
@@ -9735,15 +10226,18 @@ function Get-mdiDomainControllerReadiness {
         # instead of the enumeration - and it is worse than reporting the child as unexamined, because
         # the operator is told the opposite of the truth rather than being told nothing.
         #
-        # DERIVED, never guessed: the domain is the FQDN with its leftmost label removed, which is what
-        # a fully qualified host name means. A name with no dot carries no domain information, so the
-        # requested scope is still used there - a short name genuinely cannot be placed.
+        # The FQDN suffix is only a compatibility fallback for a row whose directory DN could not be read.
+        # It normally agrees with the AD domain; a disjoint namespace is why it cannot outrank the DN.
+        # A short name carries no domain information, so the requested scope remains the final fallback.
         $dcFqdn = ([string] $dc.FQDN).Trim().TrimEnd('.').Trim()
-        $dc['Domain'] = if ($dcFqdn -match '\.') {
+        $dc['Domain'] = if (-not [string]::IsNullOrWhiteSpace([string] $dc.DirectoryDomain)) {
+            ([string] $dc.DirectoryDomain).Trim().TrimEnd('.')
+        } elseif ($dcFqdn -match '\.') {
             $dcFqdn.Substring($dcFqdn.IndexOf('.') + 1)
         } else {
             $Domain
         }
+        [void] $dc.Remove('DirectoryDomain')
 
         # Declared before the branch so an unreachable server does not inherit the previous server's
         # details, and reset per server so nothing leaks between iterations.
@@ -9934,7 +10428,7 @@ function Get-mdiCAReadiness {
     $cas = @($CAServer | Where-Object { $_ } | ForEach-Object {
             $caName = [string] $_
             try {
-                $caComputer = Get-ADComputer -Identity $_ -Server $Domain -Properties DNSHostName, IPv4Address, OperatingSystem -ErrorAction SilentlyContinue
+                $caComputer = Get-ADComputer -Identity $_ -Server $Domain -Properties DNSHostName, IPv4Address, IPv6Address, OperatingSystem -ErrorAction SilentlyContinue
                 # The discovered name is kept when the directory lookup returns nothing. A null FQDN was
                 # passed to Test-mdiServerReachable, whose -ComputerName is a mandatory [string], and the
                 # resulting parameter binding error is terminating, not catchable, and raised outside the
@@ -9942,11 +10436,11 @@ function Get-mdiCAReadiness {
                 $caFqdn = if ($caComputer -and $caComputer.DNSHostName) { [string] $caComputer.DNSHostName } else { $caName }
                 # Every address, as for domain controllers: a certification authority can be multi-homed
                 # too, and the generated firewall rules scope by source address.
-                $caKnownIp = if ($caComputer) { [string] $caComputer.IPv4Address } else { $null }
-                $caAddresses = @(Get-mdiComputerAddress -ComputerName $caFqdn -KnownAddress $caKnownIp)
+                $caKnownAddresses = if ($caComputer) { @([string] $caComputer.IPv4Address, [string] $caComputer.IPv6Address) } else { @() }
+                $caAddresses = @(Get-mdiComputerAddress -ComputerName $caFqdn -KnownAddress $caKnownAddresses)
                 @{
                     FQDN      = $caFqdn
-                    IP        = if ($caAddresses.Count -gt 0) { $caAddresses[0] } else { $caKnownIp }
+                    IP        = if ($caAddresses.Count -gt 0) { $caAddresses[0] } else { $null }
                     Addresses = $caAddresses
                     OS        = if ($caComputer) { $caComputer.OperatingSystem } else { $null }
                 }
@@ -10250,13 +10744,13 @@ function Get-mdiEntraConnectReadiness {
     $ecs = @($EntraConnectServer | Where-Object { $_ } | ForEach-Object {
             $ecName = [string] $_
             try {
-                $ecsComputer = Get-ADComputer -Identity $_ -Server $Domain -Properties DNSHostName, IPv4Address, OperatingSystem -ErrorAction SilentlyContinue
+                $ecsComputer = Get-ADComputer -Identity $_ -Server $Domain -Properties DNSHostName, IPv4Address, IPv6Address, OperatingSystem -ErrorAction SilentlyContinue
                 $ecFqdn = if ($ecsComputer -and $ecsComputer.DNSHostName) { [string] $ecsComputer.DNSHostName } else { $ecName }
-                $ecKnownIp = if ($ecsComputer) { [string] $ecsComputer.IPv4Address } else { $null }
-                $ecAddresses = @(Get-mdiComputerAddress -ComputerName $ecFqdn -KnownAddress $ecKnownIp)
+                $ecKnownAddresses = if ($ecsComputer) { @([string] $ecsComputer.IPv4Address, [string] $ecsComputer.IPv6Address) } else { @() }
+                $ecAddresses = @(Get-mdiComputerAddress -ComputerName $ecFqdn -KnownAddress $ecKnownAddresses)
                 @{
                     FQDN      = $ecFqdn
-                    IP        = if ($ecAddresses.Count -gt 0) { $ecAddresses[0] } else { $ecKnownIp }
+                    IP        = if ($ecAddresses.Count -gt 0) { $ecAddresses[0] } else { $null }
                     Addresses = $ecAddresses
                     OS        = if ($ecsComputer) { $ecsComputer.OperatingSystem } else { $null }
                 }
@@ -10932,8 +11426,14 @@ function Merge-mdiRequiredPortsDetails {
     $order = New-Object -TypeName System.Collections.ArrayList
     foreach ($rec in @(@($First.Results) + @($Second.Results))) {
         if ($null -eq $rec) { continue }
+        $targetKey = [string] $rec.Target
+        $targetAddress = ConvertTo-mdiCanonicalIPAddress -Value $targetKey
+        if ($null -ne $targetAddress) { $targetKey = $targetAddress }
+        $targetIpKey = [string] $rec.TargetIP
+        $targetIpAddress = ConvertTo-mdiCanonicalIPAddress -Value $targetIpKey
+        if ($null -ne $targetIpAddress) { $targetIpKey = $targetIpAddress }
         $id = ([string] $rec.Id + '|' + [string] $rec.Protocol + '|' + [string] $rec.Port + '|' +
-            [string] $rec.Target + '|' + [string] $rec.TargetIP).ToLowerInvariant()
+            $targetKey + '|' + $targetIpKey).ToLowerInvariant()
         if (-not $byId.Contains($id)) {
             $byId[$id] = $rec
             [void] $order.Add($id)
@@ -10983,7 +11483,7 @@ function Merge-mdiRequiredPortsDetails {
         @{ Expression = { [string] $_.Protocol } },
         @{ Expression = { [int] ($_.Port -as [int]) } },
         @{ Expression = { [string] $_.Target } },
-        @{ Expression = { [string] $_.TargetIP } })
+        @{ Expression = { Get-mdiIPAddressSortKey -Value $_.TargetIP } })
     # Sorted, not first-seen. Select-Object -Unique preserves the order the values arrived in, so the
     # merged lists - and therefore the failed-port list, the issue list built from it and the
     # generated remediation script - came out in a different order depending on which role was
@@ -11196,7 +11696,13 @@ function Merge-mdiSensorV3ReadyDetails {
         # Pessimistic: eligible for the in-place migration only if BOTH passes said so. Anything else
         # - a disagreement, or a value neither role expressed as a real boolean - is not the positive
         # assertion this field exists to make.
-        MigrationEligible  = (($First.MigrationEligible -eq $true) -and ($Second.MigrationEligible -eq $true))
+        #
+        # Merged through the one computation that already encodes that rule for every other check
+        # rather than a boolean AND of its own. The AND turned a role whose eligibility was never
+        # determined into a measured "No": two colocated roles, one reporting 'N/A' because the host
+        # could not be queried under it, merged to a definite $false and told the operator the server
+        # cannot be migrated in place - the producer's own tri-state discarded at the merge.
+        MigrationEligible  = Merge-mdiCheckValue -First $First.MigrationEligible -Second $Second.MigrationEligible
         Blockers           = $blockerMessages
         ActionableBlockers = $actionableBlockers
         UnknownChecks      = $unknownChecks
@@ -11304,8 +11810,9 @@ function Get-mdiServerIdentityKey {
     )
 
     if ($null -eq $Server) { return '' }
-    $key = [string] $Server.FQDN
-    if ([string]::IsNullOrWhiteSpace($key)) { return '' }
+    $key = ConvertTo-mdiCanonicalComputerName -Value $Server.FQDN -Domain $Server.Domain
+    if ([string]::IsNullOrWhiteSpace([string] $key)) { return '' }
+    return $key.ToLowerInvariant()
 
     # The trailing dot of a fully qualified DNS name is trimmed before the key is built.
     # "dc1.contoso.com" and "dc1.contoso.com." are the same host - the second is simply written in
@@ -11316,24 +11823,7 @@ function Get-mdiServerIdentityKey {
     # DNS name: a directory attribute read with a stray leading space, an operator-supplied
     # -NnrTargetComputer with a trailing one, or a name split out of a comma-separated list all
     # produce a spelling that keyed differently from the same host discovered elsewhere.
-    $key = $key.Trim().TrimEnd('.').Trim().ToLowerInvariant()
-    # Trimming can empty the key: a name of "." or ".." is nothing but dots. Those are not the same
-    # host as each other, so a name that trims away yields no key at all.
-    if ($key -eq '') { return '' }
-
-    # A DOTLESS name is the NetBIOS/short spelling of a host, and the record already carries the
-    # domain it was discovered in - so "MEM03" with Domain "mdilab.local" IS "mem03.mdilab.local",
-    # DERIVED rather than guessed. Qualification is conditional on BOTH the name being dotless AND a
-    # domain being present, so it can never invent an identity: a bare short name with no domain
-    # cannot be proven to belong to any domain - "dc1" may be dc1.fabrikam.com - and is left exactly
-    # as it was. Qualifying with the record's OWN domain is also what keeps genuinely different hosts
-    # apart: "MEM03" in mdilab.local becomes mem03.mdilab.local and still does not collide with
-    # mem03.fabrikam.com.
-    if ($key -notmatch '\.') {
-        $domainKey = ([string] $Server.Domain).Trim().TrimEnd('.').Trim().ToLowerInvariant()
-        if ($domainKey -ne '') { $key = $key + '.' + $domainKey }
-    }
-    $key
+    # ConvertTo-mdiCanonicalComputerName owns the trimming, case, address and short-name rules above.
 }
 
 function Merge-mdiServerByFqdn {
@@ -12469,6 +12959,22 @@ function Get-mdiReportStatistics {
             }
         })
 
+    # A named domain controller with no usable address never entered either target plan. It is charged
+    # once as unmeasured population so a missing endpoint cannot leave the score at 100%.
+    $serverScores = @($serverScores) + @(
+        foreach ($dcName in @($ReportData.AddresslessDomainControllers |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } |
+                    ForEach-Object { [string] $_ } | Select-Object -Unique)) {
+            [PSCustomObject]@{
+                FQDN   = 'Domain controller address not determined - {0}' -f $dcName
+                Passed = 0
+                Total  = 0
+                Failed = 0
+                Unread = 1
+                Kind   = 'Unmeasured'
+            }
+        })
+
     # A Network Name Resolution target the OPERATOR named by hand is the FIFTH gap of this exact family,
     # and it was the last one still uncharged. A target that resolved to no address was dropped from the
     # probe plan, so no sensor was ever asked whether it can resolve that host. Main warns about it, the
@@ -12889,8 +13395,14 @@ function Get-mdiPortResultRecord {
                 # report or an older version can hand back dictionaries, and this normaliser exists
                 # precisely to absorb that.
                 $record = ConvertTo-mdiRecordObject -Value $portResult
-                $record | Select-Object -Property * -ExcludeProperty Success, Applicable, Server |
+                $canonicalTarget = ConvertTo-mdiCanonicalIPAddress -Value $record.Target
+                $canonicalTargetIP = ConvertTo-mdiCanonicalIPAddress -Value $record.TargetIP
+                $targetValue = if ($null -ne $canonicalTarget) { $canonicalTarget } else { $record.Target }
+                $targetIpValue = if ($null -ne $canonicalTargetIP) { $canonicalTargetIP } else { $record.TargetIP }
+                $record | Select-Object -Property * -ExcludeProperty Success, Applicable, Server, Target, TargetIP |
                     Select-Object -Property *,
+                    @{ N = 'Target'; E = { $targetValue } },
+                    @{ N = 'TargetIP'; E = { $targetIpValue } },
                     @{ N = 'Success'; E = { ConvertTo-mdiBoolean $record.Success } },
                     @{ N = 'Applicable'; E = { ConvertTo-mdiBoolean $record.Applicable } },
                     @{ N = 'Server'; E = { $srv.FQDN } }
@@ -13052,9 +13564,30 @@ function Get-mdiIssueList {
             $reason = if ([string]::IsNullOrWhiteSpace([string] $ReportData.ForestDiscovery.Error)) {
                 'forest discovery did not report whether it completed'
             } else { [string] $ReportData.ForestDiscovery.Error }
+            $scopeDomains = if ($null -ne $ReportData.PSObject.Properties['DomainsInScope']) {
+                @($ReportData.DomainsInScope)
+            } elseif ($null -ne $ReportData.ForestDiscovery.PSObject.Properties['Domains']) {
+                @($ReportData.ForestDiscovery.Domains)
+            } elseif ($null -ne $ReportData.PSObject.Properties['Domain']) {
+                @($ReportData.Domain)
+            } else { @() }
+            $scopeDomainNames = @(
+                $scopeDomains |
+                    ForEach-Object { ([string]$_).Trim().TrimEnd('.') } |
+                    Where-Object { $_ } |
+                    Select-Object -Unique
+            )
+            $scopeDescription = switch ($scopeDomainNames.Count) {
+                0 { 'No discovered domain was included in scope.' }
+                1 { 'The discovered domain included in scope was {0}.' -f $scopeDomainNames[0] }
+                default {
+                    '{0} discovered domains were included in scope: {1}.' -f
+                        $scopeDomainNames.Count, ($scopeDomainNames -join ', ')
+                }
+            }
             [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $ReportData.Forest; Area = 'Forest discovery'
-                    Issue = ('The forest domains could not be enumerated, so only {0} was examined: {1}' -f
-                        [string] $ReportData.Domain, $reason)
+                    Issue = ('The forest domains could not be enumerated; the list is incomplete. {0} Discovery error: {1}' -f
+                        $scopeDescription, $reason)
                 })
         }
 
@@ -13100,6 +13633,14 @@ function Get-mdiIssueList {
             if ($alreadyUnexamined -contains $normalised) { continue }
             [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = $normalised; Area = 'Not measured'
                     Issue = 'No LDAP probe target could be built for this domain, so no sensor was asked whether it can reach its domain controllers'
+                })
+        }
+
+        foreach ($dcName in @($ReportData.AddresslessDomainControllers |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } |
+                    ForEach-Object { [string] $_ } | Select-Object -Unique)) {
+            [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = $dcName; Area = 'Not measured'
+                    Issue = 'No usable address could be determined for this domain controller, so it was omitted from the LDAP and Network Name Resolution probe plans'
                 })
         }
 
@@ -14481,7 +15022,10 @@ function Get-mdiRequiredPortsHtml {
                     # same port was optional.
                     $rowRequirement = @($failed.Requirement | Where-Object { $_ }) + @($srvRecords.Requirement | Where-Object { $_ })
                     $class = if (@($rowRequirement)[0] -eq 'Required') { 'red' } else { 'amber' }
-                    $tooltip = (@(foreach ($f in $failed) { [string] $f.Target + ': ' + [string] $f.Detail })) -join ' | '
+                    $tooltip = (@(foreach ($f in $failed) {
+                                (Get-mdiTargetLabel -Target ([string] $f.Target) -TargetIP ([string] $f.TargetIP)) +
+                                    ': ' + [string] $f.Detail
+                            })) -join ' | '
                     '<td class="{0}" title="{1}">{2}/{3} open</td>' -f $class, (ConvertTo-mdiHtmlEncoded $tooltip), $ok.Count, $measurable.Count
                 }
             }
@@ -14520,8 +15064,7 @@ function Get-mdiRequiredPortsHtml {
             foreach ($targetGroup in ($srvNnr | Group-Object -Property Target, TargetIP | Sort-Object `
                     @{ Expression = { [string] $_.Values[0] } },
                     @{ Expression = {
-                            $addr = [string] $_.Values[1]
-                            if ($addr -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$') { [version] $addr } else { [version] '255.255.255.255' }
+                            Get-mdiIPAddressSortKey -Value ([string] $_.Values[1])
                         }
                     })) {
                 $cells = foreach ($probe in $nnrProbes) {
@@ -14614,10 +15157,11 @@ function Get-mdiRequiredPortsHtml {
             # "not required", which is the more dangerous of the two readings to guess at.
             $requirementText = if ([string]::IsNullOrWhiteSpace([string] $failure.Requirement)) { 'Not stated' }
             else { [string] $failure.Requirement }
+            $targetLabel = Get-mdiTargetLabel -Target ([string] $failure.Target) -TargetIP ([string] $failure.TargetIP)
             [void] $lines.Add(('<tr><td style="text-align:left">{0}</td><td style="text-align:left">{1}</td><td style="text-align:left">{2}</td><td>{3}</td><td class="{4}">{5}</td><td style="text-align:left">{6}</td><td style="text-align:left">{7}</td></tr>' -f
                     (ConvertTo-mdiHtmlEncoded $failure.Server), (ConvertTo-mdiHtmlEncoded $failure.Name),
                     (ConvertTo-mdiHtmlEncoded $requirementText), (ConvertTo-mdiHtmlEncoded $failure.Protocol),
-                    $class, (ConvertTo-mdiHtmlEncoded $failure.Port), (ConvertTo-mdiHtmlEncoded $failure.Target), (ConvertTo-mdiHtmlEncoded $failure.Detail)))
+                    $class, (ConvertTo-mdiHtmlEncoded $failure.Port), (ConvertTo-mdiHtmlEncoded $targetLabel), (ConvertTo-mdiHtmlEncoded $failure.Detail)))
         }
         [void] $lines.Add('</table></div>')
     }
@@ -14636,10 +15180,11 @@ function Get-mdiRequiredPortsHtml {
             # port from an unmeasured optional one.
             $requirementText = if ([string]::IsNullOrWhiteSpace([string] $row.Requirement)) { 'Not stated' }
             else { [string] $row.Requirement }
+            $targetLabel = Get-mdiTargetLabel -Target ([string] $row.Target) -TargetIP ([string] $row.TargetIP)
             [void] $lines.Add(('<tr><td style="text-align:left">{0}</td><td style="text-align:left">{1}</td><td style="text-align:left">{2}</td><td>{3}</td><td class="muted-cell">{4}</td><td style="text-align:left">{5}</td><td style="text-align:left">{6}</td></tr>' -f
                     (ConvertTo-mdiHtmlEncoded $row.Server), (ConvertTo-mdiHtmlEncoded $row.Name),
                     (ConvertTo-mdiHtmlEncoded $requirementText), (ConvertTo-mdiHtmlEncoded $row.Protocol),
-                    (ConvertTo-mdiHtmlEncoded $row.Port), (ConvertTo-mdiHtmlEncoded $row.Target), (ConvertTo-mdiHtmlEncoded $row.Detail)))
+                    (ConvertTo-mdiHtmlEncoded $row.Port), (ConvertTo-mdiHtmlEncoded $targetLabel), (ConvertTo-mdiHtmlEncoded $row.Detail)))
         }
         [void] $lines.Add('</table></div>')
     }
@@ -15388,7 +15933,7 @@ function Set-MdiReadinessReport {
                     Select-Object -ExpandProperty Name)
             $unreadColumns = @($serverList | ForEach-Object { Get-mdiUnreadCheckName -Server $_ })
             $properties = [collections.arraylist] @(@($checkColumns) + @($unreadColumns) | Select-Object -Unique)
-            $propsToAdd = @('SensorVersion', 'CapturingComponent', 'MachineType', 'Comment')
+            $propsToAdd = @('Addresses', 'SensorVersion', 'CapturingComponent', 'MachineType', 'Comment')
             # The descriptive columns are added whether or not any CHECK was readable. They used to be
             # dropped in the else branch, so an estate where every check failed to read lost the facts
             # that had been read successfully - the sensor version, the capture driver and the platform
@@ -15421,7 +15966,13 @@ function Set-MdiReadinessReport {
                     }
                     $ordered = [ordered]@{}
                     foreach ($p in $properties) {
-                        $cell = if ($effective.ContainsKey([string] $p)) {
+                        $cell = if ($p -eq 'Addresses') {
+                            $displayAddresses = @(@($srv.Addresses) + @($srv.IP) | ForEach-Object {
+                                    $canonical = ConvertTo-mdiCanonicalIPAddress -Value $_
+                                    if ($null -ne $canonical -and (Test-mdiUsableComputerAddress -Value $canonical)) { $canonical }
+                                } | Select-Object -Unique | Sort-Object -Property @{ Expression = { Get-mdiIPAddressSortKey -Value $_ } })
+                            if ($displayAddresses.Count -gt 0) { $displayAddresses -join ', ' } else { 'Not determined' }
+                        } elseif ($effective.ContainsKey([string] $p)) {
                             $effective[[string] $p]
                         } else {
                             $value = $srv.PSObject.Properties[$p]
@@ -16430,6 +16981,14 @@ function Test-mdiReadinessResult {
             $ldapPlanGap.Count, (@($ldapPlanGap | ForEach-Object { [string] $_ }) -join ', '))
     }
 
+    $addresslessDc = @($ReportData.AddresslessDomainControllers |
+        Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } |
+        ForEach-Object { [string] $_ } | Select-Object -Unique)
+    if ($addresslessDc.Count -gt 0) {
+        Write-mdiWarning ('No usable address was determined for {0} domain controller(s): {1}. They were never included in the LDAP or Network Name Resolution probe plans, so the run cannot be reported as ready.' -f
+            $addresslessDc.Count, ($addresslessDc -join ', '))
+    }
+
     # A Network Name Resolution target the operator named that resolved to no address was dropped from
     # the probe plan, so nothing measured whether the sensor can resolve it. Judged the same way as an
     # untested required probe: nothing was observed to fail, but nothing was observed at all.
@@ -16468,6 +17027,7 @@ function Test-mdiReadinessResult {
     ($untestedRequiredPorts.Count -eq 0) -and
     ($untestedNnr.Count -eq 0) -and
     ($ldapPlanGap.Count -eq 0) -and
+    ($addresslessDc.Count -eq 0) -and
     ($nnrUnresolved.Count -eq 0) -and
     ($clockSpread.IsWithin -ne $false) -and
     $domainsExamined -and
@@ -16475,6 +17035,32 @@ function Test-mdiReadinessResult {
     $domainChecksOk
 
     [bool] $return
+}
+
+function ConvertTo-mdiDomainScopeName {
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [string] $DomainName
+    )
+
+    # DNS absolute form adds a trailing root dot; it does not name another domain. Canonicalising at
+    # the scope boundary keeps discovery, per-domain row selection, report identity and file naming
+    # on one spelling.
+    ([string] $DomainName).Trim().TrimEnd('.')
+}
+
+function Get-mdiPrimaryDomainAuditing {
+    param (
+        [Parameter(Mandatory = $true)] [string] $Domain,
+        [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $DomainAuditing
+    )
+
+    $targetDomain = ConvertTo-mdiDomainScopeName -DomainName $Domain
+    $rows = @($DomainAuditing | Where-Object { $_ })
+    $primary = @($rows | Where-Object {
+            (ConvertTo-mdiDomainScopeName -DomainName ([string] $_.Domain)) -eq $targetDomain
+        })[0]
+    if ($null -eq $primary) { $primary = @($rows)[0] }
+    $primary
 }
 
 #endregion
@@ -16653,6 +17239,13 @@ if (-not $Domain) {
 if (-not $Domain) {
     throw 'Unable to determine the domain to work against. Use the -Domain parameter to specify it.'
 }
+# Canonicalise the domain once before it is used by discovery, per-domain row matching, report
+# identity, and file naming. An absolute DNS name with a trailing dot is the same domain, not a
+# different scope that should miss its DomainAuditing row and fall back to the first forest domain.
+$Domain = ConvertTo-mdiDomainScopeName -DomainName $Domain
+if ([string]::IsNullOrWhiteSpace($Domain)) {
+    throw 'The domain name is empty after removing whitespace and a trailing DNS root dot. Use -Domain with a DNS name.'
+}
 
 $targetDescription = if ($Forest) { 'the forest of {0}' -f $Domain } else { $Domain }
 if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuration reports')) {
@@ -16725,11 +17318,13 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
     # Empty when the port plan is not built at all, for the same reason as the LDAP gap above: with
     # -SkipNetworkPorts nothing was asked of any sensor, and the skip disclosure already says so.
     $nnrUnresolvedTargets = @()
+    $addresslessDomainControllers = @()
     if (-not $SkipNetworkPorts) {
         Write-mdiVerbose 'Building the network port probe plan'
         # Every sensor must be able to reach every domain controller over LDAP, so the inventory is collected once for
         # the whole scope and shared by all the probes.
         $dcInventory = @(Get-mdiDomainControllerInventory -Domain $domainsInScope)
+        $addresslessDomainControllers = @(Get-mdiAddresslessDomainController -Inventory $dcInventory)
         # Counted as distinct HOSTS, keyed on Name - which is the property this inventory actually
         # carries. An earlier version of this line counted distinct FQDN, which the records do not have,
         # so Select-Object returned nothing and the line reported "Found 0 domain controller(s)" for a
@@ -16837,8 +17432,7 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
 
     # The single-domain properties are kept and point at the domain the run was aimed at, so a baseline
     # taken with an earlier version still compares against the same value it recorded.
-    $primaryAuditing = @($domainAuditing | Where-Object { $_.Domain -eq $Domain })[0]
-    if ($null -eq $primaryAuditing) { $primaryAuditing = @($domainAuditing)[0] }
+    $primaryAuditing = Get-mdiPrimaryDomainAuditing -Domain $Domain -DomainAuditing $domainAuditing
 
     $report = @{
         ScriptVersion          = $settings.ScriptVersion
@@ -16860,6 +17454,7 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
         # it - unlike the first version of LdapPlanGapDomains, which was written for consumers that
         # were never implemented and so returned READY over an unmeasured path.
         NnrUnresolvedTargets   = @($nnrUnresolvedTargets | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } | Select-Object -Unique)
+        AddresslessDomainControllers = @($addresslessDomainControllers | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } | Select-Object -Unique)
         # Recorded so the report can tell whether the NNR target list was CHOSEN by the operator or
         # sampled from the domain controller inventory. The report discloses the sample only in the
         # second case: when these hosts were named explicitly there is no sample to disclose, and
@@ -17143,12 +17738,30 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
     # happens, and nothing in the output made it obvious.
     #
     # The sentinel is the same 255 used for a scan that enumerated nothing, because it means the same
-    # thing: no conclusion may be drawn from this run. It is raised only when -FailOnIssues asked for a
-    # pass/fail signal that cannot be produced, so an interactive -WhatIf still exits 0 as the common
-    # convention expects.
+    # thing: no conclusion may be drawn from this run. It is raised only when a MACHINE-READABLE
+    # answer was asked for that cannot be produced, so an interactive -WhatIf still exits 0 as the
+    # common convention expects.
+    #
+    # -AsJson is gated here for exactly the reason -FailOnIssues is, and was missed. It is the other
+    # machine interface - the help calls it "for use in a pipeline or a scheduled compliance job" -
+    # and a run that performed no scan has no document to emit. Measured on the shipped script:
+    #
+    #     powershell -File Test-MdiReadiness.ps1 -Domain contoso.com -WhatIf -AsJson
+    #     STDOUT: What if: Performing the operation "Create MDI related configuration reports" ...
+    #     ConvertFrom-Json -> Invalid JSON primitive: What.
+    #     EXIT  : 0
+    #
+    # So the documented caller got a parse failure while the exit code said success. A stale -WhatIf
+    # left in a saved command line - the very scenario this branch was written for - handed a JSON
+    # compliance job a clean pass over a run that looked at nothing at all.
     Write-mdiWarning 'No scan was performed because -WhatIf was specified. No report was written and no readiness conclusion is available.'
-    if ($FailOnIssues) {
-        Write-mdiWarning 'Exiting with code 255: -FailOnIssues cannot report on a run that did not happen. Remove -WhatIf to produce a verdict.'
+    $machineInterface = @(
+        $(if ($FailOnIssues) { '-FailOnIssues' })
+        $(if ($AsJson) { '-AsJson' })
+    ) | Where-Object { $_ }
+    if (@($machineInterface).Count -gt 0) {
+        Write-mdiWarning ('Exiting with code 255: {0} cannot report on a run that did not happen. Remove -WhatIf to produce a verdict.' -f
+            (@($machineInterface) -join ' and '))
         exit 255
     }
 }

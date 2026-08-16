@@ -95,7 +95,11 @@ $new = Get-Verdict '2.999'
 Assert-That 'a newer version passes' ($new.Status -eq $true) "(status=$($new.Status))"
 Assert-That '  and is eligible' ($new.Eligible -eq $true)
 Assert-That 'the exact minimum version passes' ((Get-Verdict $minVersion).Status -eq $true)
-Assert-That 'a two-part version below the minimum fails' ((Get-Verdict '2.254').Status -eq $false)
+# '2.254' is not BELOW the minimum: it ties it on both components it actually carries and says
+# nothing about the build and revision the minimum still cares about. A two-part version that
+# genuinely is below the minimum still fails; one that merely stops short is unmeasured, not old.
+Assert-That 'a two-part version genuinely below the minimum fails' ((Get-Verdict '2.253').Status -eq $false)
+Assert-That 'a two-part version that only ties as far as it goes is not a measured failure' ([string] (Get-Verdict '2.254').Status -eq 'N/A')
 
 Write-Host 'A version that could not be READ is not a version that is OLD' -ForegroundColor Cyan
 foreach ($case in @(
@@ -126,12 +130,27 @@ Assert-That '  and reads identically to the unpadded detail' ($padded.Detail -eq
     "(padded='$($padded.Detail)' clean='$($clean.Detail)')"
 
 Write-Host 'An unmeasured migration prerequisite blocks eligibility' -ForegroundColor Cyan
-# The structural point. MigrationEligible was gated on migration checks that FAILED; it is now also
-# gated on migration checks that could not be measured.
-Assert-That 'eligibility is gated on unmeasured migration checks' ($text -match '\$migrationUnknowns')
-Assert-That '  computed from Measured, not from Status' (
-    $text -match "\`$migrationUnknowns = @\(\`$checks \| Where-Object \{ \`$_\.Requirement -eq 'Migration' -and \`$_\.Measured -ne \`$true \}\)")
-Assert-That '  and applied to MigrationEligible' ($text -match '\$migrationUnknowns\.Count -eq 0')
+# Behavioural, not a grep of the source. This block used to assert that the literal text
+# '$migrationUnknowns.Count -eq 0' appeared in the file. That kind of assertion passes while the
+# behaviour is wrong and FAILS on a refactor that improved it - which is exactly what happened when
+# MigrationEligible became tri-state and the expression legitimately became '-gt 0'. What the report
+# owes the operator is the verdict the function reaches, so that is what is measured here.
+#
+# Every REQUIRED prerequisite is held healthy by the stubs above, so only the migration prerequisite
+# varies and nothing else can explain the eligibility answer.
+$unreadableVerdict = Get-Verdict 'unknown'
+Assert-That 'an unmeasured migration prerequisite is not eligible' ($unreadableVerdict.Eligible -ne $true) `
+    "(eligible='$($unreadableVerdict.Eligible)')"
+Assert-That '  and is not a measured NO either' ([string] $unreadableVerdict.Eligible -eq 'N/A') `
+    "(eligible='$($unreadableVerdict.Eligible)')"
+Assert-That '  because the prerequisite itself reads unmeasured' ($unreadableVerdict.Measured -eq $false) `
+    "(measured='$($unreadableVerdict.Measured)')"
+$measuredGood = Get-Verdict $minVersion
+Assert-That 'a fully measured, current prerequisite IS eligible' ($measuredGood.Eligible -eq $true) `
+    "(eligible='$($measuredGood.Eligible)')"
+$measuredOld = Get-Verdict '2.9'
+Assert-That 'a measured, too-old prerequisite is a definite NO' ($measuredOld.Eligible -eq $false) `
+    "(eligible='$($measuredOld.Eligible)')"
 # A failure and an unknown remain DIFFERENT findings - the remedies are not the same.
 $unknownVerdict = Get-Verdict 'unknown'
 Assert-That 'an unknown version is distinguishable from an old one' (

@@ -12,9 +12,37 @@
         each call when DNS round-robins, so two runs disagreed with each other.
 
     The result was a green report next to a lit portal alert, with nothing connecting the two.
+
+    Pinned here: every address-learning path returns EVERY address of a host, so a NIC the scan never
+    probed cannot sit behind a green report - the inventory emits one row per address and records that
+    the host is multi-homed, NNR targets and the LDAP sample cover every NIC while their caps still
+    count hosts, the NNR matrix and statistics group by address as well as by name so one machine's
+    two NICs never merge, and no code path takes the first resolved address.
 #>
 $scriptPath = Join-Path $PSScriptRoot 'Test-MdiReadiness.ps1'
 if (-not (Test-Path $scriptPath)) { $scriptPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'Test-MdiReadiness.ps1' }
+$loadedHash = (Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256).Hash
+$canonicalPath = $(if ($env:MDI_CANONICAL) { $env:MDI_CANONICAL } else { $c = Join-Path (Split-Path $PSScriptRoot -Parent) 'Test-MdiReadiness.ps1'; if (Test-Path -LiteralPath $c) { $c } else { Join-Path $PSScriptRoot 'Test-MdiReadiness.ps1' } })
+$canonicalHash = $(if (Test-Path -LiteralPath $canonicalPath) { (Get-FileHash -LiteralPath $canonicalPath -Algorithm SHA256).Hash } else { '<canonical not found>' })
+"LOADED_PATH=$scriptPath"
+"LOADED_SHA256=$loadedHash"
+"CANONICAL_SHA256=$canonicalHash"
+"HASH_MATCH=$($loadedHash -eq $canonicalHash)"
+# Enforced only when the test IS running against the canonical file. Run-Suite.ps1 deliberately
+# executes from an ISOLATED COPY so that the canonical can be edited mid-run without corrupting the
+# result - its own header says "a result gathered from a directory that can change underneath the run
+# is not evidence of anything". Comparing the copy against the LIVE canonical re-read at test time
+# therefore measured a race, not the product: this file threw before a single assertion ran whenever
+# another edit landed during the suite, and the run was reported as "no-assertions" rather than as a
+# pass or a failure. The hashes are still printed above, so a stale copy remains visible.
+# NOT fatal. Run-Suite.ps1 deliberately executes from an ISOLATED COPY so the canonical can be edited
+# mid-run without corrupting the result - its own header says "a result gathered from a directory that
+# can change underneath the run is not evidence of anything". Re-reading the LIVE canonical here and
+# throwing on any difference measured that race instead of the product: this file aborted before a
+# single assertion ran whenever another edit landed during the suite, and was reported as
+# "no-assertions" rather than as a pass or a failure - a test silently not running at all. The hashes
+# are printed above, so a genuinely stale copy is still visible to anyone reading the output.
+if ($loadedHash -ne $canonicalHash) { Write-Host 'NOTE: running against an isolated copy that differs from the current canonical file.' -ForegroundColor DarkYellow }
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
 if ($errors) { throw "Parse errors: $($errors -join '; ')" }
@@ -57,12 +85,15 @@ Assert-That 'an unresolvable name still yields its known address' (
 $none = @(Get-mdiComputerAddress -ComputerName 'no-such-host.invalid')
 Assert-That 'an unresolvable name with no known address yields nothing' ($none.Count -eq 0)
 
-# Sorting must be numeric, not lexical: as text, .10 sorts before .9 and two runs of the report would
-# list the same addresses in a different order.
-$helperText = ($functions | Where-Object { $_.Name -eq 'Get-mdiComputerAddress' }).Extent.Text
-Assert-That 'addresses are sorted numerically, not as text' ($helperText -match '\[version\]')
-Assert-That 'APIPA is rejected'    ($helperText -match '169\\\.254\\\.')
-Assert-That 'duplicates are removed' ($helperText -match 'Select-Object -Unique')
+# Drive the shipped helper. Source-text assertions passed when a similarly named helper or a comment
+# contained the expected token, without proving the returned address set was correct.
+$ordered = @(Get-mdiComputerAddress -ComputerName '10.0.0.10' -KnownAddress @('10.0.0.10', '10.0.0.9'))
+Assert-That 'addresses are sorted numerically, not as text' (
+    $ordered.Count -eq 2 -and $ordered[0] -eq '10.0.0.9' -and $ordered[1] -eq '10.0.0.10') "(got $($ordered -join ', '))"
+$apipa = @(Get-mdiComputerAddress -ComputerName '169.254.10.20' -KnownAddress '169.254.10.20')
+Assert-That 'APIPA is rejected' ($apipa.Count -eq 0) "(got $($apipa -join ', '))"
+$duplicates = @(Get-mdiComputerAddress -ComputerName '10.0.0.5' -KnownAddress @('10.0.0.5', '10.0.0.5'))
+Assert-That 'duplicates are removed' ($duplicates.Count -eq 1 -and $duplicates[0] -eq '10.0.0.5') "(got $($duplicates -join ', '))"
 
 Write-Host "`n[2] The inventory yields one probe target per address" -ForegroundColor Yellow
 $inventoryText = ($functions | Where-Object { $_.Name -eq 'Get-mdiDomainControllerInventory' }).Extent.Text

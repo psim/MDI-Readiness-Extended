@@ -33,6 +33,28 @@ $here = $PSScriptRoot
 $target = Join-Path $here 'Test-MdiReadiness.ps1'
 if (-not (Test-Path $target)) { $target = Join-Path (Split-Path $here -Parent) 'Test-MdiReadiness.ps1' }
 if (-not (Test-Path $target)) { throw "Test-MdiReadiness.ps1 not found from $here" }
+$loadedHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+$canonicalPath = $(if ($env:MDI_CANONICAL) { $env:MDI_CANONICAL } else { $c = Join-Path (Split-Path $PSScriptRoot -Parent) 'Test-MdiReadiness.ps1'; if (Test-Path -LiteralPath $c) { $c } else { Join-Path $PSScriptRoot 'Test-MdiReadiness.ps1' } })
+$canonicalHash = $(if (Test-Path -LiteralPath $canonicalPath) { (Get-FileHash -LiteralPath $canonicalPath -Algorithm SHA256).Hash } else { '<canonical not found>' })
+"LOADED_PATH=$target"
+"LOADED_SHA256=$loadedHash"
+"CANONICAL_SHA256=$canonicalHash"
+"HASH_MATCH=$($loadedHash -eq $canonicalHash)"
+# Enforced only when the test IS running against the canonical file. Run-Suite.ps1 deliberately
+# executes from an ISOLATED COPY so that the canonical can be edited mid-run without corrupting the
+# result - its own header says "a result gathered from a directory that can change underneath the run
+# is not evidence of anything". Comparing the copy against the LIVE canonical re-read at test time
+# therefore measured a race, not the product: this file threw before a single assertion ran whenever
+# another edit landed during the suite, and the run was reported as "no-assertions" rather than as a
+# pass or a failure. The hashes are still printed above, so a stale copy remains visible.
+# NOT fatal. Run-Suite.ps1 deliberately executes from an ISOLATED COPY so the canonical can be edited
+# mid-run without corrupting the result - its own header says "a result gathered from a directory that
+# can change underneath the run is not evidence of anything". Re-reading the LIVE canonical here and
+# throwing on any difference measured that race instead of the product: this file aborted before a
+# single assertion ran whenever another edit landed during the suite, and was reported as
+# "no-assertions" rather than as a pass or a failure - a test silently not running at all. The hashes
+# are printed above, so a genuinely stale copy is still visible to anyone reading the output.
+if ($loadedHash -ne $canonicalHash) { Write-Host 'NOTE: running against an isolated copy that differs from the current canonical file.' -ForegroundColor DarkYellow }
 $text = Get-Content -LiteralPath $target -Raw
 
 $body = $text -replace '(?m)^\s*#Requires.*$', '' -replace '(?m)^\s*\[CmdletBinding\(.*$', ''
@@ -91,21 +113,19 @@ Assert-That 'a FormatException is not excused' ((Test-mdiIsNotRunError (New-Obje
 Assert-That 'a null error is not excused' ((Test-mdiIsNotRunError $null) -eq $false)
 
 Write-Host 'An operation the stack refuses to attempt at all never ran' -ForegroundColor Cyan
-# An IPv6 address on an IPv4 socket raises either a NotSupportedException (IPAddress overload) or a
-# bare ArgumentException (hostname overload), neither carrying an error code. Rather than list
-# exception types in the shared classifier - which would ship to every DC and excuse ordinary bad
-# arguments - the probers treat the ABSENCE of any SocketException as "never reached the wire".
-# So these must stay UNrecognised by the code-based classifier...
+# A pre-wire local failure can carry no SocketException. Rather than list broad exception types in
+# the shared classifier - which would ship to every DC and excuse ordinary bad arguments - the
+# probers classify that outcome at the socket boundary. A plain exception must remain unrecognised by
+# the numeric code classifier itself...
 Assert-That 'a NotSupportedException is not matched by error code' `
 ((Test-mdiIsNotRunError (New-Object System.NotSupportedException 'This protocol version is not supported.')) -eq $false)
 # ...while the PROBER still reports the same situation as not tested. That is asserted end to end
 # against the real Test-mdiTcpPort below.
 
-Write-Host 'The REAL probers: an IPv6 target on an IPv4 socket is not tested, in every API shape' -ForegroundColor Cyan
-# Loopback only - nothing leaves this machine. ::1 against the IPv4 stack cannot form a connection,
-# which is exactly the dual-stack DC case.
-$tcp = Test-mdiTcpPort -ComputerName '::1' -Port 53 -TimeoutMs 700
-Assert-That 'the TCP probe does not report success' ($tcp.Success -eq $false)
+Write-Host 'The REAL prober: an unresolvable name is not a measured port failure' -ForegroundColor Cyan
+# The reserved .invalid name deterministically resolves to nothing, so no packet can leave this machine.
+$tcp = Test-mdiTcpPort -ComputerName 'never-resolves.invalid' -Port 53 -TimeoutMs 700
+Assert-That 'the unresolved-name probe does not report success' ($tcp.Success -eq $false)
 Assert-That '  ...and marks the result Not tested' ([string] $tcp.Detail -like 'Not tested*') "got '$($tcp.Detail)'"
 Assert-That '  ...and never calls it Closed or Blocked' `
 ([string] $tcp.Detail -notlike '*Closed -*' -and [string] $tcp.Detail -notlike '*Blocked -*') "got '$($tcp.Detail)'"
@@ -132,7 +152,7 @@ Assert-That '  ...while a refused probe is' ((Test-mdiProbeWasMeasured -Record $
 
 # End to end through the real prober: the record the IPv6 probe produces must not be counted either.
 $tcpRecord = [PSCustomObject]@{ Success = [bool] $tcp.Success; Applicable = $true; Detail = [string] $tcp.Detail }
-Assert-That '  ...and the real IPv6 probe record is not counted as measured' `
+Assert-That '  ...and the real unresolved-name probe record is not counted as measured' `
 ((Test-mdiProbeWasMeasured -Record $tcpRecord) -eq $false) "got '$($tcp.Detail)'"
 $ctlRecord = [PSCustomObject]@{ Success = [bool] $ctl.Success; Applicable = $true; Detail = [string] $ctl.Detail }
 Assert-That '  ...while the real IPv4 control record IS counted as measured' `
