@@ -1,5 +1,25 @@
-$sp = Join-Path $PSScriptRoot 'Test-MdiReadiness.ps1'
-if (-not (Test-Path $sp)) { $sp = Join-Path (Split-Path $PSScriptRoot -Parent) 'Test-MdiReadiness.ps1' }
+# The script under test. Sibling first, then parent, so this works both from the repository
+# (tests\ beside the product file's folder) and from the flat copy the suite runs from.
+#
+# -Path is accepted because without it this silently lints THE WRONG FILE. It took no parameters,
+# so an explicit `-Path <frozen build>` was accepted by PowerShell and then ignored, and the run
+# linted whatever happened to sit next to this script instead. Measured on 16 August: a stale copy
+# of the product from two days earlier was sitting in that folder, so three releases were reported
+# "lint clean, 13/13" on evidence taken from a build that was never shipped. A gate that cannot be
+# pointed at its subject is not a gate.
+param ([string] $Path)
+
+$sp = if ($PSBoundParameters.ContainsKey('Path') -and $Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { throw "Test-Lint: -Path not found: $Path" }
+    (Resolve-Path -LiteralPath $Path).Path
+} else {
+    $c = Join-Path $PSScriptRoot 'Test-MdiReadiness.ps1'
+    if (-not (Test-Path $c)) { $c = Join-Path (Split-Path $PSScriptRoot -Parent) 'Test-MdiReadiness.ps1' }
+    $c
+}
+if (-not (Test-Path -LiteralPath $sp)) { "PARSE ERRORS:"; "  L0: no script to lint at $sp"; exit 1 }
+# Named in the output so a reader can see WHICH file produced the verdict.
+"LINTING $sp"
 $t=$null;$e=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile($sp,[ref]$t,[ref]$e)
 if($e){ "PARSE ERRORS:"; $e | ForEach-Object { "  L$($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
