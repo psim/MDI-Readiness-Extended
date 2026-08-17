@@ -2915,7 +2915,36 @@ function Resolve-mdiNnrTarget {
     if ($MaxTargets -gt 0) {
         $byHost = @($targets | Group-Object -Property Name)
         if ($byHost.Count -gt $MaxTargets) {
-            $targets = @($byHost | Select-Object -First $MaxTargets | ForEach-Object { $_.Group })
+            # The budget is spread ACROSS DOMAINS, not spent on the first N hosts of a flat list.
+            #
+            # Main hands this resolver the whole estate - every domain of every forest in scope - so
+            # `Select-Object -First $MaxTargets` gave the entire budget to whichever domain enumerated
+            # first. Measured on an eight-DC estate spanning mdilab.local and fabrikam.local at the
+            # default MaxTargets=5: five targets, ALL mdilab.local, and fabrikam.local contributed no
+            # NNR target at all - while the NNR card still reported a result for the run. A forest
+            # nobody probed is not a forest that passed. Its sibling Resolve-mdiLdapTarget already
+            # samples per domain for precisely this reason.
+            #
+            # One host per domain per pass, in enumeration order, so a single-domain estate selects
+            # exactly the hosts it always did and every additional domain is reached before any domain
+            # takes a second slot.
+            $queues = @($byHost | Group-Object -Property { ([string] @($_.Group)[0].Domain).Trim().TrimEnd('.') } |
+                    ForEach-Object { , @($_.Group) })
+            $picked = New-Object System.Collections.ArrayList
+            $depth = 0
+            while ($picked.Count -lt $MaxTargets) {
+                $tookAny = $false
+                foreach ($queue in $queues) {
+                    if ($depth -lt $queue.Count) {
+                        [void] $picked.Add($queue[$depth])
+                        $tookAny = $true
+                        if ($picked.Count -ge $MaxTargets) { break }
+                    }
+                }
+                if (-not $tookAny) { break }
+                $depth++
+            }
+            $targets = @($picked | ForEach-Object { $_.Group })
         }
     }
     # Returned WITHOUT the comma operator, and every caller wraps the call in @(). ", $x" preserves
@@ -17122,7 +17151,43 @@ function Get-mdiPrimaryDomainAuditing {
     $primary = @($rows | Where-Object {
             (ConvertTo-mdiDomainScopeName -DomainName ([string] $_.Domain)) -eq $targetDomain
         })[0]
-    if ($null -eq $primary) { $primary = @($rows)[0] }
+    # No match. The fallback used to be @($rows)[0] unconditionally - the FIRST row, whichever domain
+    # it belonged to - and the five report properties fed from here (DomainAdfsAuditing,
+    # DomainObjectAuditing, DomainExchangeAuditing, DomainDeletedObjects, DomainSchemaVersion) then
+    # carried ANOTHER domain's measurement under this run's headline domain.
+    #
+    # In a single-domain forest that can never be wrong: $domainsInScope is one name, so row[0] IS the
+    # run's domain however the operator spelled it. That is why it survived - the mismatch needs a
+    # forest with more than one domain in scope AND a -Domain that no row's DNS name equals. Both are
+    # ordinary: -Domain is documented as "Domain Name or FQDN", $domainsInScope is built from the DNS
+    # names discovery returned, and the two disagree whenever the operator supplies the NetBIOS name
+    # of a DISJOINT namespace (DNS fabrikam.local, NetBIOS FABCORP - not a case or trailing-dot
+    # variant, a different string entirely) or names a domain controller instead of its domain.
+    #
+    # Measured on the shipped function with rows for mdilab.local and fabrikam.local:
+    #
+    #   -Domain FABCORP               picked_domain=mdilab.local
+    #   -Domain branch.fabrikam.local picked_domain=mdilab.local
+    #
+    # So the domain the operator asked about was reported using a domain in a DIFFERENT FOREST, across
+    # a trust, with no indication on any surface that a substitution had happened. An unmeasured domain
+    # coming back looking like a measurement is the failure this tool exists to prevent, and here it
+    # arrives through the row selection rather than through the check.
+    #
+    # One row is still accepted, because then there is nothing to confuse it with and the baseline
+    # compatibility this fallback was written for is preserved exactly. With two or more, $null is
+    # returned: the per-domain DomainAuditing list still carries every domain that WAS read, and the
+    # headline properties are blank rather than borrowed. Main already tolerates $null here - it is
+    # what an empty DomainAuditing collection has always produced - and the script sets no StrictMode,
+    # so the property reads yield $null, which every consumer already treats as not measured.
+    if ($null -eq $primary) {
+        if (@($rows).Count -le 1) {
+            $primary = @($rows)[0]
+        } else {
+            Write-mdiWarning ('No directory services configuration was read for {0}; it is not one of the {1} domain(s) that were examined. The domain-level auditing properties are reported as unread rather than taking another domain''s result.' -f $Domain, @($rows).Count)
+            $primary = $null
+        }
+    }
     $primary
 }
 
