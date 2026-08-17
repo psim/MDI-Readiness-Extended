@@ -2707,7 +2707,7 @@ function Get-mdiRequiredPorts {
     }
 
     $applicable = @($details | Where-Object { $_.Applicable -eq $true })
-    $mandatory = @($applicable | Where-Object { $_.Requirement -eq 'Required' })
+    $mandatory = @($applicable | Where-Object { Test-mdiRequirementIsMandatory -Requirement $_.Requirement })
     # Failure means a probe RAN and the port did not answer. Routed through the shared predicate
     # rather than a bare "-not $_.Success", which is truthy for the $null of a probe that never
     # produced a result - so an unmeasured required probe was described to the operator in
@@ -2783,7 +2783,7 @@ function Get-mdiRequiredPorts {
     # green in its most damaging form. It is reported 'N/A' (not measured) rather than $false: nothing
     # was blocked, nothing was tested, and an operator must not be sent to open a firewall for a name
     # that never resolved.
-    $dcRequiredDefined = @($Plan.Probes | Where-Object { $_.Scope -eq 'DomainController' -and $_.Requirement -eq 'Required' }).Count -gt 0
+    $dcRequiredDefined = @($Plan.Probes | Where-Object { $_.Scope -eq 'DomainController' -and (Test-mdiRequirementIsMandatory -Requirement $_.Requirement) }).Count -gt 0
     $nnrDefined = @($Plan.Probes | Where-Object { $_.Group -eq 'NNR' }).Count -gt 0
     $requiredTargetsMissing = ($dcRequiredDefined -and @($Plan.DomainControllers).Count -eq 0) -or
         ($nnrDefined -and @($Plan.NnrTargets).Count -eq 0)
@@ -2892,17 +2892,94 @@ function Resolve-mdiNnrTarget {
                     Write-mdiVerbose "Unable to find '$name' in Active Directory, resolving it with DNS"
                 }
 
+                # The name the OPERATOR supplied, kept so a qualification that turns out to be wrong
+                # can be undone below.
+                $requestedName = $name
                 $name = ConvertTo-mdiCanonicalComputerName -Value $name -Domain $Domain
 
                 # Every address, not the first one. NNR resolves whatever source address the sensor
                 # observed, so a multi-homed host that answers on one NIC and is filtered on another
                 # fails resolution for half its traffic - which a single-address probe cannot see.
                 $addresses = @(Get-mdiComputerAddress -ComputerName $name -KnownAddress $knownIp)
+                # A qualification that resolved to NOTHING is undone before the target is dropped.
+                #
+                # The line above appends -Domain to any name carrying no dot. It can only CHANGE the
+                # name in two situations: the directory lookup SUCCEEDED but returned a blank
+                # DNSHostName, where qualifying with $Domain is correct because the directory just
+                # confirmed the host is in that domain; or the lookup THREW, where we have positive
+                # evidence the host is NOT findable in $Domain and we then staple $Domain onto it
+                # anyway. In the second case the result is a name that cannot exist in DNS, and the
+                # target is dropped from the probe plan with only a warning - so the operator asked
+                # "can the sensor resolve this host?" and the run never tried.
+                #
+                # The cross-forest lab is what makes it ordinary: -NnrTargetComputer names a
+                # workstation while -Domain names the other forest, or names a domain by its
+                # DISJOINT NetBIOS name (DNS fabrikam.local, NetBIOS FABCORP - not a case or
+                # trailing-dot variant, a different string entirely, which is not a DNS suffix at
+                # all). A bare short name still resolves through the client's DNS suffix search list
+                # and NetBIOS, so qualifying it DESTROYS a name that would have resolved. Measured
+                # on the shipped function, one host whose bare name resolves to two addresses:
+                #
+                #   -Domain <empty>          2 targets
+                #   -Domain fabrikam.local   DROPPED
+                #   -Domain FABCORP          DROPPED
+                #
+                # The qualified spelling stays PREFERRED, so every case where qualification helps -
+                # including the blank-DNSHostName path above - is unchanged. Only a qualification
+                # that resolved to nothing is reconsidered, and a target that resolves under NEITHER
+                # spelling is still dropped: inventing a target nobody can reach would be the worse
+                # failure, and this must not manufacture one.
+                if ($addresses.Count -eq 0) {
+                    $bareName = ConvertTo-mdiCanonicalComputerName -Value $requestedName
+                    if (-not [string]::IsNullOrWhiteSpace([string] $bareName) -and $bareName -ne $name) {
+                        $bareAddresses = @(Get-mdiComputerAddress -ComputerName $bareName -KnownAddress $knownIp)
+                        if ($bareAddresses.Count -gt 0) {
+                            Write-mdiVerbose ('{0} did not resolve; using the name as supplied, {1}' -f $name, $bareName)
+                            $name = $bareName
+                            $addresses = $bareAddresses
+                        }
+                    }
+                }
                 if ($addresses.Count -eq 0) {
                     Write-mdiWarning ('Unable to resolve the NNR target computer {0}' -f $name)
                 } else {
+                    # The domain each target belongs to, TAGGED FROM THE NAME THAT ACTUALLY RESOLVED.
+                    #
+                    # The MaxTargets cap below spreads the budget across domains by reading .Domain
+                    # off each target. Domain-controller targets carry it - Get-mdiDomainControllerInventory
+                    # stamps every row with the domain it was enumerated from - but these
+                    # operator-supplied ones never did, so they all grouped under one empty key and
+                    # the cap silently degraded to "the first N hosts of a flat list": exactly the
+                    # behaviour the spreading below was written to replace, still in force for
+                    # whichever targets the operator chose by hand.
+                    #
+                    # Measured on an eight-host list spanning mdilab.local and fabrikam.local at the
+                    # default MaxTargets=5, the six mdilab.local hosts listed first:
+                    #
+                    #   domain-controller targets   5 sampled, 2 of them fabrikam.local
+                    #   operator-supplied targets   5 sampled, 0 of them fabrikam.local
+                    #
+                    # Same estate, same cap, and the NNR card still reported a result for the run.
+                    # A forest nobody probed is not a forest that passed.
+                    #
+                    # It is read off $name - the spelling that actually resolved - and NOT off
+                    # -Domain. -Domain can name a different forest from the host being probed, and
+                    # can be a DISJOINT NetBIOS name (fabrikam.local is FABCORP), which is not a DNS
+                    # suffix at all; the bare-name undo above may also have just discarded the
+                    # qualified spelling in favour of one carrying no suffix. A name with no dot, and
+                    # a target supplied as a bare IP address, both yield $null - unknown is what they
+                    # are, and $null is what they already grouped as, so a single-domain estate
+                    # selects exactly the hosts it always did.
+                    $targetDomain = $null
+                    if ($null -eq (ConvertTo-mdiCanonicalIPAddress -Value $name)) {
+                        $dotIndex = ([string] $name).IndexOf('.')
+                        if ($dotIndex -gt 0 -and $dotIndex -lt (([string] $name).Length - 1)) {
+                            $suffix = ([string] $name).Substring($dotIndex + 1).Trim().TrimEnd('.')
+                            if (-not [string]::IsNullOrWhiteSpace($suffix)) { $targetDomain = $suffix }
+                        }
+                    }
                     foreach ($address in $addresses) {
-                        [PSCustomObject]@{ Name = $name; IP = $address; MultiHomed = ($addresses.Count -gt 1) }
+                        [PSCustomObject]@{ Name = $name; IP = $address; MultiHomed = ($addresses.Count -gt 1); Domain = $targetDomain }
                     }
                 }
             })
@@ -5045,7 +5122,40 @@ function Get-mdiPrincipalKind {
         #
         # -contains over the collection, case-insensitively: LDAP class names are case-insensitive and
         # the structural class is not guaranteed to be last on every object.
-        if (@($principal.objectClass) -contains 'group') { return 'Group' }
+        #
+        # Classified only from class names that were actually READ, and only as STRINGS. The lookup
+        # succeeding is not the same as the class being readable: objectClass comes back $null when a
+        # server did not return the requested property, and an element that is not a string is not a
+        # class name at all. Both used to fall through to the definite "NonGroup" - a value nobody
+        # read presented as a measurement - and @($true) -contains 'group' is TRUE in PowerShell,
+        # because -contains coerces the right operand to the left element's type and a non-empty
+        # string converts to $true, so an unreadable objectClass could equally be reported as a
+        # definite Group.
+        $class = @(@($principal.objectClass) |
+                Where-Object { $_ -is [string] -and -not [string]::IsNullOrWhiteSpace($_) } |
+                ForEach-Object { $_.Trim().ToLowerInvariant() })
+        if ($class.Count -eq 0) { return 'Unknown' }
+
+        if ($class -contains 'group') { return 'Group' }
+
+        # A foreignSecurityPrincipal is a STUB, not a principal. When a trustee lives in another
+        # forest across a trust, the local directory holds only this placeholder carrying the foreign
+        # SID; the object's real class exists solely in the foreign directory, which is precisely the
+        # "in a trust this host cannot query" case the header names as Unknown. The header assumed
+        # such a lookup would FAIL and reach the catch block, but it SUCCEEDS - the stub is a genuine
+        # local object - so a cross-forest GROUP was answered 'NonGroup' with full confidence. The
+        # Deleted Objects check then treats it as a definite non-match, which is the destructive false
+        # red this function exists to prevent, now reached by any cross-forest delegation. Every
+        # domain also carries these stubs for well-known SIDs such as S-1-5-11 Authenticated Users,
+        # which is a group and was likewise answered NonGroup.
+        if ($class -contains 'foreignsecurityprincipal') { return 'Unknown' }
+
+        # Everything else that was READ is a non-group. Restricting this to a list of recognised
+        # principal classes looked safer and was wrong: groupPolicyContainer is a definite non-group
+        # this codebase already pins a test on - the class whose NAME contains 'group' and which
+        # -contains must not match - and a whitelist turned that measured answer into 'not measured'.
+        # The two guards above are the ones with evidence behind them; the rest of the classification
+        # is unchanged from the shipped behaviour.
         return 'NonGroup'
     } catch {
         Write-mdiVerbose ('Unable to determine whether trustee {0} is a group: {1}' -f $Name, $_.Exception.Message)
@@ -10333,10 +10443,36 @@ function Get-mdiDomainControllerReadiness {
         # The FQDN suffix is only a compatibility fallback for a row whose directory DN could not be read.
         # It normally agrees with the AD domain; a disjoint namespace is why it cannot outrank the DN.
         # A short name carries no domain information, so the requested scope remains the final fallback.
+        #
+        # An IP ADDRESS is not a DNS name and carries no domain information either. The suffix branch
+        # asked only whether the text contained a dot, and an IPv4 literal does, so the leftmost octet
+        # was stripped and the remainder stamped on the row as a domain nobody read. Naming a
+        # controller by address is the ordinary way to reach one across the fabrikam.local trust,
+        # where this forest's DNS holds no record for it, and ConvertTo-mdiCanonicalComputerName is
+        # DESIGNED to pass an address through unchanged - so the address arrives here intact.
+        #
+        # Measured on the shipped function, -Domain fabrikam.local:
+        #
+        #   -DomainController 10.10.1.50              Domain=10.1.50          INVENTED
+        #   -DomainController 10.10.1.51.             Domain=10.1.51          INVENTED
+        #   -DomainController fd00::50                Domain=fabrikam.local   correct
+        #   -DomainController DCFAB01                 Domain=fabrikam.local   correct
+        #   -DomainController dcfab01.fabrikam.local  Domain=fabrikam.local   correct
+        #
+        # IPv6 already behaved correctly for the accidental reason that it carries no dots, so the two
+        # address families disagreed about the same host. Downstream, Get-mdiUnexaminedDomain decides
+        # domain COVERAGE on exactly this field: fed the 10.1.50 row it reported fabrikam.local as
+        # never examined, so the domain whose controller HAD just been scanned was charged as a gap -
+        # a false red - while the report gained a per-domain heading for a domain that does not exist.
+        #
+        # ConvertTo-mdiCanonicalIPAddress is the existing strict test (four-part dotted decimal, or a
+        # colon for IPv6); it deliberately rejects the inet_addr forms, so a numeric HOST NAME is
+        # still treated as a name and keeps its suffix.
         $dcFqdn = ([string] $dc.FQDN).Trim().TrimEnd('.').Trim()
+        $dcFqdnIsAddress = $null -ne (ConvertTo-mdiCanonicalIPAddress -Value $dcFqdn)
         $dc['Domain'] = if (-not [string]::IsNullOrWhiteSpace([string] $dc.DirectoryDomain)) {
             ([string] $dc.DirectoryDomain).Trim().TrimEnd('.')
-        } elseif ($dcFqdn -match '\.') {
+        } elseif (-not $dcFqdnIsAddress -and $dcFqdn -match '\.') {
             $dcFqdn.Substring($dcFqdn.IndexOf('.') + 1)
         } else {
             $Domain
@@ -11479,6 +11615,59 @@ function Get-mdiRequirementRank {
     }
 }
 
+function Test-mdiRequirementIsMandatory {
+    <#
+        Whether a probe's Requirement is one of the MANDATORY classes - the ones whose measured
+        failure blocks the verdict. THE definition, in one place.
+
+        This test was written inline seven times as `-eq 'Required'`, and two more times, correctly,
+        as `-in @('Required', 'All')`. Nine copies of one rule is how the copies drift, and these had
+        already drifted in both directions at once:
+
+          'All' ranks 3 on the scale above - "every one must pass, and a measured failure blocks the
+          verdict" - and Get-mdiBlockingPortFailure and Get-mdiUnmeasuredRequiredProbe both include
+          it deliberately; the note beside PortsRequiredUntested even states the rule, that an inline
+          "-eq 'Required'" silently drops Requirement = 'All' probes. Its three sibling counters on
+          the lines immediately above it were left on the inline literal, so an All-class port was
+          counted by one statistic and not by the other three beside it.
+
+          And PowerShell's -eq coerces its RIGHT operand to the LEFT operand's type, so when
+          Requirement arrives as the BOOLEAN $true - which ConvertFrom-Json produces from
+          "Requirement":true - `$true -eq 'Required'` evaluates 'Required' AS A BOOLEAN, finds a
+          non-empty string, and returns TRUE. A value nobody could read was therefore promoted to a
+          blocking requirement. That is not hypothetical on this path: Requirement makes a full JSON
+          round trip - the plan is serialised to the sensor, the results are parsed back with
+          ConvertFrom-Json - and nothing re-stamps it from the plan afterwards; the only Add-Member
+          on that path adds ProbedFrom. This file already carries a fix for a previous defect of
+          exactly this class, where a JSON round trip emptied Requirement and a refused required port
+          stopped counting as a required failure.
+
+        Measured on the shipped functions, one sensor with LDAPS 636 REFUSED to dcfab01.fabrikam.local
+        and nothing differing but the Requirement spelling:
+
+            Requirement    rank   "needs attention" cell   PortsRequiredFail   mandatory?
+            'Required'      3     red                      1                   yes
+            'All'           3     amber                    0                   NO
+            $true           0     red                      1                   YES
+            'Optional'      0     amber                    0                   no
+
+        So a blocking port was painted advisory and counted zero, and an unreadable value was painted
+        blocking and charged as a required failure - while Get-mdiBlockingPortFailure, which decides
+        the verdict, disagreed with all three surfaces about both rows.
+
+        -MultiForest is what puts real traffic on this path: it promotes LdapsTcp and LdapsGcTcp from
+        Optional to Required, so in a cross-forest estate the LDAPS records that decide readiness are
+        exactly the ones whose Requirement travels the JSON round trip.
+
+        Routed through Get-mdiRequirementRank, which is the existing scale and already ranks 'All'
+        with 'Required' and anything unrecognised - a boolean included - at 0.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Requirement
+    )
+    (Get-mdiRequirementRank -Requirement $Requirement) -eq 3
+}
+
 function Get-mdiPortRecordRank {
     <#
         How much evidence a probe record carries, so two roles' copies of the same probe can be merged
@@ -12566,7 +12755,7 @@ function Get-mdiUnmeasuredRequiredProbe {
     # failure by the blocking layer and not counted here at all - so a probe that produced no result
     # was reported as a blocked port rather than as a gap to re-measure.
     @($Record | Where-Object {
-            $_.Requirement -in @('Required', 'All') -and $_.Applicable -ne $false -and
+            (Test-mdiRequirementIsMandatory -Requirement $_.Requirement) -and $_.Applicable -ne $false -and
             -not (Test-mdiProbeWasMeasured -Record $_)
         })
 }
@@ -12712,8 +12901,21 @@ function Get-mdiUnexaminedDomain {
     $scoped = @($ScopedDomain | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })
     if ($scoped.Count -eq 0) { return @() }
 
+    # A DISCOVERY PLACEHOLDER is not a server that was examined. It is a directory record the scan
+    # could not name, could not address and never contacted - Test-mdiServerIsProbeCandidate already
+    # excludes it because "it is not a machine at all", and the server-count KPIs already exclude it.
+    # Counting its Domain as coverage let a domain nobody looked at come back looking like a domain
+    # that was measured, which is precisely what this function exists to prevent.
+    #
+    # Measured on the shipped function, scope mdilab.local + fabrikam.local with mdilab.local scanned
+    # normally and fabrikam.local contributing only two unnamed-record placeholders: this function
+    # returned NOTHING, so the issue list raised no Discovery finding for fabrikam.local, the verdict
+    # computed $domainsExamined = $true, and the statistics never charged the domain-level unread
+    # check. A domain in a second forest whose controllers were never contacted was reported as
+    # examined on all three surfaces that share this definition.
     $examined = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($srv in @($Server | Where-Object { $_ })) {
+        if (Test-mdiServerIsPlaceholder -Server $srv) { continue }
         $d = & $normalise $srv.Domain
         if (-not [string]::IsNullOrWhiteSpace($d)) { [void] $examined.Add($d) }
     }
@@ -12737,6 +12939,13 @@ function Get-mdiUnexaminedDomain {
     if ($null -ne $DomainControllerServer) {
         $dcDomains = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         foreach ($dc in @($DomainControllerServer | Where-Object { $_ })) {
+            # Same exclusion as above, and it is this loop that matters most: the unnamed-record
+            # placeholders are emitted BY the domain controller pass, so they arrive here carrying
+            # the very domain they could not be contacted in. This is the same false green the
+            # narrowing below was written for - a role that proves nothing about a domain's
+            # controllers marking that domain covered - reached through a domain controller record
+            # that returned but could not be named, rather than through a certification authority.
+            if (Test-mdiServerIsPlaceholder -Server $dc) { continue }
             $d = & $normalise $dc.Domain
             if (-not [string]::IsNullOrWhiteSpace($d)) { [void] $dcDomains.Add($d) }
         }
@@ -13350,14 +13559,17 @@ function Get-mdiReportStatistics {
         PortsTotal        = $portRecords.Count
         PortsOpen         = @($portTested | Where-Object { $_.Success }).Count
         PortsBlocked      = @($portTested | Where-Object { -not $_.Success }).Count
-        PortsRequiredFail = @($portTested | Where-Object { -not $_.Success -and $_.Requirement -eq 'Required' }).Count
+        PortsRequiredFail = @($portTested | Where-Object { -not $_.Success -and (Test-mdiRequirementIsMandatory -Requirement $_.Requirement) }).Count
         # The "Required ports open" KPI headline must describe the SAME population as its sub-label
         # (which counts Required-only failures). PortsOpen/PortsBlocked count every Requirement class
         # - Optional, Recommended and AtLeastOne (NNR) included - so a headline built from them could
         # not be reconciled with a Required-only sub-label. These two count Required probes only, and
         # PortsRequiredTested - PortsRequiredOpen equals PortsRequiredFail exactly.
-        PortsRequiredOpen   = @($portTested | Where-Object { $_.Success -and $_.Requirement -eq 'Required' }).Count
-        PortsRequiredTested = @($portTested | Where-Object { $_.Requirement -eq 'Required' }).Count
+        # Both routed through the shared mandatory predicate, for the same reason the note on
+        # PortsRequiredUntested below gives: an inline "-eq 'Required'" silently drops Requirement =
+        # 'All' probes, and promotes a Requirement that arrived from JSON as a boolean.
+        PortsRequiredOpen   = @($portTested | Where-Object { $_.Success -and (Test-mdiRequirementIsMandatory -Requirement $_.Requirement) }).Count
+        PortsRequiredTested = @($portTested | Where-Object { Test-mdiRequirementIsMandatory -Requirement $_.Requirement }).Count
         PortsUntested     = @($portRecords | Where-Object { -not (Test-mdiProbeWasMeasured -Record $_) }).Count
         # Required-only unmeasured count, for the same reason PortsRequiredOpen/PortsRequiredTested
         # exist. PortsUntested counts every Requirement class, so the "Required ports open" sub-label
@@ -13555,11 +13767,16 @@ function Get-mdiBlockingPortFailure {
 
     $blocking = New-Object -TypeName System.Collections.ArrayList
 
-    foreach ($rec in @($measured | Where-Object { $_.Requirement -in @('Required', 'All') -and -not $_.Success })) {
+    foreach ($rec in @($measured | Where-Object { (Test-mdiRequirementIsMandatory -Requirement $_.Requirement) -and -not $_.Success })) {
         [void] $blocking.Add(($rec | Select-Object -Property *, @{ N = 'BlockingKind'; E = { 'Required' } }))
     }
 
-    $atLeastOne = @($applicable | Where-Object { $_.Requirement -eq 'AtLeastOne' })
+    # Rank 2 is AtLeastOne on the shared scale. A literal "-eq 'AtLeastOne'" was the one comparison
+    # in this function that PowerShell's boolean coercion still reached: a record whose Requirement
+    # arrived from JSON as $true satisfies `$true -eq 'AtLeastOne'` (the string is evaluated AS a
+    # boolean and is non-empty), so an unreadable value was judged as an NNR group member and could
+    # be reported as "no NNR method could resolve X" - a name-resolution failure nobody measured.
+    $atLeastOne = @($applicable | Where-Object { (Get-mdiRequirementRank -Requirement $_.Requirement) -eq 2 })
     # Group-Object collapses ALL null key values into a single shared group, so two records that
     # should be distinct - a measured success and a measured failure that merely happen to share a
     # null Server, Target or TargetIP - merge, and the success then rescues the failure. That is a
@@ -15124,8 +15341,57 @@ function Get-mdiRequiredPortsHtml {
                     # colour from whichever happened to sort first, so a genuinely blocked REQUIRED
                     # port was painted amber (advisory) because a different server's probe for the
                     # same port was optional.
-                    $rowRequirement = @($failed.Requirement | Where-Object { $_ }) + @($srvRecords.Requirement | Where-Object { $_ })
-                    $class = if (@($rowRequirement)[0] -eq 'Required') { 'red' } else { 'amber' }
+                    #
+                    # ...and it is the STRONGEST requirement among this server's failing records, not
+                    # the first one they happen to yield. Narrowing the scope from "every server" to
+                    # "this server" fixed half of this defect and left the other half on the same
+                    # line: [0] is still whichever record sorts first, so one SERVER holding two
+                    # requirements for one probe id reproduces the original symptom one scope down.
+                    #
+                    # That is precisely what a cross-forest estate produces. LdapsTcp and LdapsGcTcp
+                    # ship Optional and are promoted to Required in a -MultiForest plan, so a report
+                    # carrying both a same-forest and a cross-forest result set for one sensor - a
+                    # merged estate, a re-run, a JSON report from another tool - carries both
+                    # spellings under one server. Measured on the shipped function, one sensor with
+                    # two REFUSED LDAPS probes, Optional to dc01.mdilab.local and Required to
+                    # dcfab01.fabrikam.local, the only difference being the order they arrive in:
+                    #
+                    #   Optional record first   label=Required   cell=amber
+                    #   Required record first   label=Required   cell=red
+                    #
+                    # So a required port proven refused was painted amber - advisory - underneath a
+                    # row heading that correctly said Required. The colour is what an operator reads
+                    # first, and here it said do not bother while the label said act. The row label
+                    # three lines below was already fixed onto Get-mdiRequirementRank for the very
+                    # same reason; this is that fix applied to the cell it sits above.
+                    #
+                    # Ranking also stops an UNREADABLE value winning by position. Measured with a
+                    # readable Required failure beside a failing record whose Requirement was
+                    # whitespace, the number 636, or 'Required.' - all shapes an -AsJson round trip or
+                    # a hand-edited report produces - every one of them painted the cell amber,
+                    # because [0] picked the unreadable record and it is not equal to 'Required'. A
+                    # value nobody could read must never downgrade a measured failure beside it.
+                    #
+                    # 'Optional' is RECOGNISED even though it ranks 0, and the two must not be
+                    # conflated. A first attempt at this fix kept only rank > 0 and fell back to the
+                    # server's other records when nothing survived - which turned the honest amber of
+                    # "the Optional probe failed and the Required one is open" into red, by borrowing
+                    # the requirement of a probe that PASSED. Measured: that case went amber -> red.
+                    # The fallback exists for a failing record carrying no readable requirement at
+                    # all, not for one that legitimately says Optional.
+                    #
+                    # AtLeastOne stays amber deliberately, as the line above says: rank 3 (Required or
+                    # All) is the only class that blocks, and a failed NNR method is judged per target
+                    # below.
+                    $isReadable = { param($v) (Get-mdiRequirementRank -Requirement $v) -gt 0 -or ([string] $v).Trim() -ieq 'Optional' }
+                    $failedRequirement = @($failed.Requirement | Where-Object { & $isReadable $_ })
+                    $rowRequirement = if (@($failedRequirement).Count -gt 0) {
+                        $failedRequirement
+                    } else {
+                        @($srvRecords.Requirement | Where-Object { & $isReadable $_ })
+                    }
+                    $strongest = @($rowRequirement | Sort-Object -Property @{ Expression = { Get-mdiRequirementRank -Requirement $_ } } -Descending)[0]
+                    $class = if ((Get-mdiRequirementRank -Requirement $strongest) -eq 3) { 'red' } else { 'amber' }
                     $tooltip = (@(foreach ($f in $failed) {
                                 (Get-mdiTargetLabel -Target ([string] $f.Target) -TargetIP ([string] $f.TargetIP)) +
                                     ': ' + [string] $f.Detail
@@ -15135,7 +15401,48 @@ function Get-mdiRequiredPortsHtml {
             }
         }
 
-        $requirement = @($probeRecords | Select-Object -ExpandProperty Requirement -Unique)[0]
+        # The row's Requirement is the STRONGEST any server reported for this probe, not the first
+        # value that happened to sort first across every server in the table.
+        #
+        # This is the same defect the CELL COLOUR above was already fixed for, left behind on the
+        # label beside it: that fix moved off $probeRecords[0] because "a row where one server's
+        # probe is Optional and another's is Required took its colour from whichever happened to
+        # sort first", and this line still read exactly that way. Measured on the shipped function
+        # with two servers - LDAPS Optional and open on dc01.mdilab.local, Required and REFUSED on
+        # dcfab01.fabrikam.local - the only difference being the order the servers arrive in:
+        #
+        #   dc01 first     label=Optional   cells=green,red
+        #   dcfab01 first  label=Required   cells=green,red
+        #
+        # Identical estate, identical measurements, two different headings; and in the first the
+        # operator reads "Optional" over a red cell that is a blocking required port. The cells were
+        # right in both, which is what makes the label dangerous rather than merely inconsistent -
+        # the colour says act, the label says do not bother.
+        #
+        # -MultiForest is what produces the mixed state: LdapsTcp and LdapsGcTcp ship as Optional and
+        # are promoted to Required in a multi-forest plan, so a report covering both a same-forest
+        # and a cross-forest scan carries both spellings for one probe id.
+        #
+        # Get-mdiRequirementRank is the existing scale (Required/All 3, AtLeastOne 2, Recommended 1,
+        # Optional or unrecognised 0) and already exists precisely so "two roles that describe the
+        # same probe differently merge to the stronger one instead of to whichever was read first".
+        #
+        # A value that ranks 0 is either a genuine Optional or something unreadable, and those must
+        # not be told apart by guessing: the shipped definition is preferred when the records offer
+        # nothing recognised, and only a probe with no shipped definition AND no readable requirement
+        # is labelled Unknown. Without that filter a record carrying 636 or True - which an -AsJson
+        # round trip, a hand-edited report or another tool can produce - was printed verbatim as the
+        # requirement of the row.
+        $rankedRequirement = @($probeRecords | Select-Object -ExpandProperty Requirement |
+                Where-Object { (Get-mdiRequirementRank -Requirement $_) -gt 0 } |
+                Sort-Object -Property @{ Expression = { Get-mdiRequirementRank -Requirement $_ } } -Descending)
+        $requirement = if ($rankedRequirement.Count -gt 0) {
+            [string] $rankedRequirement[0]
+        } elseif (-not [string]::IsNullOrWhiteSpace([string] $probe.Requirement)) {
+            [string] $probe.Requirement
+        } else {
+            'Unknown'
+        }
         [void] $lines.Add(('<tr><td style="text-align:left" title="{0}">{1}<br/><small>{2}</small></td><td>{3}</td><td>{4}</td><td>{5}</td>{6}</tr>' -f
                 (ConvertTo-mdiHtmlEncoded $probe.Notes), (ConvertTo-mdiHtmlEncoded $probe.Name), (ConvertTo-mdiHtmlEncoded $requirement),
                 (ConvertTo-mdiHtmlEncoded $probe.Protocol), (ConvertTo-mdiHtmlEncoded $probe.Port), (ConvertTo-mdiHtmlEncoded $probe.Scope), ($cells -join '')))
@@ -15256,7 +15563,15 @@ function Get-mdiRequiredPortsHtml {
         # 10, 135, 3389, 389, 53, 9 instead of 9, 10, 53, 135, 389, 3389. The same cast is already
         # applied to LatencyMs a few lines below for exactly this reason.
         foreach ($failure in ($failures | Sort-Object Server, @{ Expression = { [int] ($_.Port -as [int]) } }, Port, Target)) {
-            $class = if ($failure.Requirement -eq 'Required') { 'red' } else { 'amber' }
+            # The STRONGEST class this record expresses, on the shared scale, not the literal string
+            # 'Required'. This is the third surface in this function to be moved off that literal -
+            # the port row label and the per-server cell colour above were moved for the same reason
+            # - and it failed in both directions at once: a record carrying 'All', which ranks 3 and
+            # which Get-mdiBlockingPortFailure blocks the verdict on, was painted AMBER (advisory);
+            # and a Requirement that arrived from the JSON round trip as the boolean $true was
+            # painted RED, because `$true -eq 'Required'` evaluates the string as a boolean and
+            # returns true. The Requirement column beside it then printed "True" as the requirement.
+            $class = if (Test-mdiRequirementIsMandatory -Requirement $failure.Requirement) { 'red' } else { 'amber' }
             # A record that carries no requirement is said to carry none. Left blank it would read as
             # "not required", which is the more dangerous of the two readings to guess at.
             $requirementText = if ([string]::IsNullOrWhiteSpace([string] $failure.Requirement)) { 'Not stated' }
