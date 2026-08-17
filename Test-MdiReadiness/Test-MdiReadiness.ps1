@@ -10112,7 +10112,19 @@ function Get-DomainSchemaVersion {
         $value = $schema.Properties['objectVersion'].Value
         if ($null -ne $value) { $schemaVersion = [int] $value }
     } catch {
-        Write-mdiWarning ('Unable to read the Active Directory schema version of {0}: {1}' -f $Domain, ($_.Exception.Message -replace '[\r\n]+', ' '))
+        # Diagnosed rather than relayed. A lazily-bound DirectoryEntry that cannot reach the target
+        # does not fail at construction - it fails at the first property read, and PowerShell reports
+        # that as "Cannot index into a null array", which is an implementation detail of this function
+        # and tells the reader nothing they can act on. Measured against fabrikam.local across a forest
+        # trust: the run printed that exact text twice, directly beneath a sibling message that
+        # correctly explained the same underlying condition as "Unable to contact the server. This may
+        # be because this server does not exist, it is currently down, or it does not have the Active
+        # Directory Web Services running." Two messages about one cause, one of them useless.
+        $reason = $_.Exception.Message -replace '[\r\n]+', ' '
+        if ($reason -match 'Cannot index into a null array|Object reference not set') {
+            $reason = 'the directory did not answer, so the schema could not be read. The domain may not exist, may be unreachable from this machine, or may not permit this account to read it.'
+        }
+        Write-mdiWarning ('Unable to read the Active Directory schema version of {0}: {1}' -f $Domain, $reason)
     } finally {
         # Guarded for the same reason as Get-mdiDsSacl: disposing a lazily bound DirectoryEntry can
         # throw, and a throw inside a finally would discard the whole run at this point.
