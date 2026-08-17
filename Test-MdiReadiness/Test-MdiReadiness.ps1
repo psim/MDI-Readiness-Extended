@@ -2506,7 +2506,12 @@ function New-mdiRemoteScriptFile {
 function Get-mdiRequiredPorts {
     param (
         [Parameter(Mandatory = $true)] [string] $ComputerName,
-        [Parameter(Mandatory = $true)] [object] $Plan
+        [Parameter(Mandatory = $true)] [object] $Plan,
+        # Whether the CALLER knows this server is a domain controller. The reverse-direction fallback
+        # below has to decide that question to know whether the DomainController-scoped probes apply,
+        # and it could only ever guess at it from the plan's target list. The domain controller pass
+        # does not have to guess - see the fallback for the measurement.
+        [Parameter(Mandatory = $false)] [switch] $IsDomainController
     )
 
     $probeCount = @($Plan.Probes).Count
@@ -2609,9 +2614,40 @@ function Get-mdiRequiredPorts {
         # In this direction the probes test what is reachable *inbound* to the server. Ports scoped to
         # DomainController (LDAP and Global Catalog) are only ever served by a domain controller, so probing
         # them against a CA, Entra Connect or member server always fails and would be reported as a blocked
-        # required port. They are kept only when the server being tested is itself a domain controller - which
-        # is established from the sample by name or by any address the server answers on.
-        $isDomainController = @($Plan.DomainControllers | Where-Object {
+        # required port. They are kept only when the server being tested is itself a domain controller.
+        #
+        # Which the CALLER states when it knows, and only otherwise is inferred from the plan.
+        #
+        # The inference reads $Plan.DomainControllers, and that list is not the domain controller
+        # population - it is the LDAP probe SAMPLE, capped by -MaxLdapTargetsPerDomain, which
+        # DEFAULTS TO 2. So on any domain holding more than two controllers a real domain controller
+        # is routinely absent from it, and the fallback then concluded it was not a domain controller
+        # at all. mdilab.local holds five, so this is what an ordinary default run does; and the
+        # fallback is itself the ordinary path across a forest trust, where remote WMI usually cannot
+        # run.
+        #
+        # Measured on the shipped functions, the six-controller estate the extended lab now has
+        # (five in mdilab.local, dcfab01 in fabrikam.local), -MultiForest, -MaxLdapTargetsPerDomain
+        # at its default of 2, both servers probed inbound from the same computer with every socket
+        # answering open:
+        #
+        #   dc01.mdilab.local (in the sample)   5 DomainController probes, 5 MEASURED
+        #   dc03.mdilab.local (not sampled)     5 DomainController probes, 0 measured
+        #
+        # Identical estate, identical reachability, and the only difference between the two servers
+        # is which of them the sampler happened to pick. Each of the five - LDAP 389 TCP and UDP,
+        # Global Catalog 3268, and LDAPS 636 and LDAPS-GC 3269, both promoted to REQUIRED by
+        # -MultiForest - was recorded against dc03 with the reason "this probe measures the
+        # DomainController scope, which cannot be established by probing the server inbound from this
+        # computer". That reason is false: the scope was established for dc01 from the same computer
+        # in the same run. A measurement that was available was reported as one that could not be
+        # taken, on every domain controller past the second in its domain.
+        #
+        # The sample-based inference is KEPT as the fallback for callers that say nothing, so a
+        # server which is not part of the domain controller pass but does appear in the plan's target
+        # list is unaffected.
+        $isDomainController = [bool] $IsDomainController -or
+            @($Plan.DomainControllers | Where-Object {
                 $dcAddress = ConvertTo-mdiCanonicalIPAddress -Value $_.IP
                 $_.Name -eq $ComputerName -or
                     ($null -ne $computerAddress -and $dcAddress -eq $computerAddress) -or
@@ -2868,6 +2904,61 @@ function New-mdiPortProbePlan {
     }
 }
 
+function Get-mdiProbeTargetKey {
+    <#
+        The identity a probe target is SAMPLED and MATCHED by: its name IN ITS OWN DOMAIN.
+
+        Resolve-mdiNnrTarget and Resolve-mdiLdapTarget both reduce the estate to "one entry per
+        host" before spending a budget across domains, and both did it with
+        `Group-Object -Property Name` - the bare spelling, with the row's Domain discarded. The
+        domain was then used to CHOOSE and never to MATCH, so two domain controllers in different
+        domains carrying the same Name were one host to the sampler.
+
+        Across a forest trust that is ordinary rather than contrived. mdilab.local and
+        fabrikam.local are separate namespaces that may each hold a "dc01", and a row reaches these
+        functions carrying a BARE name whenever the enumerated name did not resolve under its
+        qualified spelling (Get-mdiDomainControllerInventory undoes the qualification) or the record
+        had no dNSHostName (Resolve-mdiDomainController falls back to Name).
+
+        Measured on the shipped functions, a five-DC mdilab.local estate plus a single
+        fabrikam.local domain controller whose bare name collides with an mdilab.local one:
+
+            Resolve-mdiLdapTarget -MaxPerDomain 2   2 targets, domains: mdilab.local
+            Resolve-mdiNnrTarget  -MaxTargets 5     5 targets, domains: mdilab.local
+
+        fabrikam.local received NO LDAP target and NO NNR target at all - the colliding row was
+        discarded before the per-domain spreading those functions exist for ever ran - while the
+        LDAP and NNR cards still reported a result for the run. A forest nobody probed is not a
+        forest that passed, which is the reason the spreading was written in the first place.
+
+        The same collapse also broke the CAP itself: the host count under-counted, so an estate
+        holding one colliding name returned SIX targets for -MaxTargets 5, the group being expanded
+        to both of its rows after being counted as one.
+
+        ConvertTo-mdiCanonicalComputerName owns the rule, exactly as it does for
+        Get-mdiAddresslessDomainController: it qualifies a dotless name with the row's own domain,
+        leaves an already-qualified name alone, returns a bare IP address unchanged rather than
+        stapling a domain onto it, and returns nothing for a name that cannot be read. A row that
+        yields no key keys as the empty string, which is what an unnameable row already did, so it
+        is neither merged into a named host nor dropped.
+
+        Domain is COERCED to a string here rather than handed straight to the -Domain parameter,
+        which is typed [string]. An inventory row can carry a wrong type - a collection, a number -
+        and PowerShell cannot bind an Object[] to a [string] parameter, so passing it through raised
+        a parameter-transformation error. The samplers previously grouped on Name alone and never
+        touched Domain, so such a row survived; making the identity domain-aware must not turn a row
+        that was merely unreadable into an exception that ends the whole resolution. Measured on a
+        six-row estate holding one row whose Domain was @('fabrikam.local'): five targets before,
+        and a thrown "Cannot process argument transformation on parameter 'Domain'" after.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Target
+    )
+
+    if ($null -eq $Target) { return '' }
+    [string] (ConvertTo-mdiCanonicalComputerName -Value $Target.Name -Domain ([string] $Target.Domain))
+}
+
 function Resolve-mdiNnrTarget {
     param (
         [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $DomainControllers,
@@ -2990,7 +3081,12 @@ function Resolve-mdiNnrTarget {
     # The cap counts HOSTS, not addresses. Truncating a flat list of addresses would silently drop the
     # second NIC of the last host in the sample - the exact address most likely to be the one failing.
     if ($MaxTargets -gt 0) {
-        $byHost = @($targets | Group-Object -Property Name)
+        # Grouped by the host's identity IN ITS OWN DOMAIN, not by its bare Name. Two domain
+        # controllers in different domains sharing a Name are two hosts; counting them as one both
+        # under-counted against the cap and, worse, attributed the merged group to whichever domain
+        # happened to enumerate first - so the other domain lost its only NNR target before the
+        # per-domain spreading below ever ran. See Get-mdiProbeTargetKey for the measurement.
+        $byHost = @($targets | Group-Object -Property { Get-mdiProbeTargetKey -Target $_ })
         if ($byHost.Count -gt $MaxTargets) {
             # The budget is spread ACROSS DOMAINS, not spent on the first N hosts of a flat list.
             #
@@ -3047,7 +3143,14 @@ function Resolve-mdiLdapTarget {
     # and is filtered on another must be tested on BOTH. Collapsing a host to a single arbitrary address
     # let DNS round-robin decide which NIC was tested and reported the DC healthy on the strength of the
     # open interface while the blocked one went unprobed.
-    $representatives = @($DomainControllers | Where-Object { $_.IP } | Group-Object -Property Name |
+    #
+    # A host is identified BY ITS NAME IN ITS OWN DOMAIN throughout, never by the bare Name. The
+    # domain was previously used to CHOOSE the sample and then discarded to MATCH it, so a domain
+    # controller in another domain carrying the same Name was folded into this one before the
+    # per-domain sampling ran, and its whole domain silently received no LDAP target. See
+    # Get-mdiProbeTargetKey for the measurement.
+    $representatives = @($DomainControllers | Where-Object { $_.IP } |
+            Group-Object -Property { Get-mdiProbeTargetKey -Target $_ } |
             ForEach-Object { @($_.Group)[0] })
 
     $selected = if ($MaxPerDomain -le 0) {
@@ -3057,12 +3160,15 @@ function Resolve-mdiLdapTarget {
                 $_.Group | Select-Object -First $MaxPerDomain
             })
     }
-    $selectedNames = @($selected | ForEach-Object { $_.Name })
+    $selectedKeys = @($selected | ForEach-Object { Get-mdiProbeTargetKey -Target $_ })
 
-    # Every unique (Name, IP) pair of the selected hosts, de-duplicated. Grouping by Name AND IP keeps
-    # both addresses of a multi-homed DC while discarding an inventory row that repeats a pair.
-    $targets = @($DomainControllers | Where-Object { $_.IP -and ($selectedNames -contains $_.Name) } |
-            Group-Object -Property Name, IP | ForEach-Object { @($_.Group)[0] })
+    # Every unique (identity, IP) pair of the selected hosts, de-duplicated. Grouping by the identity
+    # AND the IP keeps both addresses of a multi-homed DC while discarding an inventory row that
+    # repeats a pair - and keeps a same-named domain controller in another domain distinct.
+    $targets = @($DomainControllers | Where-Object {
+                $_.IP -and ($selectedKeys -contains (Get-mdiProbeTargetKey -Target $_))
+            } |
+            Group-Object -Property { Get-mdiProbeTargetKey -Target $_ }, IP | ForEach-Object { @($_.Group)[0] })
 
     # Returned WITHOUT the comma operator, for the same reason as Resolve-mdiNnrTarget: an empty
     # result must count as zero targets in a caller that wraps the call in @().
@@ -3074,15 +3180,33 @@ function Get-mdiAddresslessDomainController {
         [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $Inventory
     )
 
+    # Domain is COERCED to a string at both sites. ConvertTo-mdiCanonicalComputerName types -Value as
+    # [object] but -Domain as [string], so only the domain argument is exposed - and PowerShell cannot
+    # bind an Object[] to a [string] parameter, so a row carrying a wrong type raised a
+    # parameter-transformation error instead of simply being unreadable.
+    #
+    # That error is TERMINATING and it is raised inside a Group-Object script block, so it did not
+    # cost the offending row: it cost the whole estate. Measured on the shipped functions with a
+    # four-row inventory holding two genuinely addressless controllers and one row whose Domain was
+    # @('fabrikam.local'):
+    #
+    #   Get-mdiAddresslessDomainController   threw - the addressless list for the estate was lost
+    #   Resolve-mdiLdapTarget, same rows     2 targets, survives
+    #
+    # Both consume the SAME $dcInventory, one line apart in Main. Get-mdiProbeTargetKey and
+    # Get-mdiServerIdentityKey were hardened for exactly this shape; this was the last reader of that
+    # inventory still binding a raw field, and an addressless list that throws is worse than one that
+    # is short, because the rows it feeds - the statistics, the issue list and the verdict - lose
+    # every genuinely unreachable controller along with the unreadable one.
     @($Inventory | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_.Name) } |
         Group-Object -Property {
-            ConvertTo-mdiCanonicalComputerName -Value $_.Name -Domain $_.Domain
+            ConvertTo-mdiCanonicalComputerName -Value $_.Name -Domain ([string] $_.Domain)
         } | Where-Object {
             @($_.Group | ForEach-Object { @($_.Addresses) + @($_.IP) } | Where-Object {
                     Test-mdiUsableComputerAddress -Value $_
                 }).Count -eq 0
         } | ForEach-Object {
-            ConvertTo-mdiCanonicalComputerName -Value $_.Group[0].Name -Domain $_.Group[0].Domain
+            ConvertTo-mdiCanonicalComputerName -Value $_.Group[0].Name -Domain ([string] $_.Group[0].Domain)
         } | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } | Select-Object -Unique)
 }
 
@@ -3623,6 +3747,52 @@ function Get-mdiDomainControllerInventory {
                     } else {
                         Get-mdiComputerAddress -ComputerName $dcName -KnownAddress $knownAddresses
                     })
+                # A qualification that resolved to NOTHING is undone before the domain controller is
+                # written off as unreachable. Resolve-mdiNnrTarget already does exactly this for
+                # operator-supplied targets, and for exactly this reason; the inventory performed the
+                # same qualification with no undo, so the two siblings disagreed about the same estate.
+                #
+                # ConvertTo-mdiCanonicalComputerName appends the scope domain to any name carrying no
+                # dot, and the scope domain is the operator's RAW -Domain string: without -Forest, Main
+                # builds Domains = @($Domain), so whatever was typed is what gets stapled on. -Domain is
+                # documented as "Domain Name or FQDN", and the name every Windows dialog shows an
+                # administrator of a DISJOINT namespace is the NetBIOS one (DNS fabrikam.local, NetBIOS
+                # FABCORP - not a case or trailing-dot variant, a different string that is not a DNS
+                # suffix at all). Qualifying with it produces a name that cannot exist in DNS, while the
+                # bare name still resolves through the client's suffix search list and NetBIOS.
+                #
+                # Measured on the shipped function, one estate of two servers whose bare names resolve:
+                #
+                #   -Domain fabrikam.local   2 rows with addresses, 0 addressless
+                #   -Domain FABCORP          0 rows with addresses, 2 ADDRESSLESS
+                #
+                # Same forest, same DNS, same directory - only the spelling of -Domain differed. The
+                # addressless rows feed the statistics, the issue list and the verdict, so an estate
+                # nobody failed to reach was reported as an estate that could not be probed: a value
+                # that was never read - no address was ever obtained for a name that does not exist -
+                # coming back looking like a measurement.
+                #
+                # The qualified spelling stays PREFERRED, so every case where qualification helps is
+                # unchanged, and this is reached only when the qualified name resolved to nothing. A
+                # server that resolves under NEITHER spelling is still reported addressless: inventing
+                # a target nobody can reach would be the worse failure, and this must not manufacture
+                # one.
+                if ($addresses.Count -eq 0) {
+                    $scopeSuffix = ([string] $domainName).Trim().TrimEnd('.').Trim()
+                    if (-not [string]::IsNullOrWhiteSpace($scopeSuffix) -and
+                        $dcName.Length -gt ($scopeSuffix.Length + 1) -and
+                        $dcName.EndsWith('.' + $scopeSuffix, [StringComparison]::OrdinalIgnoreCase)) {
+                        $bareName = $dcName.Substring(0, $dcName.Length - $scopeSuffix.Length - 1)
+                        if (-not [string]::IsNullOrWhiteSpace($bareName)) {
+                            $bareAddresses = @(Get-mdiComputerAddress -ComputerName $bareName -KnownAddress $knownAddresses)
+                            if ($bareAddresses.Count -gt 0) {
+                                Write-mdiVerbose ('{0} did not resolve; using the name as enumerated, {1}' -f $dcName, $bareName)
+                                $dcName = $bareName
+                                $addresses = $bareAddresses
+                            }
+                        }
+                    }
+                }
                 if ($addresses.Count -eq 0) {
                     # The domain controller was enumerated from the directory but no usable IP address for it
                     # could be found: its records may be stale, unusable, or the DNS server may not have
@@ -6016,7 +6186,14 @@ function New-mdiRemediationScript {
         $sensorNoAddress = @($sensorNoAddressList)
         $blockedTargets = @($blockedNnr | Select-Object -ExpandProperty Target -Unique | Sort-Object)
         $blockedTargetLabels = @($blockedNnr | ForEach-Object {
-                Get-mdiTargetLabel -Target $_.Target -TargetIP $_.TargetIP
+                # Target and TargetIP are COERCED. Get-mdiTargetLabel types both as [string], these
+                # records cross a JSON boundary - probe results are produced on the remote host and
+                # read back with ConvertFrom-Json - and a merged or hand-edited report carries the
+                # array form, which PowerShell refuses to bind to a [string] parameter. Measured:
+                # one such record among three threw and took EVERY blocked-NNR label with it, so the
+                # generated firewall rules lost their targets rather than gaining a bad one. Same
+                # class as Get-mdiServerIdentityKey and Get-mdiAddresslessDomainController.
+                Get-mdiTargetLabel -Target ([string] $_.Target) -TargetIP ([string] $_.TargetIP)
             } | Select-Object -Unique | Sort-Object)
     }
 
@@ -10435,8 +10612,12 @@ function Get-mdiDomainControllerReadiness {
     # forest and no two servers were measured over the same period.
     $capacitySamples = @{}
     if ($CapacityPlan) {
-        $reachable = @($dcs | Where-Object { $_.FQDN -and (Test-mdiServerReachable -ComputerName $_.FQDN).Reachable } |
-                ForEach-Object { $_.FQDN })
+        # FQDN is COERCED. The "$_.FQDN -and" guard does not protect the bind: a single-element
+        # collection is TRUTHY, so it passes the guard and then fails to bind to the [string]
+        # parameter - a terminating error inside a Where-Object block, which loses the capacity
+        # sample for every domain controller rather than for the one bad row.
+        $reachable = @($dcs | Where-Object { $_.FQDN -and (Test-mdiServerReachable -ComputerName ([string] $_.FQDN)).Reachable } |
+                ForEach-Object { [string] $_.FQDN })
         if ($reachable.Count -gt 0) {
             Write-mdiVerbose ('Sampling network traffic on {0} domain controller(s) in parallel for {1}s at {2}s intervals' -f
                 $reachable.Count, $CapacityPlan.DurationSeconds, $CapacityPlan.IntervalSeconds)
@@ -10561,7 +10742,7 @@ function Get-mdiDomainControllerReadiness {
 
             if ($PortProbePlan) {
                 Write-mdiVerbose "Testing required network ports for $($dc.FQDN)"
-                $requiredPorts = Get-mdiRequiredPorts -ComputerName $dc.FQDN -Plan $PortProbePlan
+                $requiredPorts = Get-mdiRequiredPorts -ComputerName $dc.FQDN -Plan $PortProbePlan -IsDomainController
                 $dc.Add('RequiredPorts', $requiredPorts.isRequiredPortsOk)
                 $details.Add('RequiredPortsDetails', $requiredPorts.details)
             }
@@ -10668,7 +10849,21 @@ function Get-mdiCAReadiness {
     # both produce an empty list, but only one of them means the domain was actually checked.
     $caNotMeasured = $false
 
+    # Cert Publishers members whose COMPUTER OBJECT could not be read, so the server behind them was
+    # never identified. Kept as a list object and mutated with .Add rather than reassigned with +=,
+    # for the reason spelled out in Get-mdiEntraConnectReadiness: the collection below runs in a
+    # ForEach-Object script block, where `$array += x` binds a NEW local variable in the child scope
+    # and every entry is silently discarded when the block exits.
+    $unreadableCaMember = New-Object -TypeName System.Collections.ArrayList
+
+    # Whether the CA list was DISCOVERED here or supplied by the operator. The two cases fail
+    # differently and must not share a fallback: a name the operator passed to -CAServer is a host
+    # name and stays probeable when the directory lookup fails, whereas a discovered member arrives
+    # as a distinguished name and is not a host name at all.
+    $caAutoDiscovered = $false
+
     if ([string]::IsNullOrEmpty($CAServer)) {
+        $caAutoDiscovered = $true
         Write-mdiVerbose "Searching for CA servers in $Domain"
         try {
             # -Server $Domain on both calls: Get-mdiCAReadiness runs once per domain in the forest, and
@@ -10695,13 +10890,59 @@ function Get-mdiCAReadiness {
     # suppress and try/catch does not intercept. Empty entries are therefore removed first.
     $cas = @($CAServer | Where-Object { $_ } | ForEach-Object {
             $caName = [string] $_
+            $caComputer = $null
             try {
                 $caComputer = Get-ADComputer -Identity $_ -Server $Domain -Properties DNSHostName, IPv4Address, IPv6Address, OperatingSystem -ErrorAction SilentlyContinue
-                # The discovered name is kept when the directory lookup returns nothing. A null FQDN was
-                # passed to Test-mdiServerReachable, whose -ComputerName is a mandatory [string], and the
-                # resulting parameter binding error is terminating, not catchable, and raised outside the
-                # try below - so one stale member of Cert Publishers removed every CA from the report.
-                $caFqdn = if ($caComputer -and $caComputer.DNSHostName) { [string] $caComputer.DNSHostName } else { $caName }
+            } catch {
+                Write-Verbose $_.Exception.Message
+            }
+
+            # A DISCOVERED member that could not be named was reported as a MACHINE THAT FAILED.
+            #
+            # $CAServer is declared [string[]], and the discovery above assigns the Get-ADGroupMember
+            # result straight back into it. A param-block type constraint stays attached to the
+            # variable for the whole function, so each ADPrincipal is COERCED TO A STRING at that
+            # assignment - and an ADPrincipal stringifies to its distinguishedName. Every discovered
+            # member therefore arrives here as 'CN=ca01,OU=CAs,DC=fabrikam,DC=local', not as an object
+            # and not as a host name.
+            #
+            # Get-ADComputer is called with -ErrorAction SilentlyContinue, so a permission denial, a
+            # replication gap or a cross-forest reference simply yields $null. The fallback was then
+            # `else { $caName }` - the distinguished name - which was handed to Test-mdiServerReachable
+            # as a -ComputerName, could not possibly resolve, and produced a row reading
+            #
+            #     FQDN 'CN=ca01,OU=CAs,DC=fabrikam,DC=local'   Unreachable=True
+            #     Comment 'Server is not available: ICMP'
+            #
+            # A server that was never IDENTIFIED was presented as a server that had been contacted and
+            # found unavailable, counted in the server KPIs as a machine, and charged as a FAILURE
+            # rather than as an unread check. Nothing was ever contacted: the name was a directory
+            # path. It also sends the operator to fix name resolution or a firewall for a host whose
+            # name the tool never learned.
+            #
+            # This is the same fact the GROUP read already handles correctly two blocks up - discovery
+            # that did not happen is reported 'N/A' and IsPlaceholder, not as a failure - and the same
+            # fact both sibling paths handle: Get-mdiDomainControllerReadiness emits
+            # 'Domain controller (not named) N of M', Get-mdiEntraConnectReadiness keeps
+            # $unreadableSyncAccount. This second read was the only one of the four without it.
+            #
+            # Measured on the shipped function, fabrikam.local with two Cert Publishers members whose
+            # computer objects could not be read: 2 rows, both carrying a DN as their FQDN, both
+            # Unreachable=True, neither marked IsPlaceholder. Whitespace counts as unreadable for the
+            # same reason - `if ($caComputer.DNSHostName)` accepted '   ' as a name, because a
+            # non-empty string is truthy.
+            #
+            # Only DISCOVERED members are diverted. A name the operator passed to -CAServer is a host
+            # name they chose, so it stays probeable exactly as before even when the directory cannot
+            # confirm it - that is the case -CAServer exists for.
+            $caDnsName = if ($caComputer) { [string] $caComputer.DNSHostName } else { '' }
+            if ($caAutoDiscovered -and [string]::IsNullOrWhiteSpace($caDnsName)) {
+                [void] $unreadableCaMember.Add($caName)
+                return
+            }
+
+            try {
+                $caFqdn = if (-not [string]::IsNullOrWhiteSpace($caDnsName)) { $caDnsName } else { $caName }
                 # Every address, as for domain controllers: a certification authority can be multi-homed
                 # too, and the generated firewall rules scope by source address.
                 $caKnownAddresses = if ($caComputer) { @([string] $caComputer.IPv4Address, [string] $caComputer.IPv6Address) } else { @() }
@@ -10840,6 +11081,33 @@ function Get-mdiCAReadiness {
             # one-server estate reported "across 2 server(s)", "Servers fully ready 1/2".
             IsPlaceholder  = $true
             Details        = [ordered]@{}
+        }
+    } elseif ($unreadableCaMember.Count -gt 0) {
+        # PARTIAL loss, and the block above cannot see it: $caNotMeasured fires only when the GROUP
+        # read failed, whereas here it succeeded and told us the domain HAS certification authorities -
+        # we simply could not turn these members into a server. That is a domain running AD CS whose
+        # CAs went unchecked, which must be surfaced as not-measured rather than as machines that
+        # failed a reachability test nobody was able to perform.
+        #
+        # One row per lost member rather than one row for the group, for the same reason the Entra
+        # Connect path gives: the denominator has to reflect how many servers were actually missed,
+        # otherwise discovering less of the estate improves the headline score.
+        foreach ($member in $unreadableCaMember) {
+            $memberLabel = if ([string]::IsNullOrWhiteSpace([string] $member)) { 'a Cert Publishers member' } else { [string] $member }
+            [PSCustomObject]@{
+                FQDN           = 'AD CS (not identified) {0} - {1}' -f $memberLabel, $Domain
+                Domain         = $Domain
+                SensorHealth   = 'N/A'
+                Comment        = ('The Cert Publishers member {0} names a certification authority whose computer object could not be read, ' +
+                    'so its host name is unknown and the server was NOT checked. This is expected across a forest trust, where dNSHostName ' +
+                    'is not always readable. Re-run with sufficient directory read rights, or pass -CAServer <name> to check it explicitly.') -f $memberLabel
+                Unreachable    = $false
+                PartialFailure = $false
+                # Not a machine, for the same reason the discovery placeholder above is not: without
+                # this the row is counted in the server-count KPIs as a server that was examined.
+                IsPlaceholder  = $true
+                Details        = [ordered]@{}
+            }
         }
     }
 }
@@ -12125,13 +12393,32 @@ function Get-mdiServerIdentityKey {
 
         Returns an empty string when there is no usable name, so callers can decide whether to keep
         such a record separate rather than merging every nameless row into one.
+
+        Domain and FQDN are COERCED to strings here rather than handed straight to
+        ConvertTo-mdiCanonicalComputerName, whose parameters are typed [string]. PowerShell cannot
+        bind an Object[] to a [string] parameter, so a row carrying a wrong type - a collection, a
+        number - raised a parameter-transformation error instead of simply being unreadable.
+
+        That is a TERMINATING error, and this key is computed inside Group-Object script blocks, so
+        it did not cost the offending row: it cost every row beside it. Measured on the shipped
+        functions with four healthy servers and one row whose Domain was @('fabrikam.local'):
+
+            Merge-mdiServerByFqdn                 threw - the whole merge died, all 5 lost
+            the Entra Connect de-duplication      threw
+            Get-mdiProbeTargetKey (same shape)    survived, key dc01.fabrikam.local
+
+        The sibling was hardened for exactly this and this one was not, so two helpers that exist to
+        answer the same question - which machine is this - disagreed about whether an unreadable row
+        is a value or an exception. A row nobody could read must not be able to delete the servers
+        that WERE read, on the one function every counter, the merge and the role de-duplication
+        share.
     #>
     param (
         [Parameter(Mandatory = $false)] [AllowNull()] [object] $Server
     )
 
     if ($null -eq $Server) { return '' }
-    $key = ConvertTo-mdiCanonicalComputerName -Value $Server.FQDN -Domain $Server.Domain
+    $key = ConvertTo-mdiCanonicalComputerName -Value ([string] $Server.FQDN) -Domain ([string] $Server.Domain)
     if ([string]::IsNullOrWhiteSpace([string] $key)) { return '' }
     return $key.ToLowerInvariant()
 
@@ -17495,6 +17782,82 @@ function ConvertTo-mdiDomainScopeName {
     ([string] $DomainName).Trim().TrimEnd('.')
 }
 
+function Resolve-mdiDomainScopeDnsName {
+    <#
+        The DNS name of the domain the operator asked for.
+
+        -Domain is documented as "Domain Name or FQDN", and the name every Windows dialog shows an
+        administrator of a DISJOINT namespace is the NetBIOS one: DNS fabrikam.local, NetBIOS
+        FABCORP. That is not a case variant and not a trailing-dot variant - it is a different
+        string, and no amount of string canonicalisation turns one into the other.
+
+        Everything downstream compares that string against names that came from the DIRECTORY. The
+        domain of a scanned domain controller is derived from its computer object's
+        DistinguishedName - deliberately, so that a disjoint primary DNS suffix cannot file a
+        controller under the wrong domain - while the scope, without -Forest, is the raw -Domain
+        string: Main builds Domains = @($Domain). Get-mdiUnexaminedDomain compares exactly those
+        two, so in a disjoint namespace they can never match.
+
+        Measured on the shipped functions, one estate of two domain controllers, fully discovered
+        and scanned under BOTH spellings:
+
+            -Domain fabrikam.local   scope fabrikam.local   rows fabrikam.local   unexamined: none
+            -Domain FABCORP          scope FABCORP          rows fabrikam.local   unexamined: FABCORP
+
+        The second charges the domain-level unread check, raises a Discovery issue and sets
+        $domainsExamined = $false, so the run is NOT READY over a domain whose every domain
+        controller had just been examined and passed. A false red produced by nothing but the
+        spelling of a parameter - and Get-mdiPrimaryDomainAuditing then reports the five
+        domain-level auditing properties as unread for the same mismatch, on the same run.
+
+        Only a DOTLESS name is resolved. A NetBIOS name cannot contain a dot, so a name that has one
+        is already a DNS name and is returned untouched: this must not rewrite an FQDN, and it must
+        not turn a domain CONTROLLER name into its domain, which is a different question with a
+        different answer.
+
+        The operator's spelling is KEPT whenever the directory cannot be asked, or answers with
+        nothing usable. Inventing a domain name nobody read would be a worse failure than the false
+        red this removes, and a single-label DNS domain resolves to itself, so it is unaffected.
+
+        "Usable" is deliberately narrow, because this value becomes the report identity, the output
+        file name and the key every later comparison is made against. An answer is accepted only
+        when it looks like a DNS name, is not an IP ADDRESS - an address is not a domain name, the
+        same reason the domain-controller attribution rejects one - and either carries a dot or is
+        the requested name back again. A DOTLESS answer that differs from what was asked for cannot
+        be the DNS root of the NetBIOS name that was asked about; measured with DNSRoot = 12345, an
+        answer of that shape replaced FABCORP outright, so the report identity, the file name and
+        the coverage key all became a number nobody could act on - strictly worse than the false red
+        being fixed. A single-label DNS forest keeps working because its answer equals the request.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [string] $DomainName
+    )
+
+    $requested = ConvertTo-mdiDomainScopeName -DomainName $DomainName
+    if ([string]::IsNullOrWhiteSpace($requested)) { return $requested }
+    if ($requested -match '\.') { return $requested }
+
+    try {
+        $adDomain = Get-ADDomain -Server $requested -ErrorAction Stop
+        $resolved = ConvertTo-mdiDomainScopeName -DomainName ([string] $adDomain.DNSRoot)
+        $isUsable = (-not [string]::IsNullOrWhiteSpace($resolved)) -and
+            ($resolved -match '^[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?)*$') -and
+            ($null -eq (ConvertTo-mdiCanonicalIPAddress -Value $resolved)) -and
+            (($resolved -match '\.') -or ($resolved -ieq $requested))
+        if (-not $isUsable) {
+            Write-mdiVerbose ('The directory returned no usable DNS name for {0}; keeping the name as supplied' -f $requested)
+            return $requested
+        }
+        if ($resolved -ine $requested) {
+            Write-mdiVerbose ('{0} is the NetBIOS name of {1}; using the DNS name as the scope' -f $requested, $resolved)
+        }
+        return $resolved
+    } catch {
+        Write-mdiVerbose ('Unable to read the DNS name of {0} from the directory ({1}); keeping the name as supplied' -f $requested, $_.Exception.Message)
+        return $requested
+    }
+}
+
 function Get-mdiPrimaryDomainAuditing {
     param (
         [Parameter(Mandatory = $true)] [string] $Domain,
@@ -17761,6 +18124,14 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
     } catch {
         throw ('The output folder {0} is not writable: {1}' -f $Path, $_.Exception.Message)
     }
+
+    # A NETBIOS domain name is resolved to its DNS name before anything is measured against it. The
+    # string canonicalisation above handles case and the trailing root dot; a disjoint NetBIOS name
+    # (DNS fabrikam.local, NetBIOS FABCORP) is a different string entirely, and every comparison
+    # downstream is against a name that came from the directory. Left unresolved it made a fully
+    # scanned domain report as unexamined - see Resolve-mdiDomainScopeDnsName for the measurement.
+    # Done here rather than beside the canonicalisation so that -WhatIf still queries nothing.
+    $Domain = Resolve-mdiDomainScopeDnsName -DomainName $Domain
 
     $forestInfo = if ($Forest) {
         Get-mdiForestDomain -Domain $Domain

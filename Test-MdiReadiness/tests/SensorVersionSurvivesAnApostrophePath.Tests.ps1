@@ -101,14 +101,27 @@ try {
     # is right and is kept: a control that cannot read a version must still stop the file rather
     # than let the assertions below measure a broken harness. Only a transient miss is absorbed, and
     # a provider that is genuinely unreachable still throws on the final attempt.
+    #
+    # The first version of this retry allowed 5 attempts with a 250ms * attempt backoff - 2.5s of
+    # patience in total - and that was not enough. The tree was reported RED on three consecutive
+    # gate runs (17:20, 17:49 and 18:28 on 17 Aug), every one of them with failures=0 and
+    # no-assert=1 naming this file, while the same file passed 7 of 7 standalone minutes later. So
+    # the only thing the red verdict measured was how busy the machine was: CIM_DataFile can enumerate
+    # a filesystem to answer, and eight scan workers hammering WMI in parallel starve it for far
+    # longer than 2.5s.
+    #
+    # Ten attempts with a 500ms * attempt backoff is roughly 22s of patience, against a suite that
+    # takes half an hour. The trade is deliberate: a transient WMI stall must not be able to hold
+    # the whole tree red, and a genuinely broken provider still costs only 22s before it throws.
     $plainResult = ''
-    foreach ($attempt in 1..5) {
+    $attempts = 10
+    foreach ($attempt in 1..$attempts) {
         $plainResult = [string] (Get-Version -ExecutablePath $plainExe)
         if (-not [string]::IsNullOrWhiteSpace($plainResult) -and $plainResult -ne 'N/A') { break }
-        if ($attempt -lt 5) { Start-Sleep -Milliseconds (250 * $attempt) }
+        if ($attempt -lt $attempts) { Start-Sleep -Milliseconds (500 * $attempt) }
     }
     if ([string]::IsNullOrWhiteSpace($plainResult) -or $plainResult -eq 'N/A') {
-        throw "the ordinary-path control returned '$plainResult' after 5 attempts - the harness is not reaching the real provider"
+        throw "the ordinary-path control returned '$plainResult' after $attempts attempts - the harness is not reaching the real provider"
     }
 
     Write-Host 'A legal install path containing an apostrophe must still yield the version' -ForegroundColor Cyan

@@ -108,10 +108,64 @@ Write-Host "`n[3] NNR probes every address; LDAP samples hosts but probes every 
 # one multi-homed DC from eating the whole budget and leaving a second DC untested.
 $nnrText = ($functions | Where-Object { $_.Name -eq 'Resolve-mdiNnrTarget' }).Extent.Text
 Assert-That 'NNR targets come from every address' ($nnrText -match 'Get-mdiComputerAddress')
-Assert-That 'the NNR cap counts hosts, not addresses' ($nnrText -match "Group-Object -Property Name")
+# Asserted by RUNNING the cap, not by matching the source text of the grouping.
+#
+# This line used to read `$nnrText -match "Group-Object -Property Name"`, which pinned the
+# MECHANISM rather than the behaviour in the header - and pinned the wrong one. Grouping by the bare
+# Name was itself a defect: two domain controllers in different domains sharing a name were one host
+# to the sampler, so a colliding "dc01" in a trusted forest was discarded before the per-domain
+# spreading ran (see Get-mdiProbeTargetKey and ProbeTargetsAreIdentifiedPerDomain.Tests.ps1). Fixing
+# that turned this assertion red while the behaviour it names - the cap counts hosts, not addresses -
+# was still correct, because the text it looked for had legitimately gone.
+#
+# Both halves are now measured on real calls: a multi-homed host must not eat the budget with its
+# NICs, and two same-named hosts in different domains must count as TWO hosts, not one.
+$nnrMultiHomed = @(
+    [PSCustomObject]@{ Name = 'dc1.contoso.com'; IP = '10.0.0.1'; Domain = 'contoso.com'; MultiHomed = $true }
+    [PSCustomObject]@{ Name = 'dc1.contoso.com'; IP = '192.168.5.1'; Domain = 'contoso.com'; MultiHomed = $true }
+    [PSCustomObject]@{ Name = 'dc2.contoso.com'; IP = '10.0.0.2'; Domain = 'contoso.com'; MultiHomed = $false }
+)
+$nnrCapped = @(Resolve-mdiNnrTarget -DomainControllers $nnrMultiHomed -MaxTargets 2)
+Assert-That 'the NNR cap counts hosts, not addresses' (
+    @($nnrCapped | Select-Object -ExpandProperty Name -Unique).Count -eq 2 -and @($nnrCapped).Count -eq 3) `
+    "(got $(@($nnrCapped).Count) rows across $(@($nnrCapped | Select-Object -ExpandProperty Name -Unique).Count) host(s))"
+
+# A bare-Name grouping would fold the colliding pair into one host. The estate must exceed the cap or
+# the sampler never engages it and the collapse cannot show: six mdilab.local hosts plus one
+# fabrikam.local host whose bare name collides with an mdilab.local one, capped at 5.
+$nnrCollision = @(
+    [PSCustomObject]@{ Name = 'dcA.mdilab.local'; IP = '10.10.1.10'; Domain = 'mdilab.local' }
+    [PSCustomObject]@{ Name = 'dcB.mdilab.local'; IP = '10.10.1.11'; Domain = 'mdilab.local' }
+    [PSCustomObject]@{ Name = 'dcC.mdilab.local'; IP = '10.10.1.12'; Domain = 'mdilab.local' }
+    [PSCustomObject]@{ Name = 'dcD.mdilab.local'; IP = '10.10.1.14'; Domain = 'mdilab.local' }
+    [PSCustomObject]@{ Name = 'dcE.mdilab.local'; IP = '10.10.1.15'; Domain = 'mdilab.local' }
+    [PSCustomObject]@{ Name = 'dc01'; IP = '10.10.1.13'; Domain = 'mdilab.local' }
+    [PSCustomObject]@{ Name = 'dc01'; IP = '10.10.1.50'; Domain = 'fabrikam.local' }
+)
+$nnrBothForests = @(Resolve-mdiNnrTarget -DomainControllers $nnrCollision -MaxTargets 5)
+Assert-That 'the NNR cap counts a same-named host in another domain as a second host' (
+    @($nnrBothForests | Select-Object -ExpandProperty Domain -Unique) -contains 'fabrikam.local') `
+    "(domains: $(@($nnrBothForests | Select-Object -ExpandProperty Domain -Unique) -join ', '))"
+Assert-That 'the NNR cap is not overspent by a name collision' (@($nnrBothForests).Count -le 5) `
+    "(got $(@($nnrBothForests).Count) targets for a cap of 5)"
 
 $ldapText = ($functions | Where-Object { $_.Name -eq 'Resolve-mdiLdapTarget' }).Extent.Text
-Assert-That 'the LDAP sample groups by host to count the cap' ($ldapText -match "Group-Object -Property Name")
+# Same correction as the NNR assertion above: this pinned the literal `Group-Object -Property Name`,
+# which was the defective grouping, so removing the defect turned the assertion red. The behaviour it
+# names is measured on real calls immediately below (lines that follow prove the cap counts HOSTS),
+# and the cross-domain half - two same-named domain controllers in different domains are two hosts -
+# is asserted here, which a bare-Name grouping cannot satisfy.
+$ldapCollision = @(
+    [PSCustomObject]@{ Name = 'dcA.mdilab.local'; IP = '10.10.1.10'; Domain = 'mdilab.local' }
+    [PSCustomObject]@{ Name = 'dcB.mdilab.local'; IP = '10.10.1.11'; Domain = 'mdilab.local' }
+    [PSCustomObject]@{ Name = 'dcC.mdilab.local'; IP = '10.10.1.12'; Domain = 'mdilab.local' }
+    [PSCustomObject]@{ Name = 'dc01'; IP = '10.10.1.13'; Domain = 'mdilab.local' }
+    [PSCustomObject]@{ Name = 'dc01'; IP = '10.10.1.50'; Domain = 'fabrikam.local' }
+)
+$ldapBothForests = @(Resolve-mdiLdapTarget -DomainControllers $ldapCollision -MaxPerDomain 2)
+Assert-That 'the LDAP sample groups by host to count the cap' (
+    @($ldapBothForests | Select-Object -ExpandProperty Domain -Unique) -contains 'fabrikam.local') `
+    "(domains: $(@($ldapBothForests | Select-Object -ExpandProperty Domain -Unique) -join ', '))"
 
 # Proven by running it: two addresses of one DC plus one address of another, capped at 2 hosts. The
 # result keeps every unique (Name, IP) pair of the selected hosts.
