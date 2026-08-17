@@ -1,4 +1,4 @@
-﻿<#
+<#
     .NOTES
         NON-ENGLISH WINDOWS AND NON-ENGLISH LOCALES
 
@@ -4621,8 +4621,36 @@ function Get-mdiEffectiveDaclTrustee {
         [switch] $ResolveSid
     )
 
-    $allow = New-Object -TypeName 'System.Collections.Generic.Dictionary[string,int]'
-    $deny = New-Object -TypeName 'System.Collections.Generic.Dictionary[string,int]'
+    # ORDINAL-IGNORE-CASE, because these are keyed on a trustee STRING and one principal can be
+    # written more than one way. The default Dictionary[string,int] comparer is case-sensitive, and
+    # the two readers do not agree about what a Trustee is: the raw descriptor path keys on
+    # [string] $ace.SecurityIdentifier - a SID, canonical - but the directory-module fallback keys on
+    # [string] $ace.IdentityReference, an NT account name such as FABCORP\MDI-Readers.
+    #
+    # NTAccount('BUILTIN\Administrators').Equals(NTAccount('builtin\administrators')) is TRUE and both
+    # translate to S-1-5-32-544, while NTAccount.Value PRESERVES the spelling it was constructed from -
+    # so the string can differ while the principal does not. Windows resolves a trustee by SID and is
+    # case-insensitive about its name; a dictionary keyed on the spelling is not.
+    #
+    # Measured on the shipped function, fed exactly the record shape the fallback reader builds:
+    #
+    #   Allow FABCORP\MDI-Readers LC+RP, Deny fabcorp\mdi-readers RP -> GRANTED (deny dropped)
+    #   Allow FABCORP\svc-mdi LC,        Allow fabcorp\svc-mdi RP    -> granted NOTHING (union split)
+    #
+    # The first is precisely the outcome rule 2 above exists to prevent: a deliberately revoked
+    # account reported as still holding read access. The second is the false red this file warns about
+    # elsewhere - it reports "no trustee holds both List Contents and Read Property" and sends the
+    # generated dsacls /G "<DSA>":LCRP at a system container to re-grant a delegation already in place,
+    # and the header above records that a split grant is ordinary ("two different tools each add an
+    # entry"). The same DACL written in one consistent case behaved correctly, which is why nothing
+    # caught it.
+    #
+    # This is already the convention for name-like keys everywhere else in this file - the domain
+    # scope set, the three sets in Get-mdiUnexaminedDomain, the unread-name set and the remediation
+    # dedup set all pass OrdinalIgnoreCase. These two were the deviation. It is NOT fuzziness: two
+    # names differing by more than case remain two principals, which the regression test pins.
+    $allow = New-Object -TypeName 'System.Collections.Generic.Dictionary[string,int]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+    $deny = New-Object -TypeName 'System.Collections.Generic.Dictionary[string,int]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
 
     foreach ($entry in @($Ace)) {
         if ($null -eq $entry) { continue }
