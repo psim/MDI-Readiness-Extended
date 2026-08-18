@@ -47,7 +47,12 @@ $loaded = (Resolve-Path -LiteralPath $target).ProviderPath
 $canonical = Join-Path (Split-Path $here -Parent) 'Test-MdiReadiness.ps1'
 Write-Host ("  LOADED  {0}" -f $loaded) -ForegroundColor DarkGray
 Write-Host ("  SHA256  {0}" -f (Get-FileHash -LiteralPath $loaded -Algorithm SHA256).Hash) -ForegroundColor DarkGray
-if ((Resolve-Path -LiteralPath $canonical).ProviderPath -ne $loaded) {
+# Run-Suite.ps1 - and the publisher's release gate - copy every test into a FLAT isolated directory
+# whose PARENT holds no product script. Resolving the canonical path unconditionally threw there and
+# killed this file before a single assertion ran, which the runner reports as "no assertions": a dead
+# test that reads exactly like a quiet one. The canonical copy is optional context for the drift
+# NOTE below, never a precondition for measuring anything.
+if ((Test-Path -LiteralPath $canonical) -and (Resolve-Path -LiteralPath $canonical).ProviderPath -ne $loaded) {
     $a = (Get-FileHash -LiteralPath $loaded -Algorithm SHA256).Hash
     $b = (Get-FileHash -LiteralPath $canonical -Algorithm SHA256).Hash
     if ($a -ne $b) { Write-Host "  NOTE  the loaded file differs from $canonical ($a vs $b)" -ForegroundColor Yellow }
