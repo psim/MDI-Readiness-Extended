@@ -19,27 +19,24 @@
 
         Requirement     rank   cell
         'Required'      3      red
-        ' Required'     3      AMBER
-        'Required '     3      AMBER
-        "Required`r"    3      AMBER
-        'All'           3      AMBER
+        ' Required'     0      amber   (unreadable - correct, see below)
+        'Required '     0      amber   (unreadable - correct, see below)
+        "Required`r"    0      amber   (unreadable - correct, see below)
+        'All'           3      AMBER   <- the defect
 
-    Two separate populations reach that default arm:
-
-      * PADDED SPELLINGS. Checks arrive from $srv.Details.SensorV3ReadyDetails.Checks, read back
-        across the base64/JSON boundary the plan is serialised through. This file already documents
-        that merged, hand-edited and foreign-tool reports deliver shapes the product never wrote on
-        this very field - "the number 636, or 'Required.'" - and a padded or line-ending-terminated
-        spelling is that same population. It is also the only member of it that is a CORRECT,
-        unambiguous requirement, so it is the one that must not be discarded.
+    Only ONE population actually reaches that default arm wrongly:
 
       * 'All'. No boundary needed at all. It is in the shipped ports table, it ranks 3 by contract,
         and the default arm painted it advisory.
 
-    After the rank was fixed the two surfaces actively CONTRADICTED each other: the run treated the
-    check as mandatory - rank 3, so it gated READY and blocked the verdict - while the chart a reader
-    opens the report to look at coloured it amber, the shade this report reserves for "should".
-    Nothing disclosed the disagreement, because each surface was self-consistent.
+    PADDED SPELLINGS ARE NOT THAT POPULATION, and this test originally claimed they were. The
+    obligation scale deliberately does NOT trim: Test-mdiRequirementIsMandatory documents at length
+    that "a value nobody could read must never be promoted to a blocking requirement", and two
+    sibling tests pin it directly - PortRequirementIsRankedNotComparedToALiteral asserts
+    "not mandatory: ' Required '", and MergedV3MandatoryUsesTheSharedRule asserts that an unreadable
+    ' Required ' is neither promoted to a blocker nor counted as a required unknown. Trimming the
+    rank was tried and REVERTED for exactly that reason: it turned both of those tests red. A padded
+    spelling therefore ranks 0 and is painted amber, and that is the intended behaviour, not a gap.
 
     The colour now comes from the scale, so the two cannot drift apart again. The mapping is otherwise
     unchanged: AtLeastOne and Recommended stay amber exactly as before.
@@ -93,11 +90,21 @@ function Get-FailCellClass {
 Write-Host ''
 Write-Host '[1] a mandatory failure is painted red however its requirement is spelled' -ForegroundColor Cyan
 
-# The whole point: these are the SAME requirement, and the report must say so.
-foreach ($spelling in @('Required', ' Required', 'Required ', '  Required  ', "Required`r", "Required`n", "`tRequired")) {
-    $shown = "'" + ($spelling -replace "`r", '\r' -replace "`n", '\n' -replace "`t", '\t') + "'"
+# The whole point: a mandatory requirement is painted red. 'All' is the spelling the defect hid.
+foreach ($spelling in @('Required', 'All')) {
+    $shown = "'" + $spelling + "'"
     Assert-That "a failing $shown check is red, not advisory" `
         ((Get-FailCellClass -Requirement $spelling) -eq 'red') "(got '$(Get-FailCellClass -Requirement $spelling)')"
+}
+
+# A padded spelling is UNREADABLE by the scale's contract and must stay advisory. Pinned here so the
+# trimming that was tried and reverted cannot come back through this surface.
+foreach ($spelling in @(' Required', 'Required ', '  Required  ', "Required`r", "Required`n", "`tRequired")) {
+    $shown = "'" + ($spelling -replace "`r", '\r' -replace "`n", '\n' -replace "`t", '\t') + "'"
+    Assert-That "a padded $shown is not promoted to red by the chart" `
+        ((Get-FailCellClass -Requirement $spelling) -eq 'amber') "(got '$(Get-FailCellClass -Requirement $spelling)')"
+    Assert-That "a padded $shown is not mandatory by the shared rule" `
+        (-not (Test-mdiRequirementIsMandatory -Requirement $spelling))
 }
 
 # 'All' ranks 3 by the scale's own contract and needs no boundary to arrive that way.

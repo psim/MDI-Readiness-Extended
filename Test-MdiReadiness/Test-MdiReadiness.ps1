@@ -12492,37 +12492,27 @@ function Get-mdiRequirementRank {
         Ranked rather than compared as text because the values are an ordered scale, and because an
         unrecognised value must sort BELOW a real one rather than winning by accident.
 
-        TRIMMED before it is ranked, the way every sibling reader of a field that crosses the same
-        boundary already normalises - ConvertTo-mdiBoolean opens with `([string] $Value).Trim()`,
-        Get-mdiProbeDomainKey and Get-mdiProbeTargetKey both trim, and the readability predicate in
-        Get-mdiRequiredPortsHtml trims on the very line it calls this function from. Without it
-        ' Optional ' was recognised as Optional and ' Required ' as nothing at all, inside one
-        expression.
+        DELIBERATELY NOT TRIMMED, and a .Trim() here has already been added and reverted once. The
+        temptation is that ' Required ' is "obviously" the same obligation. It is not, on this scale:
+        Test-mdiRequirementIsMandatory is defined as (rank -eq 3), so trimming does not merely tidy a
+        string, it PROMOTES a value nobody could read into one that blocks the verdict - the exact
+        inversion this function exists to prevent. Three regression tests pin that contract from three
+        different surfaces, and adding the trim turns all three red:
 
-        Requirement crosses a JSON boundary by design - the plan is serialised into the remote probe
-        script and the results are read back with ConvertFrom-Json - and the shapes a merged,
-        hand-edited or foreign-tool report puts on this field are already documented above: the
-        number 636, the boolean $true, 'Required.'. A padded or line-ending-terminated spelling is
-        that same population and the only member of it that states a correct, unambiguous
-        obligation. Measured on the shipped functions, one LDAPS 636 record REFUSED to
-        dcfab01.fabrikam.local with nothing differing but the whitespace around the word:
+            PortRequirementIsRankedNotComparedToALiteral   ' Required' is in $notMandatory
+            MergedV3MandatoryUsesTheSharedRule             ' Required ' is neither a blocker nor a
+                                                           required unknown
+            MandatoryFailureIsNeverPaintedAdvisory         a padded spelling stays amber
 
-            Requirement     rank   Get-mdiBlockingPortFailure   Get-mdiUnmeasuredRequiredProbe
-            'Required'      3      1                            1
-            ' Required'     0      0                            0
-            "Required`r"    0      0                            0
-
-        So a required port PROVEN REFUSED did not block the verdict and one NOBODY MEASURED did not
-        gate READY. -MultiForest is what puts real traffic there: it promotes LdapsTcp and LdapsGcTcp
-        to Required, so in a cross-forest estate those are exactly the records that decide readiness.
-
-        Trimming cannot promote an unreadable value: 636, $true, 'Required.', '' and whitespace-only
-        all still fall to 0, which the regression test pins alongside the padded spellings.
+        Nor is there a caller that needs it. Every Requirement in this script is a hard-coded literal
+        in the port definition table (Requirement = 'Required'), not text parsed from a report, so a
+        padded spelling has no way to arrive here - which is what RequirementRankIsAnOrderedScale
+        states as its own reason for refusing to pin the padded case either way.
     #>
     param (
         [Parameter(Mandatory = $false)] [AllowNull()] [object] $Requirement
     )
-    switch (([string] $Requirement).Trim()) {
+    switch ([string] $Requirement) {
         'Required' { 3 }
         'All' { 3 }
         'AtLeastOne' { 2 }
