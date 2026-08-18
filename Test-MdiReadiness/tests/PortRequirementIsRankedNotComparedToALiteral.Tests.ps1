@@ -76,10 +76,15 @@
        Get-mdiRequiredPorts itself - the function whose $mandatory selector decides
        isRequiredPortsOk and fills FailedRequired - fails the ports check for a refused 'All' port
        and does NOT charge one whose Requirement arrived from JSON as a boolean.
-    8. No PORT surface compares Requirement to a literal any more. The sensor v3.x readiness checks
-       are deliberately out of scope: they use a different vocabulary ('Required' / 'Migration' /
-       'Recommended') that Get-mdiRequirementRank does not model, and that list is built locally
-       through a [string]-typed $Requirement parameter rather than parsed from JSON.
+    8. No surface compares Requirement to a literal any more - including the sensor v3.x readiness
+       checks, which this test USED to exclude. The exclusion was justified on the grounds that
+       those lists are "built locally through a [string]-typed $Requirement parameter rather than
+       parsed from JSON". That holds for Get-mdiSensorV3Readiness, which stamps its own literals,
+       and does NOT hold for Merge-mdiSensorV3ReadyDetails: it merges two role blobs, carries
+       Requirement through unnormalised, and its own sibling branch exists for the earlier-version
+       and FOREIGN reports that have made a JSON round trip. Measured on the shipped functions, the
+       inline literal there dropped an 'All' check from BOTH Blockers and UnknownChecks and promoted
+       a boolean $true to a blocker. All four sites now use Test-mdiRequirementIsMandatory.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -241,22 +246,26 @@ Assert-That 'a Requirement that arrived as a JSON boolean is not charged as a re
 $vOpt = Get-Verdict 'Optional'
 Assert-That 'a refused Optional port is not charged as a required failure' (@($vOpt.details.FailedRequired).Count -eq 0)
 
-'--- 8. no literal Requirement -eq ''Required'' comparison survives on a PORT surface ---'
-# Scoped to the port-probe vocabulary deliberately. The sensor v3.x readiness checks use a DIFFERENT
-# vocabulary - 'Required' / 'Migration' / 'Recommended' - which Get-mdiRequirementRank does not model
-# ('Migration' is not on its scale), and that list is built locally through a [string]-typed
-# $Requirement parameter, so it neither needs nor tolerates this predicate. Those sites are named
-# here so the guard stays meaningful: a NEW literal comparison on any port surface fails this test.
+'--- 8. no literal Requirement -eq ''Required'' comparison survives on ANY surface ---'
+# This guard was once scoped to the port-probe vocabulary, with the sensor v3.x readiness checks
+# excluded because their list is "built locally through a [string]-typed $Requirement parameter
+# rather than parsed from JSON". That reasoning holds for Get-mdiSensorV3Readiness, which stamps its
+# own literals, and NOT for Merge-mdiSensorV3ReadyDetails: it merges two role blobs, carries
+# Requirement through unnormalised via Merge-mdiSensorV3Check, and its sibling branch exists for the
+# earlier-version and FOREIGN reports that make exactly that JSON round trip. Measured on the shipped
+# functions, the inline literal there dropped an 'All' check from BOTH Blockers and UnknownChecks and
+# promoted a boolean $true to a blocker. The exclusion is therefore gone: every site now goes through
+# Test-mdiRequirementIsMandatory, and a NEW literal comparison ANYWHERE fails this test.
 $productText = Get-Content -LiteralPath $productPath -Raw
 $code = @($productText -split "`n" | Where-Object { $_ -notmatch '^\s*#' })
 $checkPopulation = '\$(checks|mergedChecks)\s*\|'
 $literalHits = @($code | Where-Object {
-        $_ -match "\.Requirement\s+-eq\s+'(Required|AtLeastOne)'" -and $_ -notmatch $checkPopulation
+        $_ -match "\.Requirement\s+-eq\s+'(Required|AtLeastOne)'"
     })
-Assert-That 'no port surface compares .Requirement to a literal' ($literalHits.Count -eq 0) ("found: " + ($literalHits -join ' | '))
-# ...and the v3-check sites really are the only ones excluded, so the exclusion cannot quietly widen.
+Assert-That 'no surface compares .Requirement to a literal' ($literalHits.Count -eq 0) ("found: " + ($literalHits -join ' | '))
+# ...and specifically the v3-check population, which used to be the one exclusion, carries none either.
 $excluded = @($code | Where-Object { $_ -match "\.Requirement\s+-eq\s+'Required'" -and $_ -match $checkPopulation })
-Assert-That 'exactly 4 v3-check sites are out of scope' ($excluded.Count -eq 4) "got $($excluded.Count)"
+Assert-That 'the v3-check sites that were once excluded now use the shared rule' ($excluded.Count -eq 0) "got $($excluded.Count)"
 
 ''
 "pass=$script:pass fail=$script:fail"

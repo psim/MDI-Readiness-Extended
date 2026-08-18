@@ -15,6 +15,33 @@ The version is defined once, in the `$settings` block of the script, and appears
 footer, in the `-AsJson` output and in each baseline history entry, so any report or trend can be
 traced back to the build that produced it.
 
+## [Unreleased]
+
+### Fixed
+
+- Merging the two role passes over one host decided "is this check mandatory?" with its own inline
+  `-eq 'Required'` instead of `Test-mdiRequirementIsMandatory`, the one definition of that rule, and
+  the copy had drifted in both directions at once. `'All'` ranks alongside `'Required'` - every one
+  must pass, and a measured failure blocks the verdict - so an All-class check that was measured
+  FAILING never reached `Blockers`, and one that was never read never reached `UnknownChecks`
+  either: it left the merge with no trace on either disclosure surface. In the other direction,
+  PowerShell's `-eq` coerces its right operand to the left operand's type, so a `Requirement` that
+  came back from a JSON round trip as the boolean `true` satisfied `$true -eq 'Required'` and a
+  value nobody could read was charged as a blocking failure. Both filters now use the shared rule.
+  This merge runs whenever one host is discovered under two roles - a domain controller that is also
+  a certification authority or an AD FS server - and its sibling branch exists for earlier-version
+  and foreign reports, which is exactly what produces `"Requirement":true`.
+
+- A run that measured real failures published `Readiness: "N/A"` - "not enough evidence to decide" -
+  whenever any server had been only partially scanned. The partial-scan test was reached before
+  known failures were considered, so it decided the machine-readable verdict on its own: with
+  `PartialScanCount=1` and five checks observed failing the published value was the string `N/A`,
+  while the same five failures without a partial scan correctly published `false`. A pipeline gating
+  on `Readiness` reads `N/A` as "nothing proven wrong" and does not fail the build. A measured
+  failure now outranks an incomplete scan, which is what the function's contract always stated. The
+  `N/A` verdict is unchanged where the run genuinely could not decide - nothing scanned, or a
+  partial or unread run with nothing observed failing.
+
 ## [1.1.6] - 2026-08-18
 
 Correctness release. Thirty-one defects fixed, each with a mutation-tested regression test.

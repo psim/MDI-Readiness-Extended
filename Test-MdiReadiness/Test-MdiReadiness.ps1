@@ -4719,8 +4719,11 @@ function Get-mdiSensorV3Readiness {
     # A blocker is a check that actually failed. 'N/A' -ne $true is true, so the previous filter counted
     # every unread check as a blocker and a server that could not be queried looked comprehensively
     # ineligible. Unknowns are tracked separately: they are gaps in the evidence, not findings.
-    $blockers = @($checks | Where-Object { $_.Requirement -eq 'Required' -and $_.Status -eq $false })
-    $unknowns = @($checks | Where-Object { $_.Requirement -eq 'Required' -and $_.Measured -ne $true })
+    # Mandatory-ness through Test-mdiRequirementIsMandatory, the one definition, rather than an
+    # inline -eq: these two lines and the pair in Merge-mdiSensorV3ReadyDetails are documented as
+    # "kept literally in step" with each other, so they have to share the rule they both encode.
+    $blockers = @($checks | Where-Object { (Test-mdiRequirementIsMandatory -Requirement $_.Requirement) -and $_.Status -eq $false })
+    $unknowns = @($checks | Where-Object { (Test-mdiRequirementIsMandatory -Requirement $_.Requirement) -and $_.Measured -ne $true })
     $migrationWarnings = @($checks | Where-Object { $_.Requirement -eq 'Migration' -and $_.Status -eq $false })
     # Migration prerequisites that could not be MEASURED, tracked separately from those that failed.
     #
@@ -9667,8 +9670,18 @@ function Get-mdiCertReadiness {
 
     [PSCustomObject]@{
         isRootCertificatesOk = $valid.Count -ge 1
-        details              = $matched | Select-Object -Property Thumbprint, Subject, Issuer, NotBefore, NotAfter,
-            @{ N = 'Valid'; E = { $_.NotBefore -le $now -and $_.NotAfter -ge $now } }
+        # X509Certificate2 date properties are DateTime instances. Project them to invariant UTC text at
+        # the producer so JSON never receives PowerShell 5.1's /Date(milliseconds)/ implementation form.
+        details              = @($matched | ForEach-Object {
+                [PSCustomObject][ordered]@{
+                    Thumbprint = [string] $_.Thumbprint
+                    Subject    = [string] $_.Subject
+                    Issuer     = [string] $_.Issuer
+                    NotBefore  = ([datetime] $_.NotBefore).ToUniversalTime().ToString('o', [cultureinfo]::InvariantCulture)
+                    NotAfter   = ([datetime] $_.NotAfter).ToUniversalTime().ToString('o', [cultureinfo]::InvariantCulture)
+                    Valid      = [bool] ($_.NotBefore -le $now -and $_.NotAfter -ge $now)
+                }
+            })
     }
 }
 
@@ -10309,10 +10322,36 @@ function Get-mdiDsSacl {
             }
         }
 
-        $appliedAuditing = @($descriptor.SystemAcl) | Select-Object *,
-            @{N = 'AccessMaskDetails'; E = { (([Enum]::ToObject([DirectoryServices.ActiveDirectoryRights], $_.AccessMask))).ToString() } },
-            @{N = 'AuditFlagsValue'; E = { $_.AuditFlags.value__ } },
-            @{N = 'AceFlagsValue'; E = { $_.AceFlags.value__ } }
+        # Raw ACEs contain SecurityIdentifier and enum instances. Select-Object * preserves those rich
+        # values, so the report serialises a SID as a nested object and exposes every adapted ACE member.
+        # Build the public evidence record explicitly; every value leaving this producer is plain data.
+        $appliedAuditing = @(@($descriptor.SystemAcl) | ForEach-Object {
+                $ace = $_
+                $objectAceType = $null
+                $inheritedObjectAceType = $null
+                $objectAceFlags = $null
+                if ($null -ne $ace.PSObject.Properties['ObjectAceType']) {
+                    $objectAceType = ([guid] $ace.ObjectAceType).ToString('D')
+                }
+                if ($null -ne $ace.PSObject.Properties['InheritedObjectAceType']) {
+                    $inheritedObjectAceType = ([guid] $ace.InheritedObjectAceType).ToString('D')
+                }
+                if ($null -ne $ace.PSObject.Properties['ObjectAceFlags']) {
+                    $objectAceFlags = [int] $ace.ObjectAceFlags
+                }
+                [PSCustomObject][ordered]@{
+                    SecurityIdentifier     = $(if ($null -eq $ace.SecurityIdentifier) { $null } else { [string] $ace.SecurityIdentifier.Value })
+                    AccessMask             = [int] $ace.AccessMask
+                    AccessMaskDetails      = [string] ([Enum]::ToObject([DirectoryServices.ActiveDirectoryRights], [int] $ace.AccessMask))
+                    AuditFlags             = [string] $ace.AuditFlags
+                    AuditFlagsValue        = [int] $ace.AuditFlags
+                    AceFlags               = [string] $ace.AceFlags
+                    AceFlagsValue          = [int] $ace.AceFlags
+                    ObjectAceFlags         = $objectAceFlags
+                    ObjectAceType          = $objectAceType
+                    InheritedObjectAceType = $inheritedObjectAceType
+                }
+            })
 
 
         $properties = ($expectedAuditing | Get-Member -MemberType NoteProperty).Name
@@ -12683,9 +12722,31 @@ function Merge-mdiSensorV3ReadyDetails {
     else { $scalarLoser.SensorV2Version }
 
     if ($mergedChecks.Count -gt 0) {
-        # The producer's own rules, kept literally in step with Get-mdiSensorV3Readiness.
-        $blockers = @($mergedChecks | Where-Object { $_.Requirement -eq 'Required' -and $_.Status -eq $false })
-        $unknowns = @($mergedChecks | Where-Object { $_.Requirement -eq 'Required' -and $_.Measured -ne $true })
+        # The producer's own rules, kept literally in step with Get-mdiSensorV3Readiness - and both
+        # sides go through Test-mdiRequirementIsMandatory, because an inline `-eq 'Required'` here
+        # was wrong in BOTH directions at once, which is the exact pair that function exists for.
+        #
+        # Merge-mdiSensorV3Check carries Requirement through UNNORMALISED: it keeps the RAW value of
+        # whichever side ranks higher, so whatever the checks arrived carrying is what these filters
+        # see. Measured on the shipped functions, one v3.x check per row, two roles merged:
+        #
+        #     Requirement   IsMandatory   became a blocker / an unknown
+        #     'Required'    True          True    ok
+        #     'All'         True          FALSE   dropped
+        #     $true         False         TRUE    promoted
+        #     'Optional'    False         False   ok
+        #
+        # 'All' ranks 3 - "every one must pass, and a measured failure blocks the verdict" - so a
+        # measured FAILURE of an All-class check was not a blocker and an UNREAD one was not even an
+        # unknown: it left the merge with no trace on either disclosure surface. And $true, which
+        # ConvertFrom-Json produces from "Requirement":true, was promoted to blocking because -eq
+        # coerces its right operand to the left one's type and `$true -eq 'Required'` is TRUE.
+        #
+        # Both shapes are ordinary on this path rather than contrived: this branch's own sibling
+        # exists for "the earlier-version and foreign reports", i.e. blobs that made a JSON round
+        # trip, and the merge itself runs whenever one host is discovered under two roles.
+        $blockers = @($mergedChecks | Where-Object { (Test-mdiRequirementIsMandatory -Requirement $_.Requirement) -and $_.Status -eq $false })
+        $unknowns = @($mergedChecks | Where-Object { (Test-mdiRequirementIsMandatory -Requirement $_.Requirement) -and $_.Measured -ne $true })
         $blockerMessages = @(foreach ($blocker in $blockers) { [string] $blocker.Name + ': ' + [string] $blocker.Detail })
         $architectural = @($blockers | Where-Object { -not $_.Remediable })
         $actionableBlockers = @(
@@ -18257,6 +18318,27 @@ function Get-mdiPublishedReadiness {
     $passed = Get-mdiCoverageCount -Value $Statistics.ChecksPassed
     $unread = Get-mdiCoverageCount -Value $Statistics.ChecksUnread
     $knownFailures = [math]::Max([double] 0, $measured - $passed)
+
+    # A MEASURED failure outranks every reason the run was incomplete, including a partial scan.
+    #
+    # The partial-scan gate below used to be reached first, so it decided the answer on its own: any
+    # run with a single partially scanned server published Readiness='N/A' - "not enough evidence to
+    # decide" - even when the very same run had measured real failures. Measured on the shipped
+    # function with TotalServers=6, PartialScanCount=1, ChecksTotal=40, ChecksPassed=35 - five checks
+    # observed failing - the published value was the STRING 'N/A'. With PartialScanCount=0 and the
+    # same five failures it returned $false, which is what the contract in this comment block has
+    # always said, so the two paths disagreed about identical evidence.
+    #
+    # Readiness is the MACHINE-READABLE field: a pipeline gating on it reads 'N/A' as "inconclusive,
+    # nothing proven wrong" and does not fail the build, so five failing checks pass silently. The
+    # cross-forest topology is what makes this ordinary rather than rare - a -MultiForest run reaching
+    # the second forest across the trust routinely scans some far-forest servers only partially, which
+    # was enough on its own to erase every failure the near forest had proven.
+    #
+    # An unparseable PartialScanCount already counts as zero, so a count that was never read cannot
+    # reach the N/A gate either; only a count that parses above zero can, and now only when nothing
+    # was observed failing.
+    if ($knownFailures -gt 0) { return $false }
 
     if ($totalServers -eq 0 -or $partialScans -gt 0) { return 'N/A' }
     if ($knownFailures -eq 0 -and $unread -gt 0) { return 'N/A' }
