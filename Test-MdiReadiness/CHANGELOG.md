@@ -15,6 +15,28 @@ The version is defined once, in the `$settings` block of the script, and appears
 footer, in the `-AsJson` output and in each baseline history entry, so any report or trend can be
 traced back to the build that produced it.
 
+## [1.1.6] - 2026-08-18
+
+Correctness release. Thirty-one defects fixed, each with a mutation-tested regression test.
+
+No parameter, report section or JSON field changed, so an existing `-BaselinePath` history and any
+`-AsJson` consumer keep working.
+
+### Fixed
+
+- An estate named by its NetBIOS name, with a trailing dot or in a different case was treated as
+  unreachable rather than as the same estate spelled differently.
+- Surfaces that could not be read - a service list, a product type, a DNS question, a schema, a
+  certification authority - were reported as failures instead of as unread.
+- NNR probe budget and domain-controller scope were decided by sampling or by one domain's share,
+  leaving other domains unprobed but still counted.
+- A port requirement was ranked against the first match rather than the strongest, and a probe of a
+  host against itself counted as an open network path.
+- Cross-forest trustees and DACL entries were identified by spelling, so one trustee could read as
+  two and a DENY stopped subtracting from its ALLOW.
+- Reported artefact paths, remote JSON output and coverage figures disagreed with what the run
+  actually wrote.
+
 ## [1.1.5] - 2026-08-16
 
 Correctness release, and the end of a known blind spot: every function in the script is now named by
