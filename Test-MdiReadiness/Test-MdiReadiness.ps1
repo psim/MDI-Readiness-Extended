@@ -1840,12 +1840,42 @@ function Test-mdiNnrNetBios {
         [int] $TimeoutMs = 1500
     )
 
+    # An input that PARSES as an IP address is checked for being a REMOTE COMPUTER address before any
+    # datagram is sent. A name is left alone - this function accepts either, and only an address can
+    # be judged here.
+    #
+    # Only the IPv6 case was guarded. Loopback, multicast and the unspecified address fell through to
+    # a real send whose silence was then reported as a MEASUREMENT: "Blocked - no response within
+    # {n} ms, retried and still silent (filtered by a firewall or no service listening)". That detail
+    # carries no "not tested" marker, so the tri-state reader counts it as a measured NNR failure and
+    # the operator is told to open a firewall for an address that is not a remote endpoint at all.
+    # Measured on the shipped function:
+    #
+    #   127.0.0.1     usable=False  ->  "Blocked - ... filtered by a firewall"   notTestedMarker=False
+    #   224.0.0.1     usable=False  ->  "Blocked - ... filtered by a firewall"   notTestedMarker=False
+    #   169.254.1.1   usable=False  ->  "Not tested - NetworkUnreachable ..."    (socket, by luck)
+    #   0.0.0.0       usable=False  ->  "Not tested - AddressNotAvailable ..."   (socket, by luck)
+    #
+    # The two that reported a firewall did so only because the send SUCCEEDED and nothing answered;
+    # the two that did not were rescued by a socket error, not by a check. Which of the four an
+    # operator sees is therefore decided by the network stack rather than by the code, and NNR is one
+    # of the four methods behind the "low success rate of active name resolution" alert this tool
+    # exists to explain. Test-mdiUsableComputerAddress is the same reader Resolve-mdiNnrTarget and
+    # Resolve-mdiLdapTarget already use to keep such addresses out of the plan; this is the same
+    # question asked at the point of use, so the two readers of one target cannot disagree.
     $canonicalAddress = ConvertTo-mdiCanonicalIPAddress -Value $ComputerName
-    if ($null -ne $canonicalAddress -and
-        [Net.IPAddress]::Parse($canonicalAddress).AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) {
-        return [PSCustomObject]@{ Success = $false
-            Detail = 'Not tested - NetBIOS node status uses IPv4 only and does not apply to an IPv6 target'
-            LatencyMs = $null
+    if ($null -ne $canonicalAddress) {
+        if ([Net.IPAddress]::Parse($canonicalAddress).AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) {
+            return [PSCustomObject]@{ Success = $false
+                Detail = 'Not tested - NetBIOS node status uses IPv4 only and does not apply to an IPv6 target'
+                LatencyMs = $null
+            }
+        }
+        if (-not (Test-mdiUsableComputerAddress -Value $canonicalAddress)) {
+            return [PSCustomObject]@{ Success = $false
+                Detail = ('Not tested - {0} is not a remote computer address, so no NetBIOS name service was asked about any host' -f $canonicalAddress)
+                LatencyMs = $null
+            }
         }
     }
 
@@ -2001,6 +2031,39 @@ function Test-mdiReverseDns {
         [Parameter(Mandatory = $true)] [string] $IPAddress,
         [int] $TimeoutMs = 3000
     )
+
+    # The address is checked BEFORE the lookup, because the answer to a lookup that was never about a
+    # host cannot be a measurement of that host's PTR record.
+    #
+    # The catch below classifies SocketError HostNotFound (11001) as "the resolver got an
+    # authoritative answer and there is no PTR record - a real, measured failure", which is correct
+    # for a real address. It is wrong for an input that is not an address: there 11001 means "that
+    # string is not a host", not "this address has no PTR record". BeginGetHostEntry raises exactly
+    # that for a blank one, so the function returned
+    #
+    #   Test-mdiReverseDns -IPAddress ' '  ->  Success=False
+    #   Detail='No PTR record - verify the Reverse Lookup Zone exists and is populated'  LatencyMs=24
+    #
+    # measured on the shipped function, for every whitespace spelling and for any non-address text
+    # the resolver rejects quickly. That detail carries no "not tested" marker, so the tri-state
+    # reader counts it as a MEASURED name-resolution failure and the report tells the operator to
+    # create and populate a reverse lookup zone for a host nobody ever asked about. A value that was
+    # never read came back looking like a measurement, and the remedy it implies cannot work.
+    #
+    # Loopback is the same defect with the opposite sign: 127.0.0.1 answered "Resolved to
+    # kubernetes.docker.internal", Success=TRUE - a reverse lookup that PASSED without any device on
+    # the network having been resolved.
+    #
+    # Test-mdiUsableComputerAddress is the reader Resolve-mdiNnrTarget, Resolve-mdiLdapTarget and
+    # Get-mdiComputerAddress already use to keep these addresses out of the plan. Asking it here as
+    # well means the probe and the resolver cannot disagree about the same target. A normal global
+    # IPv6 address is usable, so IPv6 reverse lookups are unaffected.
+    if (-not (Test-mdiUsableComputerAddress -Value $IPAddress)) {
+        return [PSCustomObject]@{ Success = $false
+            Detail = ('Not tested - ''{0}'' is not a usable computer address, so no reverse lookup was made about any host' -f $IPAddress)
+            LatencyMs = $null
+        }
+    }
 
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
@@ -2555,6 +2618,14 @@ function Get-mdiPortProbeScriptText {
     # line or written to the server as a file when it is too large to embed.
     $functionNames = @(
         'ConvertTo-mdiCanonicalIPAddress', 'Test-mdiIsNotRunError',
+        # Test-mdiUsableComputerAddress is called by Test-mdiNnrNetBios and Test-mdiReverseDns, which
+        # both run ON the sensor, to refuse an address that is not a remote computer endpoint instead
+        # of reporting the silence that follows as a measured firewall block or a missing PTR record.
+        # It is listed here for the reason the comment below gives: this script runs on the sensor
+        # with nothing but the functions named here, so omitting it would make every NNR probe on
+        # every server die with a command-not-found. It calls only ConvertTo-mdiCanonicalIPAddress,
+        # which is already shipped.
+        'Test-mdiUsableComputerAddress',
         'Test-mdiTcpPort', 'Test-mdiUdpPort', 'New-mdiNetBiosNodeStatusPacket', 'New-mdiDnsQueryPacket',
         'New-mdiCldapPingPacket', 'Test-mdiNnrNetBios', 'Test-mdiReverseDns', 'Get-mdiPtrHostEntry',
         'Test-mdiCloudConnectivity',
@@ -3540,10 +3611,36 @@ function Resolve-mdiLdapTarget {
     # Every unique (identity, IP) pair of the selected hosts, de-duplicated. Grouping by the identity
     # AND the IP keeps both addresses of a multi-homed DC while discarding an inventory row that
     # repeats a pair - and keeps a same-named domain controller in another domain distinct.
+    #
+    # The ADDRESS half is COERCED, for the same reason and by the same mechanism as the Domain half
+    # thirteen lines above. This line read `..., IP` - the bare spelling - and Group-Object given a
+    # bare property name compares the RAW values, under which two DISTINCT single-element arrays
+    # compare EQUAL. Measured on the shipped function, one multi-homed domain controller whose two
+    # rows carried IP = @('10.10.2.10') and IP = @('10.10.2.11'):
+    #
+    #   bare  ..., IP                     1 group named 'h, {10.10.2.10}'  -> 1 target
+    #   coerced key                       2 groups                         -> 2 targets
+    #
+    # One NIC was therefore dropped before any probe was issued - and this function exists to stop
+    # exactly that, in its own words: "a domain controller that answers LDAP on one NIC and is
+    # filtered on another must be tested on BOTH". The dropped interface produces no record at all,
+    # so nothing downstream can count it as unmeasured; the LDAP card simply reports the DC on the
+    # strength of the interface that answered, which is the false green this codebase exists to
+    # prevent.
+    #
+    # Stated no more strongly than it was measured, exactly as the address guard above is: today's
+    # producer, Get-mdiDomainControllerInventory, canonicalises each address and assigns a scalar,
+    # so this is not a live false green in the shipped pipeline. It is a disagreement between two
+    # readers of one inventory - a supplied inventory, an -AsJson round trip, another tool or a
+    # hand-edited report reaches it - and the fix belongs on the key, where its two sibling fields
+    # already are.
     $targets = @($DomainControllers | Where-Object {
                 (Test-mdiUsableComputerAddress -Value $_.IP) -and ($selectedKeys -contains (Get-mdiProbeTargetKey -Target $_))
             } |
-            Group-Object -Property { Get-mdiProbeTargetKey -Target $_ }, IP | ForEach-Object { @($_.Group)[0] })
+            Group-Object -Property { Get-mdiProbeTargetKey -Target $_ }, {
+                $canonical = ConvertTo-mdiCanonicalIPAddress -Value $_.IP
+                if ($null -ne $canonical) { $canonical } else { ([string] $_.IP).Trim() }
+            } | ForEach-Object { @($_.Group)[0] })
 
     # Returned WITHOUT the comma operator, for the same reason as Resolve-mdiNnrTarget: an empty
     # result must count as zero targets in a caller that wraps the call in @().
@@ -12394,11 +12491,38 @@ function Get-mdiRequirementRank {
 
         Ranked rather than compared as text because the values are an ordered scale, and because an
         unrecognised value must sort BELOW a real one rather than winning by accident.
+
+        TRIMMED before it is ranked, the way every sibling reader of a field that crosses the same
+        boundary already normalises - ConvertTo-mdiBoolean opens with `([string] $Value).Trim()`,
+        Get-mdiProbeDomainKey and Get-mdiProbeTargetKey both trim, and the readability predicate in
+        Get-mdiRequiredPortsHtml trims on the very line it calls this function from. Without it
+        ' Optional ' was recognised as Optional and ' Required ' as nothing at all, inside one
+        expression.
+
+        Requirement crosses a JSON boundary by design - the plan is serialised into the remote probe
+        script and the results are read back with ConvertFrom-Json - and the shapes a merged,
+        hand-edited or foreign-tool report puts on this field are already documented above: the
+        number 636, the boolean $true, 'Required.'. A padded or line-ending-terminated spelling is
+        that same population and the only member of it that states a correct, unambiguous
+        obligation. Measured on the shipped functions, one LDAPS 636 record REFUSED to
+        dcfab01.fabrikam.local with nothing differing but the whitespace around the word:
+
+            Requirement     rank   Get-mdiBlockingPortFailure   Get-mdiUnmeasuredRequiredProbe
+            'Required'      3      1                            1
+            ' Required'     0      0                            0
+            "Required`r"    0      0                            0
+
+        So a required port PROVEN REFUSED did not block the verdict and one NOBODY MEASURED did not
+        gate READY. -MultiForest is what puts real traffic there: it promotes LdapsTcp and LdapsGcTcp
+        to Required, so in a cross-forest estate those are exactly the records that decide readiness.
+
+        Trimming cannot promote an unreadable value: 636, $true, 'Required.', '' and whitespace-only
+        all still fall to 0, which the regression test pins alongside the padded spellings.
     #>
     param (
         [Parameter(Mandatory = $false)] [AllowNull()] [object] $Requirement
     )
-    switch ([string] $Requirement) {
+    switch (([string] $Requirement).Trim()) {
         'Required' { 3 }
         'All' { 3 }
         'AtLeastOne' { 2 }
@@ -16579,11 +16703,33 @@ function Get-mdiSensorV3Html {
                 } elseif ([string] $status -eq 'N/A' -or $null -eq $status) {
                     '<td class="grey" title="{0}">N/A</td>' -f (ConvertTo-mdiHtmlEncoded $check.Detail)
                 } else {
-                    $class = switch ($check.Requirement) {
-                        'Required' { 'red' }
-                        'Recommended' { 'amber' }
-                        default { 'amber' }
-                    }
+                    # The severity colour is taken from the obligation SCALE, not from a private
+                    # comparison against the literal word.
+                    #
+                    # This switch was `switch ($check.Requirement)` with 'Required' red and everything
+                    # else amber, which disagreed with Get-mdiRequirementRank - the single obligation
+                    # scale this file owns - in two ways that both understate a mandatory failure:
+                    #
+                    #   Requirement     rank   cell before   cell now
+                    #   'Required'      3      red           red
+                    #   ' Required'     3      AMBER         red
+                    #   'Required '     3      AMBER         red
+                    #   "Required`r"    3      AMBER         red
+                    #   'All'           3      AMBER         red
+                    #
+                    # Checks reach here from $srv.Details.SensorV3ReadyDetails.Checks, read back across
+                    # the same base64/JSON boundary that already delivers 'Required.' and the number 636
+                    # on this field, so a padded or line-ending-terminated spelling is the ordinary
+                    # population - and it is the one member of it that is a correct, unambiguous
+                    # requirement. 'All' needs no boundary at all: it is in the shipped ports table and
+                    # ranks 3, and was painted advisory by the default arm.
+                    #
+                    # After the 18:19 fix to Get-mdiRequirementRank the two surfaces actively
+                    # contradicted each other - the run treated the check as mandatory while the chart
+                    # a reader looks at called it advisory. Routing through the scale is what stops them
+                    # drifting again; the mapping is otherwise unchanged, AtLeastOne and Recommended
+                    # stay amber exactly as before.
+                    $class = if ((Get-mdiRequirementRank -Requirement $check.Requirement) -ge 3) { 'red' } else { 'amber' }
                     '<td class="{0}" title="{1}">Fail</td>' -f $class, (ConvertTo-mdiHtmlEncoded $check.Detail)
                 }
             }
