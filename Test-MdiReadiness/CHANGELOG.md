@@ -19,6 +19,30 @@ traced back to the build that produced it.
 
 ### Fixed
 
+- A domain in scope that received no Network Name Resolution probe target reached READY with a
+  green score, because nothing recorded that it had been skipped. The two probe budgets are not the
+  same kind of number, and the difference is invisible until the scope holds more than one domain:
+  `-MaxLdapTargetsPerDomain` is spent PER DOMAIN, so every domain is guaranteed targets, while
+  `-MaxNnrTargets` is a single GLOBAL pool the domains compete for. `Resolve-mdiNnrTarget` spreads
+  that pool per domain - its own comment says why, "A forest nobody probed is not a forest that
+  passed" - but spreading can only honour that while the budget is at least as large as the number
+  of domains in scope, and the shipped default is 5. Measured on the shipped sampler at that
+  default, three controllers per domain: five domains in scope were all probed, six left the sixth
+  with no target at all, and eight left three domains unprobed - while the per-domain LDAP budget
+  starved none of them on the same estate. So a domain whose controllers were fully scanned,
+  passing both the unexamined-domain gate and the LDAP plan gap, could have its name resolution
+  never measured. It was not merely undisclosed but UNRECORDED: the report carried no resolved NNR
+  target list and no per-domain NNR coverage, so no surface could raise it, and the only NNR
+  disclosure is a global host count ("name resolution 5 of 18 host(s)") that reads identically
+  whether the sample spread across every domain or an entire domain got nothing. Now recorded as
+  `NnrPlanGapDomains` and read by the same three consumers as the LDAP gap - one unread charged per
+  domain, a High "Not measured" finding naming it, and READY refused. The rule deliberately differs
+  from the LDAP one: an operator-supplied target takes its Domain from its own DNS suffix, so a
+  bare IP address yields `$null` by design and a disjoint NetBIOS suffix (`ws4.FABCORP`) yields a
+  name in no scope; measured with four targets named as IP addresses the naive rule charged ALL
+  FOUR scoped domains, so any target the run cannot place silences the charge rather than licensing
+  it. This trades no false green for a false red.
+
 - Merging the two role passes over one host decided "is this check mandatory?" with its own inline
   `-eq 'Required'` instead of `Test-mdiRequirementIsMandatory`, the one definition of that rule, and
   the copy had drifted in both directions at once. `'All'` ranks alongside `'Required'` - every one

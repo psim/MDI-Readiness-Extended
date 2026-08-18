@@ -14078,6 +14078,28 @@ function Get-mdiReportStatistics {
             }
         })
 
+    # A domain that received no NAME RESOLUTION target is the same gap on the other probe surface,
+    # and it reached the score card the same way the LDAP gap did: not at all. The two budgets
+    # differ in kind - -MaxLdapTargetsPerDomain is per domain, -MaxNnrTargets is one global pool -
+    # so this one fires at the SHIPPED DEFAULT of 5 as soon as six domains are in scope, with the
+    # sixth domain's name resolution never measured and the score reading 100% in green.
+    #
+    # Charged one unread per domain, exactly like the LDAP gap, and de-duplicated for the same
+    # reason: one hole must not take two slots in the denominator.
+    $serverScores = @($serverScores) + @(
+        foreach ($gapDomain in @($ReportData.NnrPlanGapDomains |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } |
+                    ForEach-Object { [string] $_ } | Select-Object -Unique)) {
+            [PSCustomObject]@{
+                FQDN   = 'Domain name resolution not probed - {0}' -f $gapDomain
+                Passed = 0
+                Total  = 0
+                Failed = 0
+                Unread = 1
+                Kind   = 'Unmeasured'
+            }
+        })
+
     # A named domain controller with no usable address never entered either target plan. It is charged
     # once as unmeasured population so a missing endpoint cannot leave the score at 100%.
     $serverScores = @($serverScores) + @(
@@ -14760,6 +14782,21 @@ function Get-mdiIssueList {
             if ($alreadyUnexamined -contains $normalised) { continue }
             [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = $normalised; Area = 'Not measured'
                     Issue = 'No LDAP probe target could be built for this domain, so no sensor was asked whether it can reach its domain controllers'
+                })
+        }
+
+        # The same gap on the name-resolution surface. -MaxNnrTargets is a single GLOBAL budget the
+        # domains compete for, unlike the per-domain LDAP budget, so at the shipped default of 5 a
+        # sixth domain in scope receives no target at all and its name resolution is never measured.
+        # Filed under 'Not measured' rather than as an observed failure, for the same reason as the
+        # LDAP gap: nothing was seen to fail, because nothing was asked.
+        foreach ($gapDomain in @($ReportData.NnrPlanGapDomains | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })) {
+            # A domain that produced no servers at all is already named above; repeating it here
+            # would give the operator two lines for one hole.
+            $normalisedNnr = ([string] $gapDomain).Trim().TrimEnd('.')
+            if ($alreadyUnexamined -contains $normalisedNnr) { continue }
+            [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = $normalisedNnr; Area = 'Not measured'
+                    Issue = 'No Network Name Resolution probe target could be built for this domain, so no sensor was asked whether it can resolve names there. Raise -MaxNnrTargets above the number of domains in scope'
                 })
         }
 
@@ -18243,6 +18280,16 @@ function Test-mdiReadinessResult {
             $ldapPlanGap.Count, (@($ldapPlanGap | ForEach-Object { [string] $_ }) -join ', '))
     }
 
+    # The same judgement for a domain that received no NAME RESOLUTION target. -MaxNnrTargets is one
+    # global budget the domains compete for, so unlike the per-domain LDAP budget it starves whole
+    # domains at its shipped default of 5 once six are in scope. Nothing was observed failing there
+    # because nothing was asked, and nothing measured is not the same as nothing wrong.
+    $nnrPlanGap = @($ReportData.NnrPlanGapDomains | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })
+    if ($nnrPlanGap.Count -gt 0) {
+        Write-mdiWarning ('No Network Name Resolution probe target was built for {0} domain(s): {1}. Whether the sensors can resolve names there was never measured, so the run cannot be reported as ready. Raise -MaxNnrTargets above the number of domains in scope.' -f
+            $nnrPlanGap.Count, (@($nnrPlanGap | ForEach-Object { [string] $_ }) -join ', '))
+    }
+
     $addresslessDc = @($ReportData.AddresslessDomainControllers |
         Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } |
         ForEach-Object { [string] $_ } | Select-Object -Unique)
@@ -18289,6 +18336,7 @@ function Test-mdiReadinessResult {
     ($untestedRequiredPorts.Count -eq 0) -and
     ($untestedNnr.Count -eq 0) -and
     ($ldapPlanGap.Count -eq 0) -and
+    ($nnrPlanGap.Count -eq 0) -and
     ($addresslessDc.Count -eq 0) -and
     ($nnrUnresolved.Count -eq 0) -and
     ($clockSpread.IsWithin -ne $false) -and
@@ -18838,6 +18886,9 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
     $ldapPlanGapDomains = @()
     # Empty when the port plan is not built at all, for the same reason as the LDAP gap above: with
     # -SkipNetworkPorts nothing was asked of any sensor, and the skip disclosure already says so.
+    $nnrPlanGapDomains = @()
+    # Empty when the port plan is not built at all, for the same reason as the LDAP gap above: with
+    # -SkipNetworkPorts nothing was asked of any sensor, and the skip disclosure already says so.
     $nnrUnresolvedTargets = @()
     $addresslessDomainControllers = @()
     if (-not $SkipNetworkPorts) {
@@ -18886,6 +18937,57 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
             Write-mdiWarning ('No address could be resolved for the Network Name Resolution target(s) you named: {0}. They were dropped from the probe plan, so they will be reported as unverified rather than ready.' -f ($nnrUnresolvedTargets -join ', '))
         }
         Write-mdiVerbose ('Using {0} Network Name Resolution target(s): {1}' -f @($nnrTargets).Count, (@($nnrTargets | ForEach-Object { $_.Name }) -join ', '))
+        # A scoped domain that received NO name-resolution target at all, which is a DIFFERENT gap
+        # from the two above and the only one of the family still unrecorded.
+        #
+        # The two probe budgets are not the same kind of number, and the difference is invisible
+        # until the scope holds more than one domain: -MaxLdapTargetsPerDomain is spent PER DOMAIN,
+        # so every domain is guaranteed targets, while -MaxNnrTargets is a SINGLE GLOBAL pool the
+        # domains compete for. Resolve-mdiNnrTarget spreads that pool per domain - its own comment
+        # says why, "A forest nobody probed is not a forest that passed" - but spreading can only
+        # honour that while the budget is at least as large as the number of domains in scope, and
+        # the shipped default is 5.
+        #
+        # Measured on the shipped sampler at that default, three controllers per domain:
+        #
+        #   5 domains in scope -> 5 targets, every domain probed
+        #   6 domains in scope -> 5 targets, NO NNR PROBE for the sixth
+        #   8 domains in scope -> 5 targets, three domains never probed
+        #
+        # LDAP covered every domain in all of those runs. So a domain whose controllers were fully
+        # scanned - passing the unexamined-domain gate AND the LDAP plan gap - could have its name
+        # resolution never tested, and nothing said so: the report carried no resolved NNR target
+        # list and no per-domain NNR coverage, so no surface could have disclosed it even if it
+        # wanted to. The only NNR disclosure is a global host count, "name resolution 5 of 18
+        # host(s)", which reads identically whether the sample was spread across every domain or an
+        # entire domain got nothing.
+        #
+        # UNPLACEABLE TARGETS SUPPRESS THE CHARGE, which is the whole reason this is not a copy of
+        # the LDAP rule. Resolve-mdiLdapTarget only ever emits rows built from the domain-controller
+        # inventory, which always carries a Domain. This function has a second branch: an
+        # operator-supplied target gets its Domain from its own DNS suffix, and a bare IP address
+        # yields $null by design while a DISJOINT NetBIOS suffix (ws4.FABCORP) yields a name that is
+        # in no scope. Measured: with four targets named as IP addresses the naive rule charged ALL
+        # FOUR scoped domains as unprobed. A target the run cannot place is not evidence that some
+        # other domain went unprobed, so any of them silences the charge entirely - this must not
+        # trade a false green for a false red. The starvation case above is unaffected, because
+        # there every target comes from the inventory and is placeable.
+        $nnrScopeKeys = @($domainsInScope | ForEach-Object { ([string] $_).Trim().TrimEnd('.') } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $nnrUnplaceable = @($nnrTargets | Where-Object {
+                $targetDomain = ([string] $_.Domain).Trim().TrimEnd('.')
+                [string]::IsNullOrWhiteSpace($targetDomain) -or ($nnrScopeKeys -notcontains $targetDomain)
+            }).Count
+        if ($nnrUnplaceable -eq 0) {
+            $nnrPlanGapDomains = @($domainsInScope | Where-Object {
+                    $scoped = ([string] $_).Trim().TrimEnd('.')
+                    -not [string]::IsNullOrWhiteSpace($scoped) -and
+                    @($nnrTargets | Where-Object { ([string] $_.Domain).Trim().TrimEnd('.') -eq $scoped }).Count -eq 0
+                })
+        }
+        if ($nnrPlanGapDomains.Count -gt 0) {
+            Write-mdiWarning ('No Network Name Resolution probe target could be built for {0}, so no sensor was asked whether it can resolve names there. Raise -MaxNnrTargets above the number of domains in scope. It will be reported as unverified rather than ready.' -f ($nnrPlanGapDomains -join ', '))
+        }
         if (-not $NnrTargetComputer) {
             Write-mdiVerbose 'Tip: use -NnrTargetComputer to also validate NNR against workstations and member servers'
         }
@@ -18970,6 +19072,11 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
         # sensor-to-domain path never measured. The failure was written to a warning and then forgotten.
         # Recorded here so the issue list and the verdict can both see it.
         LdapPlanGapDomains     = @($ldapPlanGapDomains | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } | Select-Object -Unique)
+        # A domain in scope that received NO Network Name Resolution target, so no sensor was asked
+        # whether it can resolve names there. Recorded for the same three consumers as the LDAP gap:
+        # without the property they could not have raised it at all, which is why a domain starved
+        # of NNR probes by the global -MaxNnrTargets budget reached READY with a green score.
+        NnrPlanGapDomains      = @($nnrPlanGapDomains | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } | Select-Object -Unique)
         # Network Name Resolution targets the OPERATOR named that resolved to no address, so no sensor
         # was ever asked to resolve them. Recorded for the verdict and the issue list, which both read
         # it - unlike the first version of LdapPlanGapDomains, which was written for consumers that
