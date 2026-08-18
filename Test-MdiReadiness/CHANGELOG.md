@@ -19,6 +19,27 @@ traced back to the build that produced it.
 
 ### Fixed
 
+- A Network Name Resolution target the operator named, which resolves perfectly, was reported as a
+  host whose ADDRESS COULD NOT BE RESOLVED, when the truth was that the sampler dropped it for want
+  of budget. Main built the unresolved list against the plan AFTER `-MaxNnrTargets` had been spent,
+  so "resolved" silently meant "resolved AND survived the budget" and a budget drop was
+  indistinguishable from a host DNS cannot find. Measured on the shipped functions at the shipped
+  default of `-MaxNnrTargets 5` with eight named workstations, every one of which resolves: ws1-ws5
+  were probed, ws6, ws7 and ws8 were reported unresolved, and 3 of 3 resolve fine. All three
+  disclosure surfaces stated an address failure that had not happened - the console warning, a High
+  "could not be resolved to an address" finding, and the verdict - each charging an unread check and
+  blocking READY. The verdict was right, because those hosts genuinely were not probed, but the
+  cause was invented: the remedy it implied (fix name resolution) cannot work, and the one that
+  would (raise `-MaxNnrTargets`) was never mentioned. A control with a genuinely unresolvable host
+  confirms the wording is correct in that case, so this was wrong specifically for the budget drop.
+  Naming workstations is exactly what `-NnrTargetComputer` is for, and the tool's own console tip
+  recommends it, so naming more than five is ordinary usage at default settings.
+  `Resolve-mdiNnrTarget` now reports what RESOLVED through a `-ResolvedName` out-parameter taken
+  before the cap, Main compares the request against that, and named hosts that resolved but did not
+  fit the budget are disclosed separately as `NnrSampledOutTargets` - charged one unread each,
+  raising their own High finding that names `-MaxNnrTargets` as the remedy, and still blocking READY
+  because they genuinely were not probed.
+
 - A domain in scope that received no Network Name Resolution probe target reached READY with a
   green score, because nothing recorded that it had been skipped. The two probe budgets are not the
   same kind of number, and the difference is invisible until the scope holds more than one domain:

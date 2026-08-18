@@ -266,5 +266,30 @@ foreach ($gap in @(@(), @('child.contoso.test'), @('contoso.test', 'child.contos
         [int] $s.ChecksUnread -eq @($gap).Count) "(got $($s.ChecksUnread))"
 }
 
+''
+'[scope] the per-domain gap is NOT charged when the operator chose the target list'
+# This guard lives in Main, below the #region marker the harness truncates at, so it cannot be
+# exercised by calling a function - it is pinned here at the source level, the same technique
+# PortRequirementIsRankedNotComparedToALiteral uses.
+#
+# With -NnrTargetComputer the plan is the operator's own list and nothing else, so a scoped domain
+# they did not happen to name a host in is a CHOICE, not a gap. Charging it produced a false red
+# advising "raise -MaxNnrTargets above the number of domains in scope", which cannot change
+# anything because the budget was never the constraint. Measured with two domains in scope, two
+# hosts named in one of them and a budget of 20: the other domain was charged one unread, raised a
+# High finding and blocked READY, with nothing starved. It also double-charged - one deliberate
+# choice plus one budget shortfall became four unread checks instead of three.
+#
+# NnrCandidateCount already makes exactly this judgement for the sampling disclosure, with the same
+# predicate, so the two cannot drift apart.
+$gapStart = $source.IndexOf('$nnrScopeKeys = @($domainsInScope')
+Assert-That 'the per-domain NNR gap statement is still present in Main' ($gapStart -gt 0)
+$gapBlock = if ($gapStart -gt 0) { $source.Substring($gapStart, 1400) } else { '' }
+Assert-That 'the gap is guarded by Test-mdiNoNameSupplied, so a named list charges no domain' (
+    $gapBlock -match 'if \(\(Test-mdiNoNameSupplied -Name \$NnrTargetComputer\) -and \$nnrUnplaceable -eq 0\)')
+Assert-That 'the unplaceable-target guard survives alongside it' (
+    $gapBlock -match '\$nnrUnplaceable -eq 0')
+
+
 "================ $script:pass passed / $script:fail failed ================"
 if ($script:fail -gt 0) { exit 1 }

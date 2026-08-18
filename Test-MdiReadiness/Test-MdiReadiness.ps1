@@ -3224,7 +3224,26 @@ function Resolve-mdiNnrTarget {
         [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $DomainControllers,
         [Parameter(Mandatory = $false)] [string[]] $NnrTargetComputer = $null,
         [Parameter(Mandatory = $false)] [string] $Domain = $null,
-        [Parameter(Mandatory = $false)] [int] $MaxTargets = 5
+        [Parameter(Mandatory = $false)] [int] $MaxTargets = 5,
+        # The names that RESOLVED, reported back before the budget is spent - the same out-parameter
+        # pattern, spelled the same way, that Resolve-mdiDomainController and
+        # Get-mdiForestDomainFromLdap carry for the identical reason: the caller has to be able to
+        # tell "we could not find this host" apart from "we did not get to it".
+        #
+        # Main compares the operator's -NnrTargetComputer list against the plan to decide which named
+        # hosts were never probed, and the plan is what SURVIVED the cap. So a host the budget
+        # dropped was indistinguishable from a host DNS cannot find, and all three disclosure
+        # surfaces said the address could not be resolved. Measured at the shipped default of 5 with
+        # eight named workstations, every one of which resolves: ws6, ws7 and ws8 were reported as
+        # unresolvable, 3 of 3 resolve. The verdict was right - they were not probed - but the CAUSE
+        # was invented, so the remedy it implied (fix name resolution) could not work and the one
+        # that would (raise -MaxNnrTargets) was never mentioned.
+        # No default value. `[ref] $X = $null` cannot bind when the parameter is OMITTED - PowerShell
+        # tries to coerce the default into a reference and raises "Reference type is expected in
+        # argument", which would break every caller that does not want the names, including the
+        # tests. Declared exactly like Get-mdiDomainControllerFromLdap's -UnnamedCount, which is the
+        # working instance of this pattern in this script, and guarded with a null test below.
+        [Parameter(Mandatory = $false)] [ref] $ResolvedName
     )
 
     # Network Name Resolution must work against every device on the network, not only domain controllers. When the
@@ -3400,6 +3419,14 @@ function Resolve-mdiNnrTarget {
         # filter - a cached inventory, an imported baseline, an operator-supplied list - would land
         # exactly there, and the sampling budget would be spent on placeholders in the meantime.
         @($DomainControllers | Where-Object { Test-mdiUsableComputerAddress -Value $_.IP })
+    }
+
+    # Reported BEFORE the cap is applied, so it names what resolved rather than what fitted in the
+    # budget. Assigned unconditionally, and reset here rather than at the call site, so a caller that
+    # reuses one variable across several resolutions cannot inherit a previous one's names.
+    if ($null -ne $ResolvedName) {
+        $ResolvedName.Value = @($targets | ForEach-Object { [string] $_.Name } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     }
 
     # The cap counts HOSTS, not addresses. Truncating a flat list of addresses would silently drop the
@@ -14145,7 +14172,25 @@ function Get-mdiReportStatistics {
             }
         })
 
-    # The clock SPREAD is the sixth gap of this family, and the same shape as the fifth. MDI requires
+    # Named hosts that RESOLVED but were never probed because -MaxNnrTargets ran out. Charged the
+    # same one unread per target, because "we did not get to it" is exactly as unmeasured as "we
+    # could not find it" - only the cause and the remedy differ. Kept out of the list above so the
+    # operator is not told name resolution failed for a host that resolves perfectly.
+    $serverScores = @($serverScores) + @(
+        foreach ($nnrTarget in @($ReportData.NnrSampledOutTargets |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } |
+                    ForEach-Object { ([string] $_).Trim() } | Select-Object -Unique)) {
+            [PSCustomObject]@{
+                FQDN   = 'Name resolution target not probed (budget) - {0}' -f $nnrTarget
+                Passed = 0
+                Total  = 0
+                Failed = 0
+                Unread = 1
+                Kind   = 'Unmeasured'
+            }
+        })
+
+    # The clock SPREAD is the next gap of this family, and the same shape as the one before it. MDI requires
     # the sensor servers to be within five minutes OF EACH OTHER; that is an estate-level fact and
     # belongs to no single server, so no per-server check carries it. The verdict reads it and the
     # issue list raises it - but the SCORE surfaces never did, so a run whose clocks were 480 seconds
@@ -14814,6 +14859,16 @@ function Get-mdiIssueList {
         foreach ($nnrTarget in @($ReportData.NnrUnresolvedTargets | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })) {
             [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = ([string] $nnrTarget).Trim(); Area = 'Not measured'
                     Issue = 'This Network Name Resolution target could not be resolved to an address, so no sensor was asked to resolve it'
+                })
+        }
+
+        # The same gap with the other cause. This host resolved perfectly; the sampler simply never
+        # reached it because -MaxNnrTargets ran out. Filed as its own finding so the remedy named is
+        # the one that works - raising the budget - rather than sending the operator to fix name
+        # resolution that is not broken.
+        foreach ($nnrTarget in @($ReportData.NnrSampledOutTargets | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })) {
+            [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = ([string] $nnrTarget).Trim(); Area = 'Not measured'
+                    Issue = 'This Network Name Resolution target resolved but was not probed because the -MaxNnrTargets budget was exhausted. Raise -MaxNnrTargets to at least the number of hosts you name'
                 })
         }
     }
@@ -18307,6 +18362,15 @@ function Test-mdiReadinessResult {
             $nnrUnresolved.Count, (@($nnrUnresolved | ForEach-Object { [string] $_ }) -join ', '))
     }
 
+    # Named hosts that RESOLVED and were still never probed, because -MaxNnrTargets ran out. Judged
+    # exactly like the list above - nothing was observed to fail because nothing was asked - but
+    # stated with its own cause, so the operator is not sent to fix name resolution that works.
+    $nnrSampledOut = @($ReportData.NnrSampledOutTargets | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })
+    if ($nnrSampledOut.Count -gt 0) {
+        Write-mdiWarning ('{0} Network Name Resolution target(s) you named resolved but were never probed because the -MaxNnrTargets budget was exhausted: {1}. Raise -MaxNnrTargets to at least the number of hosts you name. The run cannot be reported as ready.' -f
+            $nnrSampledOut.Count, (@($nnrSampledOut | ForEach-Object { [string] $_ }) -join ', '))
+    }
+
     # The sensor clocks must agree with EACH OTHER, which no per-server check can establish. Every
     # TimeSync result above compares one clock with the computer running the scan, and two sensors can
     # each be inside that tolerance while being twice it apart from one another - the condition MDI
@@ -18339,6 +18403,7 @@ function Test-mdiReadinessResult {
     ($nnrPlanGap.Count -eq 0) -and
     ($addresslessDc.Count -eq 0) -and
     ($nnrUnresolved.Count -eq 0) -and
+    ($nnrSampledOut.Count -eq 0) -and
     ($clockSpread.IsWithin -ne $false) -and
     $domainsExamined -and
     $forestComplete -and
@@ -18890,6 +18955,7 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
     # Empty when the port plan is not built at all, for the same reason as the LDAP gap above: with
     # -SkipNetworkPorts nothing was asked of any sensor, and the skip disclosure already says so.
     $nnrUnresolvedTargets = @()
+    $nnrSampledOutTargets = @()
     $addresslessDomainControllers = @()
     if (-not $SkipNetworkPorts) {
         Write-mdiVerbose 'Building the network port probe plan'
@@ -18923,8 +18989,9 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
         }
         Write-mdiVerbose ('Using {0} LDAP target(s): {1}' -f @($ldapTargets).Count, (@($ldapTargets | ForEach-Object { $_.Name }) -join ', '))
 
+        $nnrResolvedNames = @()
         $nnrTargets = @(Resolve-mdiNnrTarget -DomainControllers $dcInventory -NnrTargetComputer $NnrTargetComputer `
-                -Domain $Domain -MaxTargets $MaxNnrTargets)
+                -Domain $Domain -MaxTargets $MaxNnrTargets -ResolvedName ([ref] $nnrResolvedNames))
         # A host the OPERATOR named that resolved to no address at all is dropped from the plan with
         # nothing but a warning, so no sensor is ever asked to resolve it and no consumer can tell.
         # That is the same shape as the LDAP plan gap below: the failure was written to a warning and
@@ -18932,9 +18999,29 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
         # name - a silent drop answers "can the sensor resolve my workstations?" with a run that never
         # tried. Captured from the PLAN rather than from the resolver, so it stays true however the
         # target came to be missing.
-        $nnrUnresolvedTargets = @(Get-mdiUnresolvedNnrTarget -Requested $NnrTargetComputer -Resolved @($nnrTargets | ForEach-Object { $_.Name }))
+        #
+        # Compared against what RESOLVED, not against what survived the budget. $nnrTargets is the
+        # plan after -MaxNnrTargets has been spent, so using it here made a host the sampler dropped
+        # indistinguishable from a host DNS cannot find, and this warning, the issue list and the
+        # verdict all stated an address failure that had not happened. Measured at the shipped default
+        # of 5 with eight named workstations, all of which resolve: three were named here, and 3 of 3
+        # resolve perfectly. A control with a genuinely unresolvable host confirms the wording is
+        # correct in that case, so this was wrong specifically for the budget drop.
+        $nnrUnresolvedTargets = @(Get-mdiUnresolvedNnrTarget -Requested $NnrTargetComputer -Resolved $nnrResolvedNames)
         if ($nnrUnresolvedTargets.Count -gt 0) {
             Write-mdiWarning ('No address could be resolved for the Network Name Resolution target(s) you named: {0}. They were dropped from the probe plan, so they will be reported as unverified rather than ready.' -f ($nnrUnresolvedTargets -join ', '))
+        }
+        # Named, RESOLVED, and still not probed - because the budget ran out. A different fact from
+        # the one above with a different remedy, so it is disclosed separately rather than folded into
+        # a sentence about name resolution. Those hosts genuinely were not probed, so they still keep
+        # the run out of READY; what changes is that the operator is told the true cause and the
+        # parameter that fixes it.
+        $nnrSampledOutTargets = @(Get-mdiUnresolvedNnrTarget -Requested $NnrTargetComputer `
+                -Resolved @($nnrTargets | ForEach-Object { $_.Name }) |
+                Where-Object { $nnrUnresolvedTargets -notcontains $_ })
+        if ($nnrSampledOutTargets.Count -gt 0) {
+            Write-mdiWarning ('{0} Network Name Resolution target(s) you named resolved but were not probed because -MaxNnrTargets is {1}: {2}. Raise -MaxNnrTargets to at least the number of hosts you name. They will be reported as unverified rather than ready.' -f
+                $nnrSampledOutTargets.Count, $MaxNnrTargets, ($nnrSampledOutTargets -join ', '))
         }
         Write-mdiVerbose ('Using {0} Network Name Resolution target(s): {1}' -f @($nnrTargets).Count, (@($nnrTargets | ForEach-Object { $_.Name }) -join ', '))
         # A scoped domain that received NO name-resolution target at all, which is a DIFFERENT gap
@@ -18972,13 +19059,27 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
         # other domain went unprobed, so any of them silences the charge entirely - this must not
         # trade a false green for a false red. The starvation case above is unaffected, because
         # there every target comes from the inventory and is placeable.
+        # ONLY when the domain-controller fallback supplied the targets. With -NnrTargetComputer the
+        # plan is the operator's own list and nothing else, so a scoped domain they did not happen to
+        # name a host in is a CHOICE, not a gap - and charging it produced a false red that advised
+        # "raise -MaxNnrTargets above the number of domains in scope", which cannot change anything
+        # because the budget was never the constraint. Measured with two domains in scope, two hosts
+        # named in one of them and a budget of 20: the other domain was charged one unread, raised a
+        # High finding and blocked READY, with nothing starved.
+        #
+        # This is the same judgement NnrCandidateCount already makes for the sampling disclosure -
+        # "when these hosts were named explicitly there is no sample to disclose, and saying 'a sample
+        # of 500 in scope' about a list the operator wrote himself is just wrong" - and it is made
+        # with the same predicate, so the two cannot drift apart. A named host that resolved and did
+        # not fit the budget is still disclosed, as NnrSampledOutTargets below; that one IS a budget
+        # shortfall and does name the right remedy.
         $nnrScopeKeys = @($domainsInScope | ForEach-Object { ([string] $_).Trim().TrimEnd('.') } |
                 Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
         $nnrUnplaceable = @($nnrTargets | Where-Object {
                 $targetDomain = ([string] $_.Domain).Trim().TrimEnd('.')
                 [string]::IsNullOrWhiteSpace($targetDomain) -or ($nnrScopeKeys -notcontains $targetDomain)
             }).Count
-        if ($nnrUnplaceable -eq 0) {
+        if ((Test-mdiNoNameSupplied -Name $NnrTargetComputer) -and $nnrUnplaceable -eq 0) {
             $nnrPlanGapDomains = @($domainsInScope | Where-Object {
                     $scoped = ([string] $_).Trim().TrimEnd('.')
                     -not [string]::IsNullOrWhiteSpace($scoped) -and
@@ -19082,6 +19183,11 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
         # it - unlike the first version of LdapPlanGapDomains, which was written for consumers that
         # were never implemented and so returned READY over an unmeasured path.
         NnrUnresolvedTargets   = @($nnrUnresolvedTargets | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } | Select-Object -Unique)
+        # Named hosts that RESOLVED but were never probed because -MaxNnrTargets ran out. Recorded
+        # separately from the unresolved list because the two have different causes and different
+        # remedies, and folding them together is what made the run blame DNS for a host that
+        # resolves perfectly.
+        NnrSampledOutTargets   = @($nnrSampledOutTargets | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } | Select-Object -Unique)
         AddresslessDomainControllers = @($addresslessDomainControllers | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } | Select-Object -Unique)
         # Recorded so the report can tell whether the NNR target list was CHOSEN by the operator or
         # sampled from the domain controller inventory. The report discloses the sample only in the
