@@ -1157,6 +1157,43 @@ function Test-mdiUsableComputerAddress {
     $false
 }
 
+function Test-mdiNoNameSupplied {
+    <#
+        Whether a caller-supplied list of server names names nothing usable.
+
+        The three role scanners each decide whether to AUTO-DISCOVER their servers or to trust a list
+        the caller passed in. All three asked [string]::IsNullOrEmpty($List) - and every one of those
+        parameters is declared [string[]], so the question that actually got asked was "is the ARRAY,
+        JOINED WITH SPACES, an empty string". Two blank entries join to a single space, which is not
+        empty, so a list carrying no usable name at all took the "trust the caller" branch.
+
+        That branch is the only one with NO warning and NO not-measured marker. One step later every
+        blank is dropped by Where-Object { -not [string]::IsNullOrWhiteSpace(...) }, so the list
+        became empty immediately after the only code that would have said so.
+
+        Measured on the shipped functions with -DomainController @('',''): discovery was skipped, zero
+        names survived the filter, and the run produced neither the "No domain controller was checked"
+        warning nor any unmeasured population - the "clean-looking report of nothing" that
+        Get-mdiDomainControllerReadiness's own comment says must never be mistaken for a completed
+        scan. @($null,$null), @(' ',' ') and a bare ' ' behave identically. @('') does NOT, because a
+        single blank joins to the empty string - which is why the defect survived: the one blank shape
+        anybody would think to try is the one shape that works.
+
+        For -CAServer and -EntraConnectServer the same skip loses the $caNotMeasured /
+        $entraConnectNotMeasured markers, so those roles render as "nothing here to check" rather than
+        as not verified.
+
+        Tested per ELEMENT for a usable name, not on the joined text and not on array length: @('')
+        and @($null) are lists that exist and name nothing, and "did the caller name a server" is the
+        fact the branch needs. IsNullOrWhiteSpace, not IsNullOrEmpty.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [AllowEmptyCollection()] $Name
+    )
+
+    @($Name | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) }).Count -eq 0
+}
+
 function Test-mdiTcpPort {
     param (
         [Parameter(Mandatory = $true)] [string] $ComputerName,
@@ -2959,6 +2996,56 @@ function Get-mdiProbeTargetKey {
     [string] (ConvertTo-mdiCanonicalComputerName -Value $Target.Name -Domain ([string] $Target.Domain))
 }
 
+function Get-mdiProbeDomainKey {
+    <#
+        The identity a DOMAIN is grouped by when a bounded probe budget is spread ACROSS DOMAINS.
+
+        Get-mdiProbeTargetKey above owns "which host is this"; this owns "which domain is this", and
+        the two samplers that spend a budget - Resolve-mdiNnrTarget and Resolve-mdiLdapTarget - need
+        both. They exist for one reason, and the product states it in their own comments: a forest
+        nobody probed is not a forest that passed.
+
+        They did not agree on the domain key. The NNR sampler coerced with [string] and stripped
+        whitespace and the DNS root dot; the LDAP sampler handed the raw field to
+        `Group-Object -Property Domain`. Group-Object given a BARE PROPERTY NAME compares the raw
+        values, and an inventory row can carry a Domain that is not a plain string - the shape
+        Get-mdiProbeTargetKey already documents having seen in this estate, "a six-row estate holding
+        one row whose Domain was @('fabrikam.local')".
+
+        Measured on the shipped functions, four rows across mdilab.local and fabrikam.local whose
+        Domain was a one-element array, at MaxPerDomain/MaxTargets = 1:
+
+            Group-Object -Property Domain          1 group, named '{mdilab.local}'
+            Resolve-mdiLdapTarget                  1 target,  domains: mdilab.local
+            Resolve-mdiNnrTarget, IDENTICAL rows   2 targets, domains: mdilab.local, fabrikam.local
+
+        Two different forests were ONE group, so fabrikam.local received no LDAP target at all while
+        the LDAP card still reported a result for the run - the exact defect the per-domain spreading
+        was written to fix, reintroduced one line below the fix by the spelling of the group key. The
+        NNR sibling reached both forests on the same rows, which is what proves the rows are legible
+        and the LDAP sampler is what is wrong.
+
+        The trailing DNS ROOT DOT and whitespace fail the other way, and were measured on the same
+        function: 'fabrikam.local' beside 'fabrikam.local.' produced 2 LDAP targets for ONE domain,
+        as did 'fabrikam.local' beside ' fabrikam.local ' - a single domain taking double its budget,
+        which is spent against the generated command line length limit and the port-probe time
+        budget that this script already throws and warns on. The NNR sibling returned 1 for both.
+
+        Case is left to Group-Object, which is case-insensitive unless -CaseSensitive is passed:
+        'FABRIKAM.LOCAL' and 'fabrikam.local' already grouped as one domain in both samplers and DNS
+        is case-insensitive, so nothing here needs to lower-case a key that is only ever compared.
+
+        A domain that cannot be read keys as the empty string rather than throwing or being dropped,
+        for the same reason Get-mdiProbeTargetKey does it: unknown is what it is, and an unreadable
+        row must not cost a READABLE domain the slot it was entitled to.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Domain
+    )
+
+    ([string] $Domain).Trim().TrimEnd('.').Trim()
+}
+
 function Resolve-mdiNnrTarget {
     param (
         [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $DomainControllers,
@@ -3075,7 +3162,31 @@ function Resolve-mdiNnrTarget {
                 }
             })
     } else {
-        @($DomainControllers | Where-Object { $_.IP })
+        # Test-mdiUsableComputerAddress, not the truthiness of .IP. Every address that function
+        # rejects - 0.0.0.0, loopback, APIPA, multicast, the IPv6 any address - is a NON-EMPTY
+        # STRING, so a bare `Where-Object { $_.IP }` admitted all of them as probe targets. Those
+        # are the shapes an address takes when it was never really read: a stale A record, a
+        # hosts-file entry, a NIC that fell back to APIPA, a placeholder.
+        #
+        # SCOPE OF THE CLAIM, measured rather than argued. Today's only producer of this inventory,
+        # Get-mdiDomainControllerInventory, already strips unusable addresses and warns "No usable IP
+        # address could be resolved for <dc>, so it cannot be probed" - driven end to end with a
+        # directory answering 127.0.0.1, 0.0.0.0 and 169.254.10.5, the inventory emitted ZERO rows
+        # carrying an unusable address. So this is NOT a live false green in the shipped pipeline.
+        #
+        # What it IS: the two readers of this inventory disagreed about what "has an address" means.
+        # Get-mdiAddresslessDomainController asks Test-mdiUsableComputerAddress; these resolvers asked
+        # truthiness. Handed the same six rows directly, they produced 5 probe targets and 5
+        # addressless entries with 4 rows in BOTH lists at once - one report that both probes a domain
+        # controller and declares it unreachable.
+        #
+        # The guard belongs HERE because this is the code that decides what gets probed, and the probe
+        # cannot be the guard: measured, Test-mdiTcpPort against 127.0.0.1 returns Success=True /
+        # 'Connected'. On a domain controller, where 389/636/3268/3269 all listen locally, a loopback
+        # row would therefore be reported as a reached server. Any future producer that skips the
+        # filter - a cached inventory, an imported baseline, an operator-supplied list - would land
+        # exactly there, and the sampling budget would be spent on placeholders in the meantime.
+        @($DomainControllers | Where-Object { Test-mdiUsableComputerAddress -Value $_.IP })
     }
 
     # The cap counts HOSTS, not addresses. Truncating a flat list of addresses would silently drop the
@@ -3101,7 +3212,11 @@ function Resolve-mdiNnrTarget {
             # One host per domain per pass, in enumeration order, so a single-domain estate selects
             # exactly the hosts it always did and every additional domain is reached before any domain
             # takes a second slot.
-            $queues = @($byHost | Group-Object -Property { ([string] @($_.Group)[0].Domain).Trim().TrimEnd('.') } |
+            #
+            # The domain key is Get-mdiProbeDomainKey, shared with Resolve-mdiLdapTarget. The two
+            # samplers spread the same estate for the same reason and had drifted into two different
+            # spellings of "which domain is this"; see that function for the measurement.
+            $queues = @($byHost | Group-Object -Property { Get-mdiProbeDomainKey -Domain @($_.Group)[0].Domain } |
                     ForEach-Object { , @($_.Group) })
             $picked = New-Object System.Collections.ArrayList
             $depth = 0
@@ -3149,14 +3264,34 @@ function Resolve-mdiLdapTarget {
     # controller in another domain carrying the same Name was folded into this one before the
     # per-domain sampling ran, and its whole domain silently received no LDAP target. See
     # Get-mdiProbeTargetKey for the measurement.
-    $representatives = @($DomainControllers | Where-Object { $_.IP } |
+    # Test-mdiUsableComputerAddress, not the truthiness of .IP - the same correction, for the same
+    # reason, as the domain-controller fallback in Resolve-mdiNnrTarget. 0.0.0.0, loopback, APIPA,
+    # multicast and the IPv6 any address are all non-empty strings, so they passed a bare
+    # `Where-Object { $_.IP }` and became LDAP probe targets, while Get-mdiAddresslessDomainController
+    # - reading the SAME rows with the real test - declared those very rows unreachable.
+    #
+    # Measured, and stated no more strongly than it was measured: today's only producer,
+    # Get-mdiDomainControllerInventory, already strips such addresses, so this is not a live false
+    # green in the shipped pipeline. It is a disagreement between two readers of one inventory, and
+    # the guard belongs at the resolver because the probe cannot be the guard - Test-mdiTcpPort
+    # against 127.0.0.1 answers Success=True / 'Connected', and on a domain controller 389/636/3268/3269
+    # are all listening locally.
+    $representatives = @($DomainControllers | Where-Object { Test-mdiUsableComputerAddress -Value $_.IP } |
             Group-Object -Property { Get-mdiProbeTargetKey -Target $_ } |
             ForEach-Object { @($_.Group)[0] })
 
+    # The per-domain SPREADING keys on Get-mdiProbeDomainKey, not on the raw Domain field. This line
+    # read `Group-Object -Property Domain`, and Group-Object given a bare property name compares the
+    # RAW values: two rows whose Domain was @('mdilab.local') and @('fabrikam.local') formed ONE
+    # group named '{mdilab.local}', so at MaxPerDomain=1 the whole of fabrikam.local received no LDAP
+    # target while the LDAP card still reported a result. Its NNR sibling, which already coerced the
+    # key, reached both forests on the identical rows. The same key also merges the DNS root dot and
+    # whitespace, which split one domain into two groups and gave it double the budget. See
+    # Get-mdiProbeDomainKey for the full measurement.
     $selected = if ($MaxPerDomain -le 0) {
         $representatives
     } else {
-        @($representatives | Group-Object -Property Domain | ForEach-Object {
+        @($representatives | Group-Object -Property { Get-mdiProbeDomainKey -Domain $_.Domain } | ForEach-Object {
                 $_.Group | Select-Object -First $MaxPerDomain
             })
     }
@@ -3166,7 +3301,7 @@ function Resolve-mdiLdapTarget {
     # AND the IP keeps both addresses of a multi-homed DC while discarding an inventory row that
     # repeats a pair - and keeps a same-named domain controller in another domain distinct.
     $targets = @($DomainControllers | Where-Object {
-                $_.IP -and ($selectedKeys -contains (Get-mdiProbeTargetKey -Target $_))
+                (Test-mdiUsableComputerAddress -Value $_.IP) -and ($selectedKeys -contains (Get-mdiProbeTargetKey -Target $_))
             } |
             Group-Object -Property { Get-mdiProbeTargetKey -Target $_ }, IP | ForEach-Object { @($_.Group)[0] })
 
@@ -10522,7 +10657,7 @@ function Get-mdiDomainControllerReadiness {
         [Parameter(Mandatory = $false)] [object] $CapacityPlan = $null
     )
 
-    if ([string]::IsNullOrEmpty($DomainController)) {
+    if (Test-mdiNoNameSupplied -Name $DomainController) {
         Write-mdiVerbose "Searching for Domain Controllers in $Domain"
         $resolved = Resolve-mdiDomainController -Domain $Domain
         # Records the directory returned but could not name. They are part of the estate and they were
@@ -10862,7 +10997,7 @@ function Get-mdiCAReadiness {
     # as a distinguished name and is not a host name at all.
     $caAutoDiscovered = $false
 
-    if ([string]::IsNullOrEmpty($CAServer)) {
+    if (Test-mdiNoNameSupplied -Name $CAServer) {
         $caAutoDiscovered = $true
         Write-mdiVerbose "Searching for CA servers in $Domain"
         try {
@@ -11132,7 +11267,7 @@ function Get-mdiEntraConnectReadiness {
     # discarded the moment the block exits.
     $unreadableSyncAccount = New-Object -TypeName System.Collections.ArrayList
 
-    if ([string]::IsNullOrEmpty($EntraConnectServer)) {
+    if (Test-mdiNoNameSupplied -Name $EntraConnectServer) {
         Write-mdiVerbose "Searching for Entra Connect servers in $Domain"
         $candidateCount = 0
         try {

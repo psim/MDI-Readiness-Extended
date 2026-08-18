@@ -184,9 +184,25 @@ try {
 Assert-True 'an unreadable domain does not throw out of the LDAP sampler' `
     ($null -eq $threw) `
     ("threw: {0}" -f $threw)
+# FOUR of these six rows are readable, not five.
+#
+# The row carrying IP='not-an-ip' used to be counted here, because the sampler admitted any TRUTHY
+# .IP and a non-numeric string is truthy. Admitting it is the defect pinned by
+# UnusableAddressIsNeverAProbeTarget.Tests.ps1: an address that was never read must not become
+# something the run probes. 'not-an-ip' is not an address, so that row is unreadable in exactly the
+# sense this section is about, and it is now excluded from the plan while still being counted as an
+# addressless domain controller. The assertion below asserted the OLD count, so it was asserting the
+# bug.
+#
+# Written as an EXACT set rather than a floor. A floor cannot tell "the readable rows survived" from
+# "an unreadable row crept back in", which is the very thing this section exists to catch.
+$unreadableIps = @($unreadableLdap | ForEach-Object { [string] $_.IP } | Sort-Object)
 Assert-True 'the readable rows of an unreadable estate are still returned' `
-    ($unreadableLdap.Count -ge 5) `
-    ("returned {0} target(s)" -f $unreadableLdap.Count)
+    (($unreadableIps -join ',') -eq '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4') `
+    ("returned {0} target(s): {1}" -f $unreadableLdap.Count, ($unreadableIps -join ' '))
+Assert-True 'and the row whose IP is not an address is not one of them' `
+    ($unreadableIps -notcontains 'not-an-ip') `
+    ("returned: {0}" -f ($unreadableIps -join ' '))
 
 $threwNnr = $null
 try {

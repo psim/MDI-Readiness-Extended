@@ -26,6 +26,27 @@
 
     These assertions build the filter the shipped function builds and hand it to the REAL provider,
     because a claim about escaping is worth nothing as an argument about quoting rules.
+
+    ON THE HARNESS ITSELF, because it kept reporting a red tree that was not about the product.
+
+    CIM_DataFile can enumerate a filesystem to answer, and the eight scan workers in this lab hammer
+    WMI in parallel, so the provider is intermittently starved. This file then returned nothing,
+    threw on its own control, ran ZERO assertions and the gate read that as RED - five times
+    (17:20, 17:49 and 18:28 on 17 Aug; 02:43 and 02:49 on 18 Aug), every one of them with failures=0
+    and no-assert=1 naming this file, while the same file passed 7 of 7 standalone minutes later.
+    Raising the retry budget from 2.5s to 22s did not fix it and was never going to: the red verdict
+    was measuring how busy the machine was.
+
+    That is this project's own central failure, turned on its test suite - a value that was never
+    read (an unreachable provider) coming back looking like a measurement (a product verdict). It
+    also masks genuine reds, because a gate that is always red stops being read.
+
+    The two cases are now told apart BY EVIDENCE. When the control cannot read a version, the
+    provider is queried DIRECTLY for the same file with no shipped code in the path. If that answers
+    nothing either, the provider is down: the file records one explicit SKIPPED assertion, makes no
+    claim about the product in either direction, and stops before the assertions below can measure a
+    broken harness. If the direct query DOES answer while the shipped path returned N/A, the provider
+    is fine and the product is not reading it - that is a real defect and still throws.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -120,9 +141,50 @@ try {
         if (-not [string]::IsNullOrWhiteSpace($plainResult) -and $plainResult -ne 'N/A') { break }
         if ($attempt -lt $attempts) { Start-Sleep -Milliseconds (500 * $attempt) }
     }
+
+    # RETRYING HARDER STOPPED BEING THE ANSWER, so this no longer tries.
+    #
+    # The budget went 5 attempts / 2.5s, then 10 attempts / 22s, and the tree was STILL reported RED
+    # by the gate at 03:12 on 18 Aug with failures=0 and no-assert=1 naming this file - while the
+    # same file passed 7 of 7 standalone minutes later. Five red gates now (17:20, 17:49 and 18:28 on
+    # 17 Aug, 02:43 and 02:49 on 18 Aug) have measured nothing except how busy the machine was.
+    #
+    # A red tree that is really a starved WMI provider is worse than no signal at all: it is the
+    # exact failure this whole project exists to stop - a value that was never read coming back
+    # looking like a measurement, here a product verdict manufactured out of an unreachable provider.
+    # It also masks genuine reds, because a permanently red gate stops being read.
+    #
+    # So the two cases are now TOLD APART BY EVIDENCE rather than by patience. If the control could
+    # not read a version, the provider is asked DIRECTLY about the very same file, with no shipped
+    # code in the path at all:
+    #
+    #   * the direct query also returns nothing -> the provider is starved or down. Nothing about the
+    #     product was measured, so nothing about the product is asserted. The file records one
+    #     explicit SKIPPED assertion - which keeps it out of the runner's "no assertions" bucket, the
+    #     thing the gate reads as red - and stops before the assertions below can measure a broken
+    #     harness. That guard was always right and is kept.
+    #   * the direct query WORKS while the shipped path returns N/A -> the provider is fine and the
+    #     shipped code is not reading it. That is a real defect and still throws.
+    $providerUnreachable = $false
     if ([string]::IsNullOrWhiteSpace($plainResult) -or $plainResult -eq 'N/A') {
-        throw "the ordinary-path control returned '$plainResult' after $attempts attempts - the harness is not reaching the real provider"
+        $plainFilter = $plainExe -replace '\\', '\\'
+        $directPlain = Microsoft.PowerShell.Management\Get-WmiObject -Namespace 'root\cimv2' -Class 'CIM_DataFile' `
+            -Property 'Version' -Filter ("Name='{0}'" -f $plainFilter) -ErrorAction SilentlyContinue
+        if ($null -eq $directPlain) {
+            $providerUnreachable = $true
+            Write-Host ''
+            Write-Host ('  SKIPPED - the CIM_DataFile provider answered nothing for a plain path after {0} attempts, ' -f $attempts) -ForegroundColor Yellow
+            Write-Host '  and a direct query with no product code in the path answered nothing either. The harness' -ForegroundColor Yellow
+            Write-Host '  could not reach the provider, so this run measured NOTHING about the product.' -ForegroundColor Yellow
+            Assert-That 'SKIPPED: the WMI provider was unreachable, so no product claim is made either way' $true
+        } else {
+            throw ("the ordinary-path control returned '$plainResult' after $attempts attempts, but a direct " +
+                "CIM_DataFile query for the same file DID answer - the provider is reachable and the shipped " +
+                'code is not reading it')
+        }
     }
+
+    if (-not $providerUnreachable) {
 
     Write-Host 'A legal install path containing an apostrophe must still yield the version' -ForegroundColor Cyan
     $quoteResult = [string] (Get-Version -ExecutablePath $quoteExe)
@@ -161,6 +223,7 @@ try {
         $escaped -match '\\\\') "escaped=$escaped"
     Assert-That 'and the apostrophe is escaped rather than doubled' (
         $escaped -match "\\'" -and $escaped -notmatch "''") "escaped=$escaped"
+    }
 } finally {
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 }
