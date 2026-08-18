@@ -3682,6 +3682,70 @@ function Get-mdiAddresslessDomainController {
         } | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } | Select-Object -Unique)
 }
 
+function ConvertTo-mdiReadableDomainName {
+    <#
+        The domain name an enumeration entry ACTUALLY carries, or $null when the entry is not a name
+        anybody read.
+
+        Both forest walkers - the ADWS branch of Get-mdiForestDomain and its LDAP fallback
+        Get-mdiForestDomainFromLdap - named a domain with a bare [string] cast and then tested it with
+        IsNullOrWhiteSpace alone. IsNullOrWhiteSpace is a test of the RENDERING, not of the value, and
+        every non-string renders to something non-blank: a hashtable to
+        'System.Collections.Hashtable', a nested collection to 'System.Object[]', a PSCustomObject to
+        '@{DnsRoot=emea.mdilab.local}', $true to 'True', 12345 to '12345'. So a record that could not
+        be named was counted as a NAMED DOMAIN, adwsUnnamed/unnamed stayed 0, and Complete stayed
+        $true.
+
+        Complete is the gate on all three disclosure surfaces - the unread charge, the "forest domains
+        could not be enumerated" issue, and the READY verdict - and Get-mdiForestDomain's own comment
+        states the stake: "A -Forest run that quietly examined one domain out of five and then
+        reported READY is a false green over four domains nobody looked at". Measured on the shipped
+        function against the extended lab's real three-domain mdilab.local list with the emea entry
+        replaced by an unreadable value:
+
+            @('mdilab.local', '',       'apac.mdilab.local')   Complete=False  n=2  charged
+            @('mdilab.local', 12345,    'apac.mdilab.local')   Complete=True   n=3  ['12345']
+            @('mdilab.local', @{...},   'apac.mdilab.local')   Complete=True   n=3  ['System.Collections.Hashtable']
+            @('mdilab.local', [pscustomobject]@{...}, ...)     Complete=True   n=3  ['@{DnsRoot=emea.mdilab.local}']
+            @('mdilab.local', $true,    'apac.mdilab.local')   Complete=True   n=3  ['True']
+
+        A blank entry was charged and an unreadable one was certified, on the same list, one element
+        apart - and emea.mdilab.local, a real domain of this estate, left the scan under a name that
+        is a .NET type. The certified rows are strictly worse than the charged one: the run reports a
+        three-domain forest it never enumerated, and every later comparison is made against a string
+        no directory ever returned.
+
+        A ONE-ELEMENT COLLECTION is UNWRAPPED rather than rejected, because that is the shape this
+        estate really produces and the codebase already reads it: Get-mdiProbeTargetKey,
+        Get-mdiProbeDomainKey and Get-mdiAddresslessDomainController were each hardened for a row
+        whose Domain was @('fabrikam.local'), and [string] @('fabrikam.local') is 'fabrikam.local'.
+        Only a value that renders to something no directory returned is refused, so nothing that used
+        to be read stops being read.
+
+        The type is what is tested, not the spelling. A charset or shape rule cannot do this job -
+        'System.Collections.Hashtable' is legal DNS characters throughout - and an all-numeric
+        single-label domain arrives from a directory as the STRING '12345', which is still accepted.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Value
+    )
+
+    $candidate = $Value
+    if ($candidate -is [System.Management.Automation.PSObject]) { $candidate = $candidate.BaseObject }
+    # A string is itself IEnumerable, and a hashtable is enumerable but not a list, so the unwrap is
+    # deliberately narrowed to IList and applied ONCE. Looping would not terminate on a value that
+    # enumerates to itself, and a multi-element collection is not one domain name however it renders.
+    if ($candidate -isnot [string] -and $candidate -is [System.Collections.IList]) {
+        $items = @($candidate)
+        if ($items.Count -ne 1) { return $null }
+        $candidate = $items[0]
+        if ($candidate -is [System.Management.Automation.PSObject]) { $candidate = $candidate.BaseObject }
+    }
+    if ($candidate -isnot [string]) { return $null }
+    if ([string]::IsNullOrWhiteSpace($candidate)) { return $null }
+    [string] $candidate
+}
+
 function Get-mdiForestDomainFromLdap {
     param (
         [Parameter(Mandatory = $false)] [string] $Domain = $null,
@@ -3738,8 +3802,15 @@ function Get-mdiForestDomainFromLdap {
         # Complete left at $true an entire domain left the scan with no trace on any of them.
         $unnamed = 0
         $domains = @(foreach ($entry in $searcher.FindAll()) {
-                $dnsRoot = if ($entry.Properties['dnsroot'].Count -gt 0) { [string] $entry.Properties['dnsroot'][0] } else { $null }
-                if ([string]::IsNullOrWhiteSpace($dnsRoot)) { $unnamed++; continue }
+                # ConvertTo-mdiReadableDomainName, not a bare [string] cast. A crossRef whose dnsRoot
+                # attribute holds anything but a string rendered to a non-blank .NET type name and was
+                # counted as a named domain; see that function for the measurement. The ADWS branch of
+                # Get-mdiForestDomain applies the identical rule, in the same place in its own loop,
+                # because a fallback that accepts what the primary rejects reintroduces the failure.
+                $dnsRoot = if ($entry.Properties['dnsroot'].Count -gt 0) {
+                    ConvertTo-mdiReadableDomainName -Value $entry.Properties['dnsroot'][0]
+                } else { $null }
+                if ($null -eq $dnsRoot) { $unnamed++; continue }
                 $dnsRoot
             }) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
 
@@ -3808,8 +3879,13 @@ function Get-mdiForestDomain {
         # while the report still certified that the whole forest had been enumerated.
         $adwsUnnamed = 0
         $adwsDomains = @(foreach ($entry in @($adForest.Domains)) {
-                $domainName = [string] $entry
-                if ([string]::IsNullOrWhiteSpace($domainName)) { $adwsUnnamed++; continue }
+                # ConvertTo-mdiReadableDomainName, not a bare [string] cast tested with
+                # IsNullOrWhiteSpace. That tested the RENDERING: a hashtable, a nested collection, a
+                # PSCustomObject, a boolean and a number all render non-blank, so a record nobody
+                # could name was counted as a named domain and this whole branch returned
+                # Complete=$true over it. See that function for the measurement.
+                $domainName = ConvertTo-mdiReadableDomainName -Value $entry
+                if ($null -eq $domainName) { $adwsUnnamed++; continue }
                 $domainName.Trim()
             })
         if ($adwsDomains.Count -gt 0) {
@@ -6641,8 +6717,23 @@ function New-mdiRemediationScript {
     # opening a port on a domain controller on the strength of a measurement that does not exist, and
     # it is the same $null-is-not-a-failure defect the predicate was created for. Test-mdiProbeWasMeasured
     # is the same definition the ports KPI, the detail matrix and the verdict already use.
+    #
+    # The NNR FAMILY is resolved the same way, through Test-mdiProbeIsPrimaryNnr, and not by reading
+    # Group off the record. $unresolvableKey one line above comes from Get-mdiBlockingPortFailure,
+    # which already resolves the family from the shipped definitions by Id, so a raw Group test here
+    # made the two halves of this one decision disagree. Measured on the shipped functions, one
+    # target with all three primary methods MEASURED REFUSED, nothing differing but Group:
+    #
+    #   Group 'NNR'   verdict NnrMeasured=1   script emits RPC, NetBIOS and RDP rules
+    #   Group $null   verdict NnrMeasured=1   script emits NOTHING
+    #   Group ''      verdict NnrMeasured=1   script emits NOTHING
+    #   Group 12345   verdict NnrMeasured=1   script emits NOTHING
+    #
+    # So the report stated "no NNR method could resolve X" and the remediation script generated from
+    # that same report was silent about X - the operator runs the fix, believes the finding is
+    # addressed, and the ports that lower the active name resolution success rate stay shut.
     $blockedNnr = @($nnrRecords |
-            Where-Object { (Test-mdiProbeWasMeasured -Record $_) -and $_.Success -eq $false -and $_.Group -eq 'NNR' -and
+            Where-Object { (Test-mdiProbeWasMeasured -Record $_) -and $_.Success -eq $false -and (Test-mdiProbeIsPrimaryNnr -Record $_) -and
                 ((@($_.Server, $_.Target, $_.TargetIP) | ForEach-Object { [string] $_ }) -join $nnrKeySeparator) -in $unresolvableKey })
     $ruleMap = @{
         135  = @{ Name = 'MDI-NNR-RPC-In'; Protocol = 'TCP'; Display = 'MDI Network Name Resolution - NTLM over RPC (TCP 135)' }
@@ -13679,6 +13770,58 @@ function Test-mdiProbeWasMeasured {
     ($Record.Applicable -eq $true) -and ([string] $Record.Detail -notmatch $script:mdiPortNotTestedPattern)
 }
 
+function Get-mdiProbeGroupKey {
+    <#
+        The probe FAMILY a port/NNR record belongs to, resolved from the SHIPPED definitions by Id
+        rather than read off the record's own Group field.
+
+        Group is stamped from the PLAN, makes the full JSON round trip to the sensor and back, and
+        nothing re-stamps it afterwards - the identical path documented on
+        Test-mdiRequirementIsMandatory. Get-mdiPortResultRecord normalises only Success and
+        Applicable, so Group reaches every consumer unprotected: $null, '', a number or a collection
+        are all shapes another tool's JSON, a hand-edited report or an older version can hand back.
+        An empty Group is a real SHIPPED value as well - NnrReverseDns carries Scope NetworkDevice
+        with Group '' because it is recommended rather than primary - so "no Group" cannot be read as
+        "not a member of a family" either.
+
+        A record whose Id the shipped table does not know keeps its own Group, so a probe family added
+        in a later version still groups without being listed here. This is the same judgement the
+        requirement label makes when it prefers the shipped definition over an unreadable record value.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $Record
+    )
+
+    if ($null -eq $Record) { return '' }
+    $recordId = [string] $Record.Id
+    if (-not [string]::IsNullOrWhiteSpace($recordId)) {
+        $shipped = @($settings.RequiredPorts | Where-Object { [string] $_.Id -eq $recordId })
+        if ($shipped.Count -gt 0) { return ([string] $shipped[0].Group) }
+    }
+    [string] $Record.Group
+}
+
+function Test-mdiProbeIsPrimaryNnr {
+    <#
+        Whether a record is one of the PRIMARY name-resolution methods - NTLM over RPC, NetBIOS and
+        RDP. Their success is what makes a target resolvable and what the 'Low success rate of active
+        name resolution' health alert is computed from. NnrReverseDns is deliberately NOT one of them:
+        it shares the NetworkDevice scope but is recommended, and a PTR lookup answering does not mean
+        the sensor could resolve the device.
+
+        Shared because one question was being asked with two different fields on two surfaces of the
+        same page. The NNR matrix admits its rows by SCOPE while the statistics admitted theirs by
+        GROUP, so a record that kept its Scope but lost its Group was drawn as a red "No" row in the
+        matrix and was absent from the KPI counting exactly those rows.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $Record
+    )
+
+    if ($null -eq $Record) { return $false }
+    (Get-mdiProbeGroupKey -Record $Record) -eq 'NNR'
+}
+
 function Get-mdiUnmeasuredRequiredProbe {
     <#
         Mandatory probes that never actually ran.
@@ -14412,7 +14555,22 @@ function Get-mdiReportStatistics {
     # required port into a silent nothing - and where the summary flag read ready, into a false green.
     # They are kept here and routed into PortsUntested below, never into PortsOpen or PortsBlocked.
     $portRecords = @(Get-mdiPortResultRecord -Server $reachable | Where-Object { $_.Applicable -ne $false })
-    $nnrRecords = @($portRecords | Where-Object { $_.Group -eq 'NNR' -and $_.Applicable -eq $true })
+    # Admitted through the shared predicate, not by reading Group off the record. The NNR MATRIX on
+    # the same page admits its rows by SCOPE (Scope -eq 'NetworkDevice'), and this KPI reports the
+    # very fact that table draws - so with Group as the authority here the two disagreed about which
+    # records exist. Measured on the shipped functions, one target with all three primary methods
+    # MEASURED REFUSED and nothing differing but the Group field:
+    #
+    #   Group 'NNR'   KPI targets=1 resolvable=0   matrix verdict "No"   (agreed)
+    #   Group $null   KPI targets=0 resolvable=0   matrix verdict "No"
+    #   Group ''      KPI targets=0 resolvable=0   matrix verdict "No"
+    #   Group 12345   KPI targets=0 resolvable=0   matrix verdict "No"
+    #
+    # So a target proven unresolvable VANISHED from the headline count of resolvable targets while
+    # the matrix one screen below still drew it in red - losing a row improving the headline, which
+    # is the shape this script exists to prevent. It moved into the ordinary-ports population at the
+    # same time (PortDistinctTargetCount 0 -> 1), because that filter tests the same raw field.
+    $nnrRecords = @($portRecords | Where-Object { (Test-mdiProbeIsPrimaryNnr -Record $_) -and $_.Applicable -eq $true })
 
     # An NNR target is only resolvable when at least one primary method answers, which is exactly what the
     # 'Low success rate of active name resolution' health alert measures.
@@ -14470,7 +14628,7 @@ function Get-mdiReportStatistics {
     # open 8/8, No required port blocked" with nothing saying so. That is the same illusion the NNR
     # card was corrected for: a green ratio over a fraction of the estate, on the surface an operator
     # reads first after an alert about blocked traffic.
-    $portDistinctTarget = @($portRecords | Where-Object { [string] $_.Group -ne 'NNR' } | ForEach-Object {
+    $portDistinctTarget = @($portRecords | Where-Object { -not (Test-mdiProbeIsPrimaryNnr -Record $_) } | ForEach-Object {
             $t = [string] $_.Target
             if ([string]::IsNullOrWhiteSpace($t)) { $t = [string] $_.TargetIP }
             $t
@@ -14768,15 +14926,31 @@ function Get-mdiBlockingPortFailure {
     # should be distinct - a measured success and a measured failure that merely happen to share a
     # null Server, Target or TargetIP - merge, and the success then rescues the failure. That is a
     # false green in the one place the verdict must never produce one. So the grouping key is built
-    # explicitly: a record with any null or empty key is given a unique key and judged alone, which is
-    # the conservative choice because a lone failure still blocks and can mask nothing.
+    # explicitly: a record with any null or empty IDENTITY key is given a unique key and judged alone,
+    # which is the conservative choice because a lone failure still blocks and can mask nothing.
+    #
+    # The probe FAMILY is not one of those identity keys, and reading it raw off the record made the
+    # opposite mistake - a false RED. Group is unprotected (see Get-mdiProbeGroupKey), and a record
+    # whose Group arrived $null or '' failed the blank test above, so every method of one target got
+    # its own GUID key and was judged alone. The sibling that SUCCEEDED could then no longer rescue
+    # the sibling that failed. Measured on the shipped function, one target with RPC measured OPEN and
+    # NetBIOS measured REFUSED, nothing differing but the Group field:
+    #
+    #   Group 'NNR'   blocking <none>        (correct - RPC resolved the target)
+    #   Group $null   blocking NnrMeasured   "no NNR method could resolve ws7.fabrikam.local"
+    #   Group ''      blocking NnrMeasured   "no NNR method could resolve ws7.fabrikam.local"
+    #
+    # That fails the run and sends an operator to open a firewall port on a host whose name resolution
+    # was measured WORKING. The family is therefore resolved from the shipped definitions by Id, the
+    # same authority the NNR matrix and the statistics use, and is kept out of the blank-key test: an
+    # unreadable family must not split one target, whereas an unreadable target identity must.
     $groupKeySeparator = [string][char]31
     foreach ($group in @($atLeastOne | Group-Object -Property {
-                $keys = @($_.Server, $_.Group, $_.Target, $_.TargetIP)
+                $keys = @($_.Server, $_.Target, $_.TargetIP)
                 if (@($keys | Where-Object { [string]::IsNullOrWhiteSpace([string] $_) }).Count -gt 0) {
                     [guid]::NewGuid().ToString()
                 } else {
-                    ($keys | ForEach-Object { [string] $_ }) -join $groupKeySeparator
+                    (@((Get-mdiProbeGroupKey -Record $_)) + @($keys | ForEach-Object { [string] $_ })) -join $groupKeySeparator
                 }
             })) {
         # The shared predicate again, not a sixth longhand copy. This one still tested only Applicable
@@ -16500,15 +16674,11 @@ function Get-mdiRequiredPortsHtml {
         # does not know falls back to its own Group, so a primary method added in a later version
         # still counts without being listed here; this is the same judgement the requirement label
         # above makes when it prefers the shipped definition over an unreadable record value.
-        $primaryNnrId = @($nnrProbes | Where-Object { [string] $_.Group -eq 'NNR' } |
-                ForEach-Object { [string] $_.Id })
-        $shippedNnrId = @($nnrProbes | ForEach-Object { [string] $_.Id })
-        $isPrimaryNnr = {
-            param($Record)
-            $recordId = [string] $Record.Id
-            if ($shippedNnrId -contains $recordId) { return ($primaryNnrId -contains $recordId) }
-            ([string] $Record.Group -eq 'NNR')
-        }
+        #
+        # Routed through the shared Test-mdiProbeIsPrimaryNnr rather than a local scriptblock, because
+        # the KPI reporting this very table's verdict admitted its records by the raw Group field and
+        # therefore disagreed with the table about which targets exist at all.
+        $isPrimaryNnr = { param($Record) Test-mdiProbeIsPrimaryNnr -Record $Record }
         [void] $lines.Add('<h4>Network Name Resolution (NNR) matrix</h4>')
         [void] $lines.Add('<p>At least one primary method (NTLM over RPC, NetBIOS, RDP) must succeed for every device the sensor observes. Targets where all methods fail are what lower the <a href="https://aka.ms/mdi/nnr/troubleshooting">active name resolution success rate</a>.</p>')
         [void] $lines.Add('<div class="table-scroll"><table>')
