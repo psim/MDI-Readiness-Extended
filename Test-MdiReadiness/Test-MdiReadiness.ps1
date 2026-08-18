@@ -16466,6 +16466,49 @@ function Get-mdiRequiredPortsHtml {
     $nnrRecords = @($records | Where-Object { $_.Scope -eq 'NetworkDevice' -and $_.Applicable -eq $true })
     if ($nnrRecords.Count -gt 0) {
         $nnrProbes = @($settings.RequiredPorts | Where-Object { $_.Scope -eq 'NetworkDevice' })
+        # Which of those methods are PRIMARY, taken from the shipped definitions by Id.
+        #
+        # The rows of this table are admitted by SCOPE (NetworkDevice, above) while the Resolvable
+        # verdict below was decided by the record's own GROUP field. Two different fields, so a
+        # record that kept its Scope but lost its Group was drawn as a row, its method cells
+        # rendered the real measurements, and the verdict beside them was computed from an EMPTY
+        # set - which reads "Not tested".
+        #
+        # Measured on the shipped function, one target with both primary methods REFUSED and
+        # nothing differing but the Group field:
+        #
+        #   Group 'NNR'      cells Blocked,Blocked   verdict "No"          (red)
+        #   Group $null      cells Blocked,Blocked   verdict "Not tested"  (muted)
+        #   Group ''         cells Blocked,Blocked   verdict "Not tested"  (muted)
+        #   Group 12345      cells Blocked,Blocked   verdict "Not tested"  (muted)
+        #   Group $null, both methods OPEN           verdict "Not tested"  (muted)
+        #
+        # So a target whose every primary method was measured shut reported that nothing had been
+        # tested, next to its own cells saying otherwise - a measured failure presented as an
+        # absence of evidence, which is the direction this script exists to prevent.
+        #
+        # Group is not defensible as the authority here. It is stamped from the PLAN, travels the
+        # full JSON round trip to the sensor and back, and nothing re-stamps it afterwards -
+        # exactly the path whose identical treatment of Requirement is documented on
+        # Test-mdiRequirementIsMandatory. Get-mdiPortResultRecord normalises only Success and
+        # Applicable, so Group arrives here unprotected. An empty Group is also a real SHIPPED
+        # value: NnrReverseDns carries Scope NetworkDevice with Group '' because it is recommended
+        # rather than primary.
+        #
+        # The Id is used instead, matched against the shipped table - the same authority the method
+        # cells are already matched against one screen below. A record whose Id the shipped table
+        # does not know falls back to its own Group, so a primary method added in a later version
+        # still counts without being listed here; this is the same judgement the requirement label
+        # above makes when it prefers the shipped definition over an unreadable record value.
+        $primaryNnrId = @($nnrProbes | Where-Object { [string] $_.Group -eq 'NNR' } |
+                ForEach-Object { [string] $_.Id })
+        $shippedNnrId = @($nnrProbes | ForEach-Object { [string] $_.Id })
+        $isPrimaryNnr = {
+            param($Record)
+            $recordId = [string] $Record.Id
+            if ($shippedNnrId -contains $recordId) { return ($primaryNnrId -contains $recordId) }
+            ([string] $Record.Group -eq 'NNR')
+        }
         [void] $lines.Add('<h4>Network Name Resolution (NNR) matrix</h4>')
         [void] $lines.Add('<p>At least one primary method (NTLM over RPC, NetBIOS, RDP) must succeed for every device the sensor observes. Targets where all methods fail are what lower the <a href="https://aka.ms/mdi/nnr/troubleshooting">active name resolution success rate</a>.</p>')
         [void] $lines.Add('<div class="table-scroll"><table>')
@@ -16507,12 +16550,14 @@ function Get-mdiRequiredPortsHtml {
                         '<td class="red" title="{0}">Blocked</td>' -f (ConvertTo-mdiHtmlEncoded $record.Detail)
                     }
                 }
-                $primaryOk = @($targetGroup.Group | Where-Object { $_.Group -eq 'NNR' -and $_.Success -eq $true }).Count -gt 0
+                $primaryOk = @($targetGroup.Group | Where-Object {
+                        (& $isPrimaryNnr $_) -and $_.Success -eq $true
+                    }).Count -gt 0
                 # Whether ANY NNR method against this target produced a measurement. Same predicate as
                 # the cells above and as the verdict, so a target nothing was measured against cannot
                 # read a red "No" here while the KPI on the same page calls it untested.
                 $primaryTested = @($targetGroup.Group | Where-Object {
-                        $_.Group -eq 'NNR' -and (Test-mdiProbeWasMeasured -Record $_)
+                        (& $isPrimaryNnr $_) -and (Test-mdiProbeWasMeasured -Record $_)
                     }).Count -gt 0
                 $verdict = if ($primaryOk) { '<td class="green">Yes</td>' }
                 elseif (-not $primaryTested) { '<td class="muted-cell">Not tested</td>' }
