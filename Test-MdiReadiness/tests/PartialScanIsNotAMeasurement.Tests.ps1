@@ -54,8 +54,12 @@ $AsJson = $false; $PassThru = $false; $FailOnIssues = $false; $OpenHtmlReport = 
 
 $lines = [IO.File]::ReadAllLines($Target)
 $startIdx = -1; $endIdx = -1
+# Anchored on $result, which is where the verdict/exit block begins. Starting earlier (at the $stats
+# assignment) swept the ARTEFACT-WRITING section into the slice as well, and the child then died on
+# $Path being null - a slice this test never meant to execute. The statistics the slice needs are
+# supplied by the child instead, immediately below.
 for ($n = 0; $n -lt $lines.Count; $n++) {
-    if ($startIdx -lt 0 -and $lines[$n] -match '^\s*\$result = Test-mdiReadinessResult -ReportData \$report\s*$') { $startIdx = $n }
+    if ($startIdx -lt 0 -and $lines[$n] -match '^\s*\$issueCount = @\(Get-mdiIssueList -Statistics \$stats -ReportData \$report\)\.Count\s*$') { $startIdx = $n }
     if ($startIdx -ge 0 -and $lines[$n] -match '^\s*exit \$exitCode\s*$') { $endIdx = $n + 1; break }
 }
 if ($startIdx -lt 0 -or $endIdx -lt 0) { throw "Main anchors not found (start=$startIdx end=$endIdx)" }
@@ -105,8 +109,13 @@ $report = [PSCustomObject]@{
 }
 $htmlReportFile = 'C:\Temp\report.html'
 $remediation = $null
-$s = Get-mdiReportStatistics -ReportData $report
-Write-Output ('STATS TotalServers={0} PartialScanCount={1}' -f $s.TotalServers, $s.PartialScanCount)
+# Named $stats, not $s: the slice below is Main's own verdict block and reads $stats. Main computes it
+# a few lines above the slice's start anchor, so the child has to supply it - and when it did not, the
+# whole file died with "Cannot bind argument to parameter 'Statistics' because it is null" and
+# reported zero assertions, which reads as a quiet test rather than a dead one.
+$stats = Get-mdiReportStatistics -ReportData $report
+$result = Test-mdiReadinessResult -ReportData $report
+Write-Output ('STATS TotalServers={0} PartialScanCount={1}' -f $stats.TotalServers, $stats.PartialScanCount)
 Invoke-Expression $slice
 '@
 

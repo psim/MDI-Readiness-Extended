@@ -1,4 +1,4 @@
-<#
+﻿<#
     One machine must be one machine on every surface, and its addresses must survive to all of them.
 
     A domain controller reached by both its short name and its FQDN, or holding more than one NIC, was
@@ -13,7 +13,7 @@
     IPv6 is canonical and mapped forms are folded; both NICs of a multi-homed DC reach the inventory,
     the plans and the probe records; different machines sharing an address stay separate; only the
     failing NIC produces failures; the addressless DC stays in the population, is charged as not
-    measured, is named in the issue list with its reason, and renders an explicit Not determined cell;
+    measured, blocks readiness, is named in the issue list with its reason, and renders an explicit Not determined cell;
     the remediation names the failing host and exact address without substituting the healthy NIC; and
     the HTML and JSON both show seven canonical machines, not an eighth alias row.
 #>
@@ -101,6 +101,11 @@ Assert-That 'the alias is one NNR endpoint, not two' (@($nnrTargets | Where-Obje
 Assert-That 'the alias is one LDAP endpoint, not two' (@($ldapTargets | Where-Object { $_.IP -eq '10.0.0.77' }).Count -eq 1)
 Assert-That 'different machines sharing an address remain separate' (@($nnrTargets | Where-Object { $_.IP -eq '10.0.0.55' } | Select-Object -ExpandProperty Name -Unique).Count -eq 2)
 Assert-That 'both multi-homed endpoints reach the NNR plan' ((@($nnrTargets | Where-Object Name -eq 'dc1.example.test').IP -join ',') -eq '10.0.0.11,10.0.0.12')
+Assert-That 'both target plans use the same canonical IPv6 spellings' (
+    @($nnrTargets | Where-Object { $_.Name -eq 'dc2.example.test' -and $_.IP -eq '2001:db8::22' }).Count -eq 1 -and
+    @($ldapTargets | Where-Object { $_.Name -eq 'dc2.example.test' -and $_.IP -eq '2001:db8::22' }).Count -eq 1 -and
+    @($nnrTargets | Where-Object { $_.Name -eq 'dc3.example.test' -and $_.IP -eq '10.0.0.33' }).Count -eq 1 -and
+    @($ldapTargets | Where-Object { $_.Name -eq 'dc3.example.test' -and $_.IP -eq '10.0.0.33' }).Count -eq 1)
 $plan = New-mdiPortProbePlan -Domain 'example.test' -DomainController $ldapTargets -NnrTarget $nnrTargets -TimeoutMs 20
 $plan.Probes = @($plan.Probes | Where-Object { $_.Id -in @('NnrRpc', 'LdapTcp') })
 Set-Item -Path function:script:Get-mdiConfiguredDnsServer -Value { [PSCustomObject]@{ Servers = @(); Measured = $true; Detail = $null } }
@@ -114,6 +119,10 @@ foreach ($record in $records) { "RAW_RECORD TARGET=[$($record.Target)] TARGET_TY
 Assert-That 'the probe records retain the one canonical alias spelling' (@($records | Where-Object Target -eq 'dc7.example.test').Count -eq 2)
 Assert-That 'no short alias reaches a probe record' (@($records | Where-Object Target -eq 'DC7').Count -eq 0)
 Assert-That 'only the second NIC produces the measured failures' (@($records | Where-Object { $_.Success -eq $false -and $_.TargetIP -eq '10.0.0.12' }).Count -eq 2)
+Assert-That 'probe records retain the plans canonical IPv6 spellings' (
+    @($records | Where-Object { $_.Target -eq 'dc2.example.test' -and $_.TargetIP -eq '2001:db8::22' }).Count -eq 2 -and
+    @($records | Where-Object { $_.Target -eq 'dc3.example.test' -and $_.TargetIP -eq '10.0.0.33' }).Count -eq 2 -and
+    @($records | Where-Object { $_.TargetIP -eq '::ffff:10.0.0.33' }).Count -eq 0)
 
 function New-ServerRow([string] $Name, $IP, [object[]] $Addresses, [object[]] $Results = @()) {
     $details = [PSCustomObject]@{}
@@ -161,26 +170,59 @@ Assert-That 'the coverage population includes all seven real machines' ($stats.P
 Assert-That 'the coverage surface shows only six machines entered a plan' ($stats.PortDistinctTargetCount -eq 6 -and $stats.NnrDistinctTargetCount -eq 6) "port=$($stats.PortDistinctTargetCount) nnr=$($stats.NnrDistinctTargetCount)"
 Assert-That 'the score charges the missing endpoint as not measured' (@($stats.ServerScores | Where-Object FQDN -eq 'Domain controller address not determined - dc4.example.test').Count -eq 1)
 Assert-That 'the issue list names the addressless DC and why it was omitted' (@($issues | Where-Object { $_.Server -eq 'dc4.example.test' -and $_.Area -eq 'Not measured' -and $_.Issue -match 'LDAP and Network Name Resolution' }).Count -eq 1)
+$verdictControl = $report.PSObject.Copy()
+$verdictControl.DomainControllers = @(New-ServerRow 'healthy.example.test' '10.0.0.99' @('10.0.0.99'))
+$verdictControl.AddresslessDomainControllers = @()
+$verdictWithGap = $verdictControl.PSObject.Copy()
+$verdictWithGap.AddresslessDomainControllers = @($addressless)
+$controlReady = Test-mdiReadinessResult -ReportData $verdictControl 3>$null 4>$null
+$gapReady = Test-mdiReadinessResult -ReportData $verdictWithGap 3>$null 4>$null
+"RAW_VERDICT CONTROL=[$controlReady] CONTROL_TYPE=$(Type-Of $controlReady) ADDRESSLESS=[$gapReady] ADDRESSLESS_TYPE=$(Type-Of $gapReady)"
+Assert-That 'the addressless DC alone blocks the readiness verdict' ($controlReady -eq $true -and $gapReady -eq $false) "control=$controlReady addressless=$gapReady"
 Assert-That 'the issue list names the exact failed NIC' (@($issues | Where-Object { $_.Issue -match 'dc1\.example\.test \(10\.0\.0\.12\)' }).Count -ge 2)
 
 '[HTML, JSON and remediation] every output carries the same endpoint facts'
-$outDir = Join-Path ([IO.Path]::GetTempPath()) ('mdi-crosssurface-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+# A scratch directory of this run's own, under the OS temp path. It used to be an absolute path
+# under one developer's profile, which fails for anyone who clones the repository and leaks a
+# username into a public repo. The run name keeps concurrent runs from sharing a directory, since
+# this one is deleted wholesale below.
+$outDir = Join-Path ([IO.Path]::GetTempPath()) ('mdi-crosssurface-test-output-' + [Guid]::NewGuid().ToString('N'))
 if (Test-Path -LiteralPath $outDir) { Remove-Item -LiteralPath $outDir -Recurse -Force }
 [void] [IO.Directory]::CreateDirectory($outDir)
 try {
+    $remediationRecords = @(
+        [PSCustomObject]@{
+            Id = 'NnrRpc'; Name = 'NNR - NTLM over RPC'; Protocol = 'TCP'; Port = 135
+            Scope = 'NetworkDevice'; Group = 'NNR'; Requirement = 'AtLeastOne'
+            Target = 'dual.example.test'; TargetIP = '10.0.0.11'
+            Applicable = $true; Success = $true; LatencyMs = 1; Detail = 'Connected'
+        },
+        [PSCustomObject]@{
+            Id = 'NnrRpc'; Name = 'NNR - NTLM over RPC'; Protocol = 'TCP'; Port = 135
+            Scope = 'NetworkDevice'; Group = 'NNR'; Requirement = 'AtLeastOne'
+            Target = 'dual.example.test'; TargetIP = '10.0.0.12'
+            Applicable = $true; Success = $false; LatencyMs = 1; Detail = 'Closed - connection refused'
+        }
+    )
+    $remediationReport = $report.PSObject.Copy()
+    $remediationReport.DomainControllers = @(
+        New-ServerRow 'sensor.example.test' '192.0.2.10' @('192.0.2.10') $remediationRecords)
+    $remediationReport.AddresslessDomainControllers = @()
     $remediationPath = Join-Path $outDir 'Fix-MdiReadiness-example.test.ps1'
-    $remediation = New-mdiRemediationScript -ReportData $report -FilePath $remediationPath
+    $remediation = New-mdiRemediationScript -ReportData $remediationReport -FilePath $remediationPath
     $remediationText = [IO.File]::ReadAllText($remediationPath)
-    Assert-That 'the generated remediation names the failing host and exact address' ($remediationText.Contains('dc1.example.test (10.0.0.12)'))
-    Assert-That 'the generated remediation does not substitute the healthy NIC' (-not $remediationText.Contains('dc1.example.test (10.0.0.11)'))
+    Assert-That 'the generated remediation names the failing host and exact address' ($remediationText.Contains('dual.example.test (10.0.0.12)'))
+    Assert-That 'the generated remediation does not substitute the healthy NIC' (-not $remediationText.Contains('dual.example.test (10.0.0.11)'))
 
     $script:SkipCA = $true; $script:SkipEntraConnect = $true; $script:SkipNetworkPorts = $false; $script:SkipSensorV3Readiness = $true
-    $htmlPath = Set-MdiReadinessReport -Domain 'example.test' -Path $outDir -ReportData $report -Remediation $remediation -SkipTrend
+    $htmlPath = Set-MdiReadinessReport -Domain 'example.test' -Path $outDir -ReportData $report -Remediation $null -SkipTrend
     $html = [IO.File]::ReadAllText($htmlPath)
     $dcTab = [regex]::Match($html, '(?s)<section class="panel" id="tab-dcs">(.*?)<section class="panel" id="tab-ports">').Groups[1].Value
     Assert-That 'the DC table exposes the first NIC' ($dcTab.Contains('10.0.0.11'))
     Assert-That 'the DC table exposes the second NIC' ($dcTab.Contains('10.0.0.12'))
     Assert-That 'the DC table exposes canonical IPv6' ($dcTab.Contains('2001:db8::22'))
+    Assert-That 'the DC table exposes the folded mapped address only' ($dcTab.Contains('10.0.0.33') -and -not $dcTab.Contains('::ffff:10.0.0.33'))
+    Assert-That 'the DC table retains only the canonical alias spelling' ($dcTab.Contains('dc7.example.test') -and -not $dcTab.Contains('>DC7<'))
     Assert-That 'the addressless DC has an explicit Not determined cell' ($dcTab -match 'dc4\.example\.test[\s\S]*?Not determined')
     Assert-That 'the HTML tab count is seven canonical machines' ($html -match 'Domain controllers <span class="count">7</span>')
 
@@ -191,6 +233,12 @@ try {
     foreach ($row in @($json.DomainControllers)) { "RAW_JSON NAME=[$($row.FQDN)] IP=[$($row.IP)] IP_TYPE=$(Type-Of $row.IP) ADDRESSES=[$(@($row.Addresses) -join ',')] ADDRESSES_TYPE=$(Type-Of $row.Addresses)" }
     Assert-That 'JSON contains seven machines, not an eighth alias row' (@($json.DomainControllers).Count -eq 7)
     Assert-That 'JSON retains only the canonical alias spelling' (@($json.DomainControllers | Where-Object FQDN -eq 'dc7.example.test').Count -eq 1 -and @($json.DomainControllers | Where-Object FQDN -eq 'DC7').Count -eq 0)
+    $jsonDc2 = @($json.DomainControllers | Where-Object FQDN -eq 'dc2.example.test')[0]
+    $jsonDc3 = @($json.DomainControllers | Where-Object FQDN -eq 'dc3.example.test')[0]
+    Assert-That 'JSON retains the same canonical IPv6 spellings' (
+        $jsonDc2.IP -eq '2001:db8::22' -and (@($jsonDc2.Addresses) -join ',') -eq '2001:db8::22' -and
+        $jsonDc3.IP -eq '10.0.0.33' -and (@($jsonDc3.Addresses) -join ',') -eq '10.0.0.33')
+    Assert-That 'JSON keeps both machines that share one address' (@($json.DomainControllers | Where-Object IP -eq '10.0.0.55' | Select-Object -ExpandProperty FQDN -Unique).Count -eq 2)
     $jsonDc1 = @($json.DomainControllers | Where-Object FQDN -eq 'dc1.example.test')[0]
     Assert-That 'JSON retains both multi-homed addresses' ((@($jsonDc1.Addresses) -join ',') -eq '10.0.0.11,10.0.0.12')
     $jsonDc4 = @($json.DomainControllers | Where-Object FQDN -eq 'dc4.example.test')[0]

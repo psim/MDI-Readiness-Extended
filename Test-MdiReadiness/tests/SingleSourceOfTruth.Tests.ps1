@@ -267,8 +267,33 @@ $consoleCalls = $mainAst.FindAll({
         $n.GetCommandName() -eq 'Write-mdiConsole' -and $n.Extent.Text -match 'checks passed'
     }, $true)
 Assert-That 'both console verdict lines exist' ($consoleCalls.Count -ge 2) "(found $($consoleCalls.Count))"
-$badConsole = @($consoleCalls | Where-Object { $_.Extent.Text -notmatch 'Get-mdiCoverageDenominator' })
-Assert-That '  ...and every one uses the shared denominator' ($badConsole.Count -eq 0) "($($badConsole.Count) still on ChecksTotal)"
+
+# A call site may reach the shared denominator EITHER by calling Get-mdiCoverageDenominator inline or
+# by using a variable that Main assigned from exactly that call. Demanding the inline call made this
+# assertion fail on a refactor that IMPROVED the code - the three verdict lines were changed to share
+# one $coverageDenominator computed once, which is the very rule this file exists to enforce, and the
+# test called it "still on ChecksTotal" when none of them mentions ChecksTotal at all.
+#
+# So the variables are resolved first, from assignments whose right-hand side really is that call, and
+# a call site passes if it uses one of them. The thing that must NOT appear is a raw ChecksTotal.
+$sharedVars = @($mainAst.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $n.Right.Extent.Text -match 'Get-mdiCoverageDenominator' -and
+            $n.Left -is [System.Management.Automation.Language.VariableExpressionAst]
+        }, $true) | ForEach-Object { $_.Left.VariablePath.UserPath } | Select-Object -Unique)
+Assert-That '  the shared denominator is computed once into a variable' ($sharedVars.Count -ge 1) `
+    "(assignments found: $($sharedVars -join ', '))"
+$badConsole = @($consoleCalls | Where-Object {
+        $callText = $_.Extent.Text
+        $usesShared = ($callText -match 'Get-mdiCoverageDenominator') -or
+            @($sharedVars | Where-Object { $callText -match ('\$' + [regex]::Escape($_) + '\b') }).Count -gt 0
+        -not $usesShared
+    })
+Assert-That '  ...and every one uses the shared denominator' ($badConsole.Count -eq 0) `
+    "($($badConsole.Count) reach it by neither the call nor a shared variable)"
+$rawTotal = @($consoleCalls | Where-Object { $_.Extent.Text -match 'ChecksTotal' })
+Assert-That '  ...and none quotes the measured-only total directly' ($rawTotal.Count -eq 0) `
+    "($($rawTotal.Count) still on ChecksTotal)"
 
 Write-Host 'Every template substitution is encoded' -ForegroundColor Cyan
 Assert-That 'the verdict text is HTML-encoded' ($text -match "Replace\('@@VERDICTTEXT@@', \(ConvertTo-mdiHtmlEncoded")

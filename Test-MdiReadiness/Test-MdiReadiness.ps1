@@ -1,4 +1,4 @@
-<#
+﻿<#
     .NOTES
         NON-ENGLISH WINDOWS AND NON-ENGLISH LOCALES
 
@@ -980,6 +980,40 @@ function Invoke-mdiRemoteCommand {
     } catch {
         $return = $_.Exception.Message
     }
+    # Every line Get-Content returns is a System.String DECORATED with the provider note properties
+    # PSPath, PSParentPath, PSChildName, PSDrive, PSProvider, ReadCount and Length. ConvertTo-Json
+    # serialises note properties, and PSProvider is a ProviderInfo whose Drives -> PSDriveInfo ->
+    # Provider -> Drives graph is cyclic - so the value stops being a JSON string and becomes an
+    # object whose text hides under ".value", trailed by the SCANNING HOST'S provider and drive
+    # metadata. Callers store this verbatim as a check's `details` (Get-mdiPowerScheme does, on both
+    # of its measured branches), and it goes straight into the -AsJson document and mdi-<domain>.json.
+    #
+    # Measured on the shipped function against this machine, one line of powercfg /getactivescheme
+    # output, at the nesting the report actually uses
+    # (report.DomainControllers[0].Details.PowerSettingsDetails, -Depth 7):
+    #
+    #   359,045 characters of JSON for ONE check on ONE server, opening
+    #   {"PowerSettingsDetails":{"value":"Power Scheme GUID: 8c5e7fda-...","PSPath":
+    #    "Microsoft.PowerShell.Core\FileSystem::\\<DC>\C$\WINDOWS\TEMP\mdi-<guid>.tmp",...
+    #
+    # and in isolation 44,738,380 characters at -Depth 6, then OutOfMemoryException at -Depth 7 -
+    # so the same value one level shallower kills the run outright, after every check has succeeded,
+    # with no document written. The report has exactly one level of depth headroom today.
+    #
+    # It is also a TYPE DRIFT a consumer cannot defend against: the not-measured branches build their
+    # `details` with -f and emit a JSON string, while the measured branches emit this object. The same
+    # field was a string on an unreadable server and an object on a readable one.
+    #
+    # Fixed here rather than at each call site so nothing leaving this function can carry the
+    # decoration - present callers and future ones alike. The cast rebuilds a plain [string] with the
+    # identical text (verified -ceq) and is applied element-wise so the array-of-lines shape that
+    # Get-mdiPowerScheme and Get-mdiAdvancedAuditing parse is preserved exactly; a scalar stays scalar
+    # and $null stays $null.
+    if ($return -is [array]) {
+        $return = @($return | ForEach-Object { if ($_ -is [string]) { [string] $_ } else { $_ } })
+    } elseif ($return -is [string]) {
+        $return = [string] $return
+    }
     $return
 }
 
@@ -1550,8 +1584,37 @@ function New-mdiDnsQueryPacket {
     $packet.AddRange([byte[]] @(0x00, 0x00))             # Answer RRs
     $packet.AddRange([byte[]] @(0x00, 0x00))             # Authority RRs
     $packet.AddRange([byte[]] @(0x00, 0x00))             # Additional RRs
+    # RFC 1035 caps a label at 63 bytes and the whole encoded QNAME at 255. Neither was enforced, and
+    # the length byte was written with a bare [byte] cast, so the name went onto the wire - or did not
+    # go at all - in two different broken ways depending only on how long it was:
+    #
+    #   64..255 bytes  the length byte is written with its TOP BITS SET. 0xC0 is the DNS compression
+    #                  POINTER marker, so a label of 192..255 does not encode an over-long name, it
+    #                  encodes a different structure. Measured on the shipped function: a 192-byte
+    #                  label produced length byte 0xC0 and a 255-byte label 0xFF, both silently, and
+    #                  Invoke-mdiPortProbePlan then recorded a DnsUdp RESULT for the malformed
+    #                  question - a query that asked the server nothing, reported as a measurement.
+    #   256+ bytes     [byte] THROWS "Value was either too large or too small for an unsigned byte",
+    #                  and the throw ESCAPES Invoke-mdiPortProbePlan. Measured on the shipped
+    #                  functions with the same plan: a 63-byte label returned results, a 256-byte one
+    #                  returned NONE - the whole port-probe pass for that server was lost, so every
+    #                  other probe beside it produced no record at all rather than a failure.
+    #
+    # Both are reachable from ordinary operator input: the name is the -Domain string, which
+    # New-mdiPortProbePlan carries into the plan verbatim as DnsProbeName. This function and
+    # Invoke-mdiPortProbePlan are BOTH in the shipped function list, so the throw happened on every
+    # scanned server inside the remote command line, not only on the scanning host.
+    #
+    # The refusal is deliberate and explicit rather than a truncation: a question this encoder cannot
+    # represent must not be sent as something else, and inventing a shorter name would ask about a
+    # host nobody named. The caller records it as NOT TESTED.
+    $qnameLength = 1
     foreach ($label in ($Name -split '\.' | Where-Object { $_ })) {
         $labelBytes = [Text.Encoding]::ASCII.GetBytes($label)
+        $qnameLength += 1 + $labelBytes.Length
+        if ($labelBytes.Length -gt 63 -or $qnameLength -gt 255) {
+            throw ('a DNS question cannot be built for this name: RFC 1035 allows a label of 63 bytes and a name of 255, and this one needs {0} and {1}' -f $labelBytes.Length, $qnameLength)
+        }
         $packet.Add([byte] $labelBytes.Length)
         $packet.AddRange($labelBytes)
     }
@@ -2094,6 +2157,40 @@ function Get-mdiConfiguredDnsServer {
     $result
 }
 
+function Get-mdiLocalProbeAddress {
+    <#
+        The IP addresses that belong to the machine running the probe plan.
+
+        A TCP or UDP probe aimed at one of these never leaves the host: the local stack serves it,
+        and on a domain controller 389, 636, 3268 and 3269 are all listening locally. It therefore
+        succeeds whatever a firewall between hosts would have done to the same packet, which makes it
+        a value nobody measured wearing the shape of a measurement.
+
+        This is the same argument Resolve-mdiLdapTarget already makes about 127.0.0.1 ("the probe
+        cannot be the guard - measured, Test-mdiTcpPort against 127.0.0.1 returns Success=True /
+        'Connected'"). Test-mdiUsableComputerAddress duly rejects loopback, APIPA, 0.0.0.0 and the
+        IPv6 any address - but NOT a domain controller's own routable address, because that address
+        is entirely usable for everybody except the machine that owns it.
+
+        Loopback is included so both cases are handled by one list. Failure returns an EMPTY list,
+        which restores exactly the previous behaviour: a fault in this helper must never be able to
+        suppress probes that would otherwise have run.
+    #>
+    $addresses = New-Object -TypeName System.Collections.ArrayList
+    try {
+        foreach ($ip in [Net.Dns]::GetHostAddresses([Net.Dns]::GetHostName())) {
+            $canonical = ConvertTo-mdiCanonicalIPAddress -Value $ip
+            if ($null -ne $canonical) { [void] $addresses.Add($canonical) }
+        }
+    } catch {
+    }
+    foreach ($loopback in '127.0.0.1', '::1') {
+        $canonical = ConvertTo-mdiCanonicalIPAddress -Value $loopback
+        if ($null -ne $canonical) { [void] $addresses.Add($canonical) }
+    }
+    @($addresses | Select-Object -Unique)
+}
+
 function Invoke-mdiPortProbePlan {
     param (
         [Parameter(Mandatory = $true)] [object] $Plan
@@ -2104,6 +2201,27 @@ function Invoke-mdiPortProbePlan {
     $dnsServers = @($dnsLookup.Servers)
     # ArrayList rather than Generic.List[object]: converting a Generic.List[object] with @() throws
     # "Argument types do not match" on some Windows PowerShell 5.1 builds (for example 5.1.20348.4294).
+    # The addresses a probe cannot learn anything by contacting, because they are this machine's own.
+    # Read ONCE: the list cannot change during a plan, and Get-mdiLocalProbeAddress performs a DNS
+    # lookup that would otherwise be repeated per probe per target.
+    $localAddresses = @(Get-mdiLocalProbeAddress)
+    # Splits a target list into the ones worth probing and the ones that are this machine. Shared by
+    # the two scopes below so they cannot drift into two different ideas of "is this me".
+    $splitSelfTargets = {
+        param($TargetList)
+        $remote = New-Object -TypeName System.Collections.ArrayList
+        $self = New-Object -TypeName System.Collections.ArrayList
+        foreach ($candidate in @($TargetList)) {
+            if ($null -eq $candidate) { continue }
+            $candidateIp = ConvertTo-mdiCanonicalIPAddress -Value $candidate.IP
+            if ($null -ne $candidateIp -and $localAddresses -contains $candidateIp) {
+                [void] $self.Add($candidate)
+            } else {
+                [void] $remote.Add($candidate)
+            }
+        }
+        [PSCustomObject]@{ Remote = @($remote.ToArray()); Self = @($self.ToArray()) }
+    }
     $results = New-Object -TypeName System.Collections.ArrayList
 
     $addResult = {
@@ -2179,10 +2297,25 @@ function Invoke-mdiPortProbePlan {
                         $outcome = if ($probe.Protocol -eq 'TCP') {
                             Test-mdiTcpPort -ComputerName $dnsServer -Port $probe.Port -TimeoutMs $timeoutMs
                         } else {
-                            $dnsPayload = New-mdiDnsQueryPacket -Name $Plan.DnsProbeName
-                            Test-mdiUdpPort -ComputerName $dnsServer -Port $probe.Port -TimeoutMs $timeoutMs `
-                                -Payload $dnsPayload -ExpectedTransactionId ((([int] $dnsPayload[0]) -shl 8) -bor [int] $dnsPayload[1]) `
-                                -ResponseValidator { param($bytes) Test-mdiDnsResponseShape -Response $bytes }
+                            # GUARDED. DnsProbeName is the operator's -Domain string, carried into the
+                            # plan verbatim, and New-mdiDnsQueryPacket refuses a name RFC 1035 cannot
+                            # encode. Unguarded that refusal escaped this function and ended the whole
+                            # plan: measured on the shipped functions, a 256-byte label took the pass
+                            # from results to NONE, so every other probe beside it lost its record
+                            # entirely rather than failing. A probe with no record cannot be counted as
+                            # missing by anything downstream, which is the larger failure of the two.
+                            $dnsPayload = $null; $dnsPayloadError = $null
+                            try { $dnsPayload = New-mdiDnsQueryPacket -Name $Plan.DnsProbeName } catch { $dnsPayloadError = $_.Exception.Message }
+                            if ($null -eq $dnsPayload) {
+                                [PSCustomObject]@{
+                                    Success = $false
+                                    Detail  = ('Not tested - {0}' -f $dnsPayloadError)
+                                }
+                            } else {
+                                Test-mdiUdpPort -ComputerName $dnsServer -Port $probe.Port -TimeoutMs $timeoutMs `
+                                    -Payload $dnsPayload -ExpectedTransactionId ((([int] $dnsPayload[0]) -shl 8) -bor [int] $dnsPayload[1]) `
+                                    -ResponseValidator { param($bytes) Test-mdiDnsResponseShape -Response $bytes }
+                            }
                         }
                         & $addResult $probe $dnsServer $dnsServer $outcome
                     }
@@ -2190,36 +2323,71 @@ function Invoke-mdiPortProbePlan {
             }
 
             'NetworkDevice' {
-                foreach ($target in $Plan.NnrTargets) {
-                    $outcome = switch ($probe.Id) {
-                        'NnrNetBios' { Test-mdiNnrNetBios -ComputerName $target.IP -TimeoutMs $timeoutMs }
-                        # -TimeoutMs passed, like its NetBIOS sibling one line above. Without it this
-                        # probe silently kept its own 3000 ms default, so -PortProbeTimeoutMs moved
-                        # every other probe in the plan and left this one alone: an operator raising
-                        # the timeout for a slow WAN link still got "not tested" from reverse DNS, and
-                        # one lowering it to keep a large scan short still paid 3 seconds per target.
-                        'NnrReverseDns' { Test-mdiReverseDns -IPAddress $target.IP -TimeoutMs $timeoutMs }
-                        default { Test-mdiTcpPort -ComputerName $target.IP -Port $probe.Port -TimeoutMs $timeoutMs }
+                # A target that IS this machine proves nothing about name resolution reaching it from
+                # the sensor, so it is never probed. When other targets exist it is simply dropped -
+                # they carry the measurement and the verdict is unchanged. When it is the ONLY target
+                # the scope has nothing left to measure, and that is recorded as NOT TESTED rather
+                # than left to a self-connection that always succeeds.
+                $nnrSplit = & $splitSelfTargets $Plan.NnrTargets
+                if (@($nnrSplit.Remote).Count -eq 0 -and @($nnrSplit.Self).Count -gt 0) {
+                    foreach ($target in $nnrSplit.Self) {
+                        & $addResult $probe $target.Name $target.IP ([PSCustomObject]@{
+                                Success = $false
+                                Detail  = 'Not tested - this target is the server running the probe, and a connection to the machine''s own address is served locally rather than crossing the network'
+                            })
                     }
-                    & $addResult $probe $target.Name $target.IP $outcome
+                } else {
+                    foreach ($target in $nnrSplit.Remote) {
+                        $outcome = switch ($probe.Id) {
+                            'NnrNetBios' { Test-mdiNnrNetBios -ComputerName $target.IP -TimeoutMs $timeoutMs }
+                            # -TimeoutMs passed, like its NetBIOS sibling one line above. Without it this
+                            # probe silently kept its own 3000 ms default, so -PortProbeTimeoutMs moved
+                            # every other probe in the plan and left this one alone: an operator raising
+                            # the timeout for a slow WAN link still got "not tested" from reverse DNS, and
+                            # one lowering it to keep a large scan short still paid 3 seconds per target.
+                            'NnrReverseDns' { Test-mdiReverseDns -IPAddress $target.IP -TimeoutMs $timeoutMs }
+                            default { Test-mdiTcpPort -ComputerName $target.IP -Port $probe.Port -TimeoutMs $timeoutMs }
+                        }
+                        & $addResult $probe $target.Name $target.IP $outcome
+                    }
                 }
             }
 
             'DomainController' {
-                foreach ($target in $Plan.DomainControllers) {
-                    $outcome = if ($probe.Protocol -eq 'TCP') {
-                        Test-mdiTcpPort -ComputerName $target.IP -Port $probe.Port -TimeoutMs $timeoutMs
-                    } else {
-                        # CLDAP carries its message ID inside BER rather than in the first two bytes, so
-                        # the generic identifier check does not apply. The reply is parsed instead: it
-                        # must be a well-formed LDAP message, carry the message ID this probe sent, and
-                        # hold a search RESPONSE. Checking only for a leading BER SEQUENCE accepted our
-                        # own request reflected back, because the packet we send starts with one.
-                        Test-mdiUdpPort -ComputerName $target.IP -Port $probe.Port -TimeoutMs $timeoutMs `
-                            -Payload (New-mdiCldapPingPacket) `
-                            -ResponseValidator { param($bytes) Test-mdiCldapResponseShape -Response $bytes }
+                # The same rule as NetworkDevice above, and the case it exists for. The LDAP sample is
+                # spread per DOMAIN (-MaxLdapTargetsPerDomain, default 2), so a domain holding ONE
+                # domain controller gives that controller only ITSELF to probe - and every required
+                # DomainController port then passed on a connection that never left the machine.
+                # Measured on dc2022 with a single-controller plan: LdapTcp, LdapUdp, LdapGcTcp,
+                # LdapsTcp and LdapsGcTcp all reported open, mandatory failures 0, unmeasured 0, and
+                # isRequiredPortsOk came back True. -MultiForest promotes LDAPS 636 and LDAPS-GC 3269
+                # to Required, so the two ports a multi-forest deployment turns on were certified the
+                # same way. Proven blocked at the same time: 10.10.1.12:389 and :636 answered from
+                # dc2022 itself and were refused from dc2016.
+                $dcSplit = & $splitSelfTargets $Plan.DomainControllers
+                if (@($dcSplit.Remote).Count -eq 0 -and @($dcSplit.Self).Count -gt 0) {
+                    foreach ($target in $dcSplit.Self) {
+                        & $addResult $probe $target.Name $target.IP ([PSCustomObject]@{
+                                Success = $false
+                                Detail  = 'Not tested - this domain controller is the server running the probe, and a connection to the machine''s own address is served locally rather than crossing the network'
+                            })
                     }
-                    & $addResult $probe $target.Name $target.IP $outcome
+                } else {
+                    foreach ($target in $dcSplit.Remote) {
+                        $outcome = if ($probe.Protocol -eq 'TCP') {
+                            Test-mdiTcpPort -ComputerName $target.IP -Port $probe.Port -TimeoutMs $timeoutMs
+                        } else {
+                            # CLDAP carries its message ID inside BER rather than in the first two bytes, so
+                            # the generic identifier check does not apply. The reply is parsed instead: it
+                            # must be a well-formed LDAP message, carry the message ID this probe sent, and
+                            # hold a search RESPONSE. Checking only for a leading BER SEQUENCE accepted our
+                            # own request reflected back, because the packet we send starts with one.
+                            Test-mdiUdpPort -ComputerName $target.IP -Port $probe.Port -TimeoutMs $timeoutMs `
+                                -Payload (New-mdiCldapPingPacket) `
+                                -ResponseValidator { param($bytes) Test-mdiCldapResponseShape -Response $bytes }
+                        }
+                        & $addResult $probe $target.Name $target.IP $outcome
+                    }
                 }
             }
 
@@ -2391,6 +2559,11 @@ function Get-mdiPortProbeScriptText {
         'New-mdiCldapPingPacket', 'Test-mdiNnrNetBios', 'Test-mdiReverseDns', 'Get-mdiPtrHostEntry',
         'Test-mdiCloudConnectivity',
         'Test-mdiDnsResponseShape', 'Get-mdiBerLength', 'Test-mdiCldapResponseShape',
+        # Get-mdiLocalProbeAddress is what stops the sensor probing ITSELF and reporting the result as
+        # an open network path. Invoke-mdiPortProbePlan calls it, and this script runs on the sensor
+        # with nothing but the functions named here - so omitting it would not degrade the check, it
+        # would make every port probe on every server fail with a command-not-found.
+        'Get-mdiLocalProbeAddress',
         'Test-mdiLocalTcpListener', 'Test-mdiLocalUdpListener', 'Get-mdiConfiguredDnsServer', 'Invoke-mdiPortProbePlan'
     )
     # Every probe primitive is shipped, including Test-mdiCloudConnectivity even when no workspace was
@@ -3056,8 +3229,48 @@ function Resolve-mdiNnrTarget {
 
     # Network Name Resolution must work against every device on the network, not only domain controllers. When the
     # caller supplies representative endpoints we use those, otherwise we fall back to a sample of domain controllers.
-    $targets = if ($NnrTargetComputer) {
-        @($NnrTargetComputer | ForEach-Object {
+    #
+    # The branch is chosen with Test-mdiNoNameSupplied, and the BLANK ENTRIES ARE REMOVED FIRST.
+    #
+    # `if ($NnrTargetComputer)` is not the question "did the caller name a host". -NnrTargetComputer
+    # is declared [string[]], and for a MULTI-element array PowerShell tests the array itself, which
+    # is true whatever the elements are. This is the fourth list parameter in the script to ask a raw
+    # truthiness question of a [string[]]; the other three are the role scanners, and
+    # Test-mdiNoNameSupplied was written for exactly this.
+    #
+    # Here it was worse than a silent skip, because a blank name does not merely resolve to nothing -
+    # it cannot be PASSED. Get-mdiComputerAddress types -ComputerName as a MANDATORY [string], and a
+    # mandatory string parameter rejects the empty string at BIND time. That is a terminating error,
+    # raised inside the ForEach-Object whose output becomes $targets, so it does not cost the blank
+    # entry: it costs every host beside it. Measured on the shipped function, five domain-controller
+    # rows across mdilab.local, emea, apac and fabrikam.local available as the fallback:
+    #
+    #   -NnrTargetComputer $null                            5 targets  (fallback)
+    #   -NnrTargetComputer @('')                            5 targets  (fallback)
+    #   -NnrTargetComputer @('','')                         THREW
+    #   -NnrTargetComputer @($null,$null)                   THREW
+    #   -NnrTargetComputer @(' ')                           THREW
+    #   -NnrTargetComputer @('','dc2022.mdilab.local')      THREW
+    #
+    # The last line is the one that matters: the operator named a REAL domain controller and put one
+    # blank beside it - a trailing comma, an empty line in a file read with Get-Content, an empty CSV
+    # cell - and the run died. Not a degraded scan; no scan. Main calls this at the top level and the
+    # call is inside NO try block (confirmed from the syntax tree, not from indentation), so the
+    # exception propagates out of the script and no report is written at all.
+    #
+    # @('') is the one blank shape anybody would think to try, and it is the one shape that already
+    # worked, because a SINGLE-element array is truthy according to its element. That is why this
+    # survived: the obvious probe passes.
+    #
+    # Removing the blanks alone would not be enough - a list of nothing but blanks would then take
+    # the caller branch, resolve nothing, and skip the domain-controller fallback silently, which is
+    # the "clean-looking report of nothing" this project keeps removing. Get-mdiUnresolvedNnrTarget
+    # would disclose nothing either: it skips blank requests, correctly, because a blank was never a
+    # host anyone asked about. So the branch asks whether a NAME was supplied, and the loop then runs
+    # over the names only.
+    $namedComputers = @($NnrTargetComputer | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })
+    $targets = if (-not (Test-mdiNoNameSupplied -Name $NnrTargetComputer)) {
+        @($namedComputers | ForEach-Object {
                 $name = $_
                 $knownIp = $null
                 try {
@@ -4361,10 +4574,24 @@ function Get-mdiSensorV3Readiness {
     # already returns 'N/A' for that exact token, so the same server was called unreadable by one
     # check and definitively broken by another. See Test-mdiServiceTokenKnown.
     $senseStateKnown = Test-mdiServiceTokenKnown -Token $senseState
+    # StartMode is part of the verdict, not decoration. It was read, printed in the detail, and then
+    # never consulted: a Sense service Running under start mode Disabled or Manual was a green PASS
+    # whose own sentence said "(start mode: Disabled)". That service does not come back after a
+    # reboot, so Defender for Endpoint onboarding lapses on the next restart and the report calls the
+    # server ready. Get-mdiSensorHealth already fails the identical configuration on the sensor
+    # service - "start mode is Manual, not Auto; it will not start after a reboot" - so the same two
+    # tokens produced a pass on one surface and a failure on the other in the same run. Measured by
+    # sweeping StartMode with State held at Running: the Sense verdict never moved once.
+    $senseStartModeKnown = Test-mdiServiceTokenKnown -Token $senseStartMode
+    # Order matters. A service that is not running is a definite failure whatever its start mode, and
+    # that outranks an unreadable start mode; only a service that IS running has its persistence
+    # decided by a start mode, and an unreadable one there is unknown rather than wrong.
     $isSenseRunning = if (-not $wmiReadable -or -not $senseReadable) { 'N/A' }
     elseif ($null -eq $senseService) { $false }
     elseif (-not $senseStateKnown) { 'N/A' }
-    else { $senseState -eq 'Running' }
+    elseif ($senseState -ne 'Running') { $false }
+    elseif (-not $senseStartModeKnown) { 'N/A' }
+    else { $senseStartMode -eq 'Auto' }
     & $addCheck 'Defender for Endpoint (Sense) service is running' $isSenseRunning $(
         if (-not $wmiReadable) { 'Not tested - {0}' -f $unreadable }
         elseif (-not $senseReadable) { 'Not tested - the service list could not be read on this server: {0}' -f [string] $senseResult.Error }
@@ -4373,8 +4600,13 @@ function Get-mdiSensorV3Readiness {
             if ([string]::IsNullOrWhiteSpace([string] $senseState)) { 'Not tested - the Sense service was found but the service control manager did not report its state on this server, so whether it is running could not be determined' }
             else { 'Not tested - the service control manager reported the Sense service state as Unknown on this server, so whether it is running could not be determined' }
         }
+        elseif ($senseState -ne 'Running') { 'Sense service is {0} (start mode: {1}) - it must be running' -f $senseState, $senseStartMode }
+        elseif (-not $senseStartModeKnown) {
+            if ([string]::IsNullOrWhiteSpace([string] $senseStartMode)) { 'Not tested - the Sense service is running but the service control manager did not report its start mode on this server, so whether it survives a reboot could not be determined' }
+            else { 'Not tested - the service control manager reported the Sense service start mode as Unknown on this server, so whether it survives a reboot could not be determined' }
+        }
         elseif ($isSenseRunning -eq $true) { 'Sense service is running (start mode: {0})' -f $senseStartMode }
-        else { 'Sense service is {0} (start mode: {1}) - it must be running' -f $senseState, $senseStartMode }
+        else { 'Sense service is running but its start mode is {0}, not Auto - it will not start after a reboot and Defender for Endpoint onboarding will lapse' -f $senseStartMode }
     )
 
     $onboardingResult = Get-mdiRemoteRegistryResult -ComputerName $ComputerName -Key $v3.MdeStatusRegKey -Value $v3.MdeOnboardingStateValue
@@ -4999,6 +5231,16 @@ function Get-mdiDeletedObjectsPermission {
         [Parameter(Mandatory = $false)] [string[]] $DirectoryServiceAccount = $null
     )
 
+    # Whether the operator actually NAMED an account, and the named accounts themselves - computed
+    # ONCE, here, rather than at the three sites that each asked it differently. -DirectoryServiceAccount
+    # is [string[]], and a MULTI-element array is truthy whatever its elements are, so `-not $DirectoryServiceAccount`
+    # answered "is this list non-empty", not "did the operator name an account". Three sites asked it
+    # that way and one of them then passed a blank element into Get-mdiMatchingTrustee, whose -Account
+    # is a MANDATORY [string] and rejects the empty string at BIND time - a terminating error that
+    # costs the real account beside the blank. See the main status branch below for the measurement.
+    $namedAccounts = @($DirectoryServiceAccount | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })
+    $accountWasNamed = -not (Test-mdiNoNameSupplied -Name $DirectoryServiceAccount)
+
     # The Directory Service Account must be able to read the Deleted Objects container, otherwise MDI cannot resolve
     # deleted entities. Source: https://aka.ms/mdi/dsa-permissions
     try {
@@ -5172,8 +5414,12 @@ function Get-mdiDeletedObjectsPermission {
         # grants read to nobody.
         if ($null -eq $granted -or @($granted).Count -eq 0) {
             $descriptorWasRead = ($null -ne $readMethod)
+            # $accountWasNamed is computed once at the top of the function, per ELEMENT rather than on
+            # the array, for the reason given there: @('','') is a list that names nobody, and asking
+            # the array asserted a DEFINITE FAILURE here - a false red on a container whose DACL was
+            # read in full, against an account nobody actually named.
             return [PSCustomObject]@{
-                isDeletedObjectsPermissionOk = $(if ($descriptorWasRead -and $DirectoryServiceAccount) { $false } else { 'N/A' })
+                isDeletedObjectsPermissionOk = $(if ($descriptorWasRead -and $accountWasNamed) { $false } else { 'N/A' })
                 # NotAsserted has to be carried here too, for exactly the reason spelled out on the main
                 # return path below: 'N/A' alone cannot tell "the DACL was read in full and there was no
                 # account to assert against" apart from a real measurement gap, and every consumer that
@@ -5189,7 +5435,7 @@ function Get-mdiDeletedObjectsPermission {
                 # failure, which must still be asserted; and when the descriptor could not be read at all
                 # this is a genuine gap that has to keep counting as an unread check rather than being
                 # excused as a question nobody asked.
-                NotAsserted                  = ($descriptorWasRead -and -not $DirectoryServiceAccount)
+                NotAsserted                  = ($descriptorWasRead -and -not $accountWasNamed)
                 Measured                     = $descriptorWasRead
                 details                      = [PSCustomObject]@{
                     Container = $deletedObjectsDn
@@ -5229,12 +5475,43 @@ function Get-mdiDeletedObjectsPermission {
         # The accounts that resolved, were searched for on a fully-read DACL, and were genuinely not
         # on it. Named in the failure message so a multi-account run says WHICH one is missing.
         $unmatchedAccount = @()
-        $status = if (-not $DirectoryServiceAccount) {
+        # The branch is chosen with Test-mdiNoNameSupplied, and the BLANK ENTRIES ARE REMOVED FIRST.
+        #
+        # `-not $DirectoryServiceAccount` is not the question "did the operator name an account".
+        # -DirectoryServiceAccount is declared [string[]], and for a MULTI-element array PowerShell
+        # tests the array itself, which is true whatever the elements are. This is the fifth list
+        # parameter in the script to ask a raw truthiness question of a [string[]]; the others are
+        # the three role scanners and Resolve-mdiNnrTarget, and Test-mdiNoNameSupplied was written
+        # for exactly this.
+        #
+        # Here a blank does not merely fail to match - it cannot be PASSED. Get-mdiMatchingTrustee
+        # types -Account as a MANDATORY [string], and a mandatory string parameter rejects the empty
+        # string at BIND time. That is a terminating error raised inside the loop, so it does not
+        # cost the blank entry: it costs the REAL account beside it. The outer try catches it and the
+        # check is reported as "Unable to read the Deleted Objects container: Cannot bind argument to
+        # parameter 'Account'..." - which blames the directory, and sends the operator to check
+        # READ_CONTROL and run dsacls against a container whose DACL had just been read in full.
+        #
+        # Measured on the shipped function against a live domain, using BUILTIN\Administrators
+        # because it genuinely IS on that container's DACL:
+        #
+        #   -DirectoryServiceAccount @('BUILTIN\Administrators')       True   'has read access to the Deleted Objects container'
+        #   -DirectoryServiceAccount @('BUILTIN\Administrators','')    N/A    'Unable to read the Deleted Objects container: Cannot bind argument...'
+        #   -DirectoryServiceAccount @('','BUILTIN\Administrators')    N/A    same
+        #   -DirectoryServiceAccount @($null,'BUILTIN\Administrators') N/A    same
+        #
+        # A verified pass replaced by an unmeasured verdict with a misattributed cause, from one blank
+        # list element. @('') alone is SAFE, and that is why this survived: a single-element array is
+        # truthy according to its element, so the one blank shape anybody would think to try is the
+        # one shape that already worked. An operator builds this list by hand, from a config file or
+        # a CSV, so a trailing comma, an empty line read with Get-Content or an empty cell all
+        # produce the breaking shape.
+        $status = if (Test-mdiNoNameSupplied -Name $DirectoryServiceAccount) {
             'N/A'
         } else {
             $anyAmbiguous = $false
             $allSatisfied = $true
-            foreach ($dsa in $DirectoryServiceAccount) {
+            foreach ($dsa in $namedAccounts) {
                 $matched = @(Get-mdiMatchingTrustee -Trustee $granted -Account $dsa)
                 if (@($matched | Where-Object { $_.Confidence -eq 'Verified' }).Count -gt 0) { continue }
                 $ambiguous = @($matched | Where-Object { $_.Confidence -eq 'Ambiguous' })
@@ -5333,7 +5610,7 @@ function Get-mdiDeletedObjectsPermission {
             # while the HTML cell for the same fact read a benign grey "Not applicable" (12601-12605),
             # because the renderer was the only surface reading the Measured flag. Every default run
             # failed this way.
-            NotAsserted                  = (-not $DirectoryServiceAccount)
+            NotAsserted                  = (-not $accountWasNamed)
             # Measured: the DACL WAS read. Reporting who has access without being told which account to
             # assert is an answer, not a gap - so this 'N/A' is measured, while the one above (the
             # descriptor could not be read at all) is not. An ambiguous identity match is different: the
@@ -6994,9 +7271,13 @@ function New-mdiRemediationScript {
     }
 
     $content = $script.ToArray() -join [environment]::NewLine
-    Write-mdiReportFile -Content $content -FilePath $FilePath
+    # The path is taken FROM THE WRITER, never re-derived. (Resolve-Path -Path $FilePath).Path was
+    # wildcard-expanding: with an output folder named 'out[1]' it returned $null while the 11891-byte
+    # script sat on disk, and Main then printed "Remediation script written to  with 1 section(s)."
+    # about the one artefact an operator is told to run as Domain Admin. See Write-mdiReportFile.
+    $writtenPath = Write-mdiReportFile -Content $content -FilePath $FilePath
     [PSCustomObject]@{
-        Path         = (Resolve-Path -Path $FilePath).Path
+        Path         = $writtenPath
         SectionCount = $sections
     }
 }
@@ -7168,7 +7449,7 @@ function Get-mdiBaselineHistory {
     }
 
     try {
-        if (-not (Test-Path -Path $BaselinePath)) { [void] (New-Item -ItemType Directory -Path $BaselinePath -Force) }
+        if (-not (Test-Path -LiteralPath $BaselinePath)) { [void] (New-Item -ItemType Directory -Path $BaselinePath -Force) }
     } catch {
         Write-mdiWarning ('Unable to create the baseline directory {0}, skipping the trend update for this run: {1}' -f $BaselinePath, $_.Exception.Message)
         return $result
@@ -7416,9 +7697,11 @@ function Get-mdiBaselineHistory {
         }
 
         try {
-            Write-mdiReportFile -Content ($persisted | ConvertTo-Json -Depth 4) -FilePath $file
+            # Captured, not called bare: the writer now returns the rooted path it wrote, and a bare
+            # call would put that string on this function's own output stream.
+            $writtenFile = Write-mdiReportFile -Content ($persisted | ConvertTo-Json -Depth 4) -FilePath $file
             $result = [PSCustomObject]@{
-                Path    = $file
+                Path    = $writtenFile
                 History = @($history)
                 Current = $entry
             }
@@ -9629,14 +9912,17 @@ function Get-mdiMachineType {
                     { $_ -match 'Xen|Google' } { $_; break }
                     { $_ -match 'QEMU' } { 'KVM'; break }
                     { $_ -eq 'Microsoft Corporation' } {
-                        $azgaParams = @{
-                            ComputerName = $ComputerName
-                            Namespace    = 'root\cimv2'
-                            Class        = 'Win32_Service'
-                            Filter       = "Name = 'WindowsAzureGuestAgent'"
-                            ErrorAction  = 'SilentlyContinue'
-                        }
-                        if (Get-WmiObject @azgaParams) { 'Azure' } else { 'Hyper-V' }
+                        # Get-mdiServiceStateResult, not a bare Get-WmiObject: it reads with
+                        # ErrorAction 'Stop' and carries a Readable flag, so "the agent is not
+                        # installed" and "the service list could not be read" stop sharing one
+                        # answer. This was the last Win32_Service read in the file still using
+                        # SilentlyContinue, and `if (Get-WmiObject ...)` is exactly the
+                        # `if ($service)` test that accessor's own documentation condemns: on an
+                        # Access-Denied service list it asserted Hyper-V as a measured fact while
+                        # five other checks on the same server correctly reported Not tested.
+                        $azga = Get-mdiServiceStateResult -ComputerName $ComputerName -ServiceName 'WindowsAzureGuestAgent'
+                        if ($azga.Readable -ne $true) { throw ('the service list could not be read: {0}' -f [string] $azga.Error) }
+                        if ($azga.Service) { 'Azure' } else { 'Hyper-V' }
                         break
                     }
                     default {
@@ -9645,9 +9931,18 @@ function Get-mdiMachineType {
                             Namespace    = 'root\cimv2'
                             Class        = 'Win32_ComputerSystemProduct'
                             Property     = 'uuid'
-                            ErrorAction  = 'SilentlyContinue'
+                            ErrorAction  = 'Stop'
                         }
-                        $uuid = (Get-WmiObject @cspParams).UUID
+                        # Same rule as the outer query above, applied one level down - that guard was
+                        # one query too shallow. SilentlyContinue returned $null for a query that
+                        # FAILED and for a machine carrying no EC2 UUID alike, so 'Physical' was
+                        # emitted from a read that never happened: a virtual machine that could not be
+                        # queried reported as bare metal, the exact failure the outer guard removed.
+                        # Both throws land in this function's catch, which writes the verbose line and
+                        # returns 'N/A' - the value the server table already renders as "Not tested".
+                        $uuid = try { (Get-WmiObject @cspParams).UUID } catch { throw ('the computer system product inventory was not returned: {0}' -f ($_.Exception.Message -replace '[\r\n]+', ' ')) }
+                        # An answer that did not carry the UUID is not a reading of "no EC2 UUID".
+                        if ([string]::IsNullOrWhiteSpace([string] $uuid)) { throw 'the computer system product inventory did not carry a UUID' }
                         if ($uuid -match '^EC2') { 'AWS' }
                         else { 'Physical' }
                     }
@@ -16234,7 +16529,7 @@ h1,h2,h3,h4{color:var(--heading);margin:0}
 .verdict{display:inline-flex;align-items:center;gap:10px;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.28);
   border-radius:999px;padding:9px 18px;font-weight:600;backdrop-filter:blur(6px)}
 .verdict .dot{width:10px;height:10px;border-radius:50%;box-shadow:0 0 0 4px rgba(255,255,255,.16)}
-.verdict.ok .dot{background:#5ee08a}.verdict.bad .dot{background:#ff8a92}
+.verdict.ok .dot{background:#5ee08a}.verdict.bad .dot{background:#ff8a92}.verdict.na .dot{background:#b8bdc7}
 .hero-actions{display:flex;gap:8px;margin-top:12px}
 .btn{border:1px solid rgba(255,255,255,.32);background:rgba(255,255,255,.12);color:#fff;border-radius:8px;
   padding:7px 13px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit}
@@ -16755,6 +17050,7 @@ function Set-MdiReadinessReport {
         [Parameter(Mandatory = $true)] [object[]] $ReportData,
         [Parameter(Mandatory = $false)] [object] $Remediation = $null,
         [Parameter(Mandatory = $false)] [string] $BaselinePath = $null,
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Statistics = $null,
         [Parameter(Mandatory = $false)] [switch] $SkipTrend
     )
 
@@ -16771,11 +17067,17 @@ function Set-MdiReadinessReport {
     # while the script went on to print "READY" and a blank report path. Claiming success for a run
     # that wrote nothing is worse than failing.
     try {
-        Write-mdiReportFile -Content ($ReportData | ConvertTo-Json -Depth 7) -FilePath $jsonReportFile
+        # The writer returns the rooted path it actually wrote, and that is what the HTML links to.
+        # This used to be re-derived one line later with (Resolve-Path -Path $jsonReportFile).Path,
+        # which is wildcard-expanding while the write is literal. With an output folder named
+        # 'reports [nightly]' the JSON landed on disk (1313 bytes) and $jsonReportFilePath came back
+        # $null, so the very next use of it - Split-Path -Leaf, for the report's own "Full details"
+        # link - killed the run with "Cannot bind argument to parameter 'Path' because it is null",
+        # leaving the JSON on disk and no HTML beside it.
+        $jsonReportFilePath = Write-mdiReportFile -Content ($ReportData | ConvertTo-Json -Depth 7) -FilePath $jsonReportFile
     } catch {
         throw ('Unable to write the JSON report to {0}: {1}' -f $jsonReportFile, $_.Exception.Message)
     }
-    $jsonReportFilePath = (Resolve-Path -Path $jsonReportFile).Path
 
     $convertServerTable = {
         param($Servers, $SkippedMessage, $EmptyMessage)
@@ -17054,7 +17356,7 @@ function Set-MdiReadinessReport {
         Get-mdiSensorV3Html -Server $allServers
     }
 
-    $stats = Get-mdiReportStatistics -ReportData $ReportData
+    $stats = if ($null -ne $Statistics) { $Statistics } else { Get-mdiReportStatistics -ReportData $ReportData }
 
     # Built AFTER the statistics, because the "nothing to remediate" branch is a claim ABOUT the
     # checks and may only be made once we know some were actually read. An estate whose domain
@@ -17159,15 +17461,19 @@ function Set-MdiReadinessReport {
         '<p class="muted">Not evaluated</p>'
     }
 
-    $isReady = Test-mdiReadinessResult -ReportData $ReportData
-    $verdictClass = if ($isReady) { 'ok' } else { 'bad' }
-    # The scope qualifier is appended to BOTH verdicts, not only to READY. It was added to stop an
-    # unqualified "All prerequisites met" being produced by a run that examined a fraction of them,
-    # which is the more dangerous case - but "Action required" needs it too. An operator reading that
-    # verdict is about to work through the findings believing the list is complete, when a skipped
-    # area could be hiding more; and after fixing what they can see they will re-run and get READY,
-    # so the scan's scope has to be visible at the point they decide what to act on.
-    $verdictText = $(if ($isReady) { 'All prerequisites met' } else { 'Action required' }) +
+    # Main publishes this tri-state on the report before calling the renderer. Direct callers that
+    # supply an older report get the same value through the shared classifier rather than a second
+    # copy of the readiness rule.
+    $publishedReadiness = $ReportData.Readiness
+    if ($null -eq $publishedReadiness) {
+        $publishedReadiness = Get-mdiPublishedReadiness -ReadinessResult (Test-mdiReadinessResult -ReportData $ReportData) -Statistics $stats
+    }
+    $isReady = ($publishedReadiness -is [bool]) -and ($publishedReadiness -eq $true)
+    $isUnknown = [string] $publishedReadiness -eq 'N/A'
+    $verdictClass = if ($isReady) { 'ok' } elseif ($isUnknown) { 'na' } else { 'bad' }
+    # The scope qualifier is appended to every verdict, including an unknown one, so no headline
+    # claims more of the estate than this run examined.
+    $verdictText = $(if ($isReady) { 'All prerequisites met' } elseif ($isUnknown) { 'Readiness N/A' } else { 'Action required' }) +
         (Get-mdiVerdictQualifier -ReportData $ReportData)
     $issueCount = @(Get-mdiIssueList -Statistics $stats -ReportData $ReportData).Count
     $issueBadge = if ($issueCount -gt 0) { '<span class="count bad">' + $issueCount + '</span>' } else { '' }
@@ -17342,11 +17648,16 @@ function Set-MdiReadinessReport {
     $htmlReportFile = Join-Path -Path $Path -ChildPath ('mdi-{0}.html' -f (ConvertTo-mdiSafeFileName $Domain))
     Write-mdiVerbose "Creating html report: $htmlReportFile"
     try {
-        Write-mdiReportFile -Content $htmlContent -FilePath $htmlReportFile
+        # The path this function RETURNS is the path the writer wrote, so the closing artefact
+        # inventory in Main cannot name anything else. Re-deriving it with (Resolve-Path -Path ...)
+        # was wildcard-expanding: measured with sibling folders dc1\ and dc2\ present and the report
+        # written into dc[12]\, it returned BOTH siblings and Main printed
+        # "  Report: ...\dc1\mdi-contoso.com.html" - a stale report from a different scan.
+        $htmlWrittenPath = Write-mdiReportFile -Content $htmlContent -FilePath $htmlReportFile
     } catch {
         throw ('Unable to write the HTML report to {0}: {1}' -f $htmlReportFile, $_.Exception.Message)
     }
-    (Resolve-Path -Path $htmlReportFile).Path
+    $htmlWrittenPath
 }
 
 function Write-mdiReportFile {
@@ -17422,7 +17733,28 @@ function Write-mdiReportFile {
             $isJson = [string]::Equals([IO.Path]::GetExtension($FilePath), '.json',
                 [StringComparison]::OrdinalIgnoreCase)
             [IO.File]::WriteAllText($FilePath, $Content, (New-Object System.Text.UTF8Encoding (-not $isJson)))
-            return
+            # The ROOTED path that was just written is the function's result, and it is the ONLY way a
+            # caller may learn where an artefact went.
+            #
+            # Every caller used to re-derive that answer itself with (Resolve-Path -Path $x).Path. That
+            # is the WILDCARD-EXPANDING form, while the write above is literal, so the two were
+            # different functions of the same string and the run reported a path it had not written.
+            # Measured on the shipped functions with an output folder named 'out[1]':
+            #
+            #   file on disk (literal)  True, 11891 bytes
+            #   (Resolve-Path).Path     $null
+            #   console                 "Remediation script written to  with 1 section(s)."
+            #
+            # and with sibling folders dc1\ and dc2\ present, a run writing into 'dc[12]' had
+            # Resolve-Path return BOTH siblings, so the closing inventory named dc1\mdi-<domain>.html -
+            # a STALE report from a different scan - instead of the file this run produced. A folder
+            # name carrying [ ] * or ? is ordinary ('Reports [nightly]', 'MDI [2026-08]'), and -Path is
+            # free text: ConvertTo-mdiSafeFileName only sanitises the file NAME, never the folder.
+            #
+            # Returning it from here makes the disagreement unrepresentable rather than merely fixed:
+            # there is no second expression left that could drift. Callers MUST capture the value -
+            # a bare call would put the path on their own output stream.
+            return $FilePath
         } catch [IO.IOException] {
             # ONLY a sharing or lock violation is worth retrying. DirectoryNotFoundException,
             # FileNotFoundException and PathTooLongException all derive from IOException, so catching
@@ -17906,6 +18238,55 @@ function Test-mdiReadinessResult {
     [bool] $return
 }
 
+function Get-mdiPublishedReadiness {
+    <#
+        The machine-readable readiness value: boolean when the run proved an answer, and 'N/A'
+        when it did not produce enough evidence to decide. A measured failure remains $false even
+        when other checks are unread; only a result with no known failure can be unknown.
+    #>
+    param (
+        [Parameter(Mandatory = $true)] [bool] $ReadinessResult,
+        [Parameter(Mandatory = $true)] [object] $Statistics
+    )
+
+    if ($ReadinessResult) { return $true }
+
+    $totalServers = Get-mdiCoverageCount -Value $Statistics.TotalServers
+    $partialScans = Get-mdiCoverageCount -Value $Statistics.PartialScanCount
+    $measured = Get-mdiCoverageCount -Value $Statistics.ChecksTotal
+    $passed = Get-mdiCoverageCount -Value $Statistics.ChecksPassed
+    $unread = Get-mdiCoverageCount -Value $Statistics.ChecksUnread
+    $knownFailures = [math]::Max([double] 0, $measured - $passed)
+
+    if ($totalServers -eq 0 -or $partialScans -gt 0) { return 'N/A' }
+    if ($knownFailures -eq 0 -and $unread -gt 0) { return 'N/A' }
+    $false
+}
+
+function Set-mdiReportValue {
+    <#
+        Publish one headline fact onto the report, whatever shape the report is.
+
+        Main builds $report as a HASHTABLE, where `$report.Name = value` quietly adds the key. Several
+        tests deliberately execute a SLICE of the real Main block against a report they built as a
+        [PSCustomObject] - that technique is what proves the shipped console text rather than a
+        reimplementation of it - and on a PSCustomObject the very same statement THROWS
+        "The property 'ChecksPassed' cannot be found on this object". The whole file died before a
+        single assertion, so the suite reported it as "no assertions" rather than as a failure.
+
+        Assigning through here works on both, so the publishing step cannot depend on which shape the
+        caller happens to hold.
+    #>
+    param (
+        [Parameter(Mandatory = $true)] [object] $Report,
+        [Parameter(Mandatory = $true)] [string] $Name,
+        [Parameter(Mandatory = $false)] [AllowNull()] $Value
+    )
+
+    if ($Report -is [System.Collections.IDictionary]) { $Report[$Name] = $Value }
+    else { Add-Member -InputObject $Report -MemberType NoteProperty -Name $Name -Value $Value -Force }
+}
+
 function ConvertTo-mdiDomainScopeName {
     param (
         [Parameter(Mandatory = $false)] [AllowNull()] [string] $DomainName
@@ -17963,6 +18344,38 @@ function Resolve-mdiDomainScopeDnsName {
         answer of that shape replaced FABCORP outright, so the report identity, the file name and
         the coverage key all became a number nobody could act on - strictly worse than the false red
         being fixed. A single-label DNS forest keeps working because its answer equals the request.
+
+        ADWS is not the only way to ask, and it is the way most likely to be unavailable.
+        Get-ADDomain talks to Active Directory Web Services on TCP 9389 - which
+        Get-mdiForestDomain's own comment calls "an optional service that can be stopped,
+        firewalled, or refuse a restricted caller", and which is why that function has an LDAP
+        fallback. This one had none: it caught, kept the operator's spelling, and produced exactly
+        the false red described above. Measured on the shipped function with -Domain FABCORP:
+
+            ADWS answers                  -> fabrikam.local   RESOLVED
+            ADWS refuses the caller       -> FABCORP          kept NetBIOS
+            ADWS port 9389 filtered       -> FABCORP          kept NetBIOS
+            ADWS service stopped          -> FABCORP          kept NetBIOS
+            the AD module is not present  -> FABCORP          kept NetBIOS
+
+        and Get-mdiUnexaminedDomain then charged FABCORP as unexamined against a fully scanned
+        two-controller fabrikam.local estate. So on a domain-joined workstation without RSAT - the
+        ordinary case for a tool documented as runnable before any sensor is installed - the
+        disjoint namespace ALWAYS took the false-red path, whatever the directory would have said.
+
+        The fallback asks the DC locator instead, which needs no ADWS: a DirectoryContext resolves a
+        NetBIOS domain name through the same mechanism Windows itself uses. Verified against the
+        live cross-forest lab from a member of the OTHER forest, where ADWS was reachable so both
+        paths could be compared on one host:
+
+            Get-ADDomain -Server FABCORP                       DNSRoot=fabrikam.local NetBIOS=FABCORP
+            Domain::GetDomain(DirectoryContext 'FABCORP')      fabrikam.local
+            Domain::GetDomain(DirectoryContext 'MDILAB')       mdilab.local
+            Domain::GetDomain(DirectoryContext 'NOSUCHDOM')    threw - the domain cannot be contacted
+
+        The SAME usability rule is applied to both answers, in one place, because a fallback that
+        accepted what the primary rejects would reintroduce the exact "a value nobody read came back
+        looking like a measurement" failure the rule exists to stop.
     #>
     param (
         [Parameter(Mandatory = $false)] [AllowNull()] [string] $DomainName
@@ -17972,25 +18385,50 @@ function Resolve-mdiDomainScopeDnsName {
     if ([string]::IsNullOrWhiteSpace($requested)) { return $requested }
     if ($requested -match '\.') { return $requested }
 
-    try {
-        $adDomain = Get-ADDomain -Server $requested -ErrorAction Stop
-        $resolved = ConvertTo-mdiDomainScopeName -DomainName ([string] $adDomain.DNSRoot)
-        $isUsable = (-not [string]::IsNullOrWhiteSpace($resolved)) -and
-            ($resolved -match '^[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?)*$') -and
-            ($null -eq (ConvertTo-mdiCanonicalIPAddress -Value $resolved)) -and
-            (($resolved -match '\.') -or ($resolved -ieq $requested))
-        if (-not $isUsable) {
-            Write-mdiVerbose ('The directory returned no usable DNS name for {0}; keeping the name as supplied' -f $requested)
-            return $requested
+    $isUsable = {
+        param($Candidate)
+        $resolved = ConvertTo-mdiDomainScopeName -DomainName ([string] $Candidate)
+        (-not [string]::IsNullOrWhiteSpace($resolved)) -and
+        ($resolved -match '^[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?)*$') -and
+        ($null -eq (ConvertTo-mdiCanonicalIPAddress -Value $resolved)) -and
+        (($resolved -match '\.') -or ($resolved -ieq $requested))
+    }
+
+    # Both readers are tried in turn, and an UNUSABLE answer falls through to the next one rather
+    # than ending the search: a directory that answers with a blank, an address or a number has told
+    # us nothing, which is the same position as not having been asked.
+    $readers = @(
+        @{ Name = 'Active Directory Web Services'
+            Read = { ([string] (Get-ADDomain -Server $requested -ErrorAction Stop).DNSRoot) }
         }
+        @{ Name = 'the domain locator'
+            Read = {
+                $context = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext('Domain', $requested)
+                ([string] ([System.DirectoryServices.ActiveDirectory.Domain]::GetDomain($context)).Name)
+            }
+        }
+    )
+
+    foreach ($reader in $readers) {
+        try {
+            $answer = & $reader.Read
+        } catch {
+            Write-mdiVerbose ('Unable to read the DNS name of {0} from {1} ({2})' -f $requested, $reader.Name, $_.Exception.Message)
+            continue
+        }
+        if (-not (& $isUsable $answer)) {
+            Write-mdiVerbose ('{0} returned no usable DNS name for {1}' -f $reader.Name, $requested)
+            continue
+        }
+        $resolved = ConvertTo-mdiDomainScopeName -DomainName ([string] $answer)
         if ($resolved -ine $requested) {
             Write-mdiVerbose ('{0} is the NetBIOS name of {1}; using the DNS name as the scope' -f $requested, $resolved)
         }
         return $resolved
-    } catch {
-        Write-mdiVerbose ('Unable to read the DNS name of {0} from the directory ({1}); keeping the name as supplied' -f $requested, $_.Exception.Message)
-        return $requested
     }
+
+    Write-mdiVerbose ('The directory returned no usable DNS name for {0}; keeping the name as supplied' -f $requested)
+    $requested
 }
 
 function Get-mdiPrimaryDomainAuditing {
@@ -18234,10 +18672,17 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
     # The output folder is created up front. -BaselinePath already did this, but -Path did not, so
     # pointing it at a folder that does not exist yet ran the entire scan and then threw
     # "Could not find a part of the path" while writing the report, losing every result.
-    if (Test-Path -Path $Path) {
+    # -LiteralPath throughout, because -Path is a WILDCARD PATTERN and the folder is created and
+    # written to literally. An operator folder named 'Reports [nightly]' or 'MDI [2026-08]' is
+    # ordinary, and -Path is free text. Measured on the shipped block: Test-Path -Path returned False
+    # for a folder that demonstrably existed, and Remove-Item -Path below raised a
+    # WildcardPatternException that -ErrorAction SilentlyContinue does not suppress, so the run
+    # aborted with "The output folder ... is not writable" one line after New-Item had SUCCEEDED in
+    # writing a file to it - and left the write-test file behind, once per run.
+    if (Test-Path -LiteralPath $Path) {
         # Test-Path alone is satisfied by a FILE, so -Path pointing at one skipped creation, ran the
         # whole scan, and then failed to write every report into a path that is not a folder.
-        if (-not (Test-Path -Path $Path -PathType Container)) {
+        if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
             throw ('The output path {0} is a file. -Path must be a folder.' -f $Path)
         }
     } else {
@@ -18255,7 +18700,12 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
     try {
         $probeFile = Join-Path -Path $Path -ChildPath ('.mdi-write-test-{0}' -f [guid]::NewGuid().ToString('N').Substring(0, 8))
         [void] (New-Item -ItemType File -Path $probeFile -Force -ErrorAction Stop)
-        Remove-Item -Path $probeFile -Force -ErrorAction SilentlyContinue
+        # -LiteralPath, matching the New-Item above. Remove-Item -Path treats the name as a wildcard
+        # PATTERN, so in a folder whose name carries [ ] * or ? it matched nothing and, being
+        # -ErrorAction SilentlyContinue, said nothing: every run left a hidden 0-byte
+        # .mdi-write-test-<8 hex> file in the operator's report folder, named in no inventory and
+        # never cleaned up. Measured: 2 files after 2 preflights against one folder.
+        Remove-Item -LiteralPath $probeFile -Force -ErrorAction SilentlyContinue
     } catch {
         throw ('The output folder {0} is not writable: {1}' -f $Path, $_.Exception.Message)
     }
@@ -18504,6 +18954,16 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
             })
     }
 
+    # Compute each headline fact once, through the same functions used by the console and HTML, and
+    # publish those results on the report before either JSON writer sees it. ChecksTotal is the
+    # measured population; ChecksUnread is separate and joins it in the displayed denominator.
+    $stats = Get-mdiReportStatistics -ReportData $report
+    $result = Test-mdiReadinessResult -ReportData $report
+    Set-mdiReportValue -Report $report -Name 'ChecksPassed' -Value ([int] $stats.ChecksPassed)
+    Set-mdiReportValue -Report $report -Name 'ChecksTotal' -Value ([int] $stats.ChecksTotal)
+    Set-mdiReportValue -Report $report -Name 'ChecksUnread' -Value ([int] $stats.ChecksUnread)
+    Set-mdiReportValue -Report $report -Name 'Readiness' -Value (Get-mdiPublishedReadiness -ReadinessResult ([bool] $result) -Statistics $stats)
+
     # One lock across the WHOLE artefact set, not per file.
     #
     # Write-mdiReportFile already serialises each individual write and retries a sharing violation, so
@@ -18569,7 +19029,7 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
         }
 
         $htmlReportFile = Set-MdiReadinessReport -Domain $report.Domain -Path $Path -ReportData $report `
-            -Remediation $remediation -BaselinePath $BaselinePath -SkipTrend:$SkipTrend
+            -Remediation $remediation -BaselinePath $BaselinePath -Statistics $stats -SkipTrend:$SkipTrend
     } finally {
         if ($reportSetMutex) {
             if ($reportSetHeld) { try { [void] $reportSetMutex.ReleaseMutex() } catch { } }
@@ -18577,14 +19037,14 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
         }
     }
 
-    $result = Test-mdiReadinessResult -ReportData $report
-
-    if ($OpenHtmlReport) { Invoke-Item -Path $htmlReportFile }
+    # -LiteralPath: $htmlReportFile is the exact path the writer reported writing. -Path would treat
+    # it as a wildcard pattern again, which is how the reported path and the written path came apart
+    # in the first place - and here it would open a DIFFERENT run's report, or nothing at all.
+    if ($OpenHtmlReport) { Invoke-Item -LiteralPath $htmlReportFile }
 
     # A bare True or False at the end of a long run reads like an error rather than a verdict, so the
     # outcome is summarised for a human and the boolean is only put on the pipeline when it is asked
     # for. -FailOnIssues covers the case where a caller only needs a pass or fail signal.
-    $stats = Get-mdiReportStatistics -ReportData $report
     # Counted from the same list the HTML report renders, so the two can never disagree. Deriving it
     # from (ChecksTotal - ChecksPassed) counted FAILED CHECKS while the report listed FINDINGS, and one
     # failed RequiredPorts check expands into one finding per blocked port and per unresolvable NNR
@@ -18595,6 +19055,7 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
     # counted. That reads as a clean bill of health for a scan that saw almost nothing, which is the most
     # misleading output this tool can produce.
     $unreadCount = [int] $stats.ChecksUnread
+    $coverageDenominator = Get-mdiCoverageDenominator -Measured $stats.ChecksTotal -Unread $stats.ChecksUnread
     if ($stats.TotalServers -eq 0) {
         # Reporting "0/0 checks passed" as a readiness verdict invites the reader to treat a failed run
         # as a finished one. The run did not fail to find problems, it failed to look.
@@ -18626,10 +19087,16 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
         Write-mdiConsole -AsJson:$AsJson '  This is not a readiness result. Re-run it rather than reading it as one.' -ForegroundColor Red
         Write-mdiConsole -AsJson:$AsJson ('  {0} issue(s) found on the part of the estate that was reached - the list is incomplete.' -f
             $issueCount) -ForegroundColor Yellow
+    } elseif ([string] $report.Readiness -eq 'N/A') {
+        Write-mdiConsole -AsJson:$AsJson ''
+        Write-mdiConsole -AsJson:$AsJson ('  READINESS N/A  {0}/{1} checks passed across {2} server(s).{3}' -f
+            $stats.ChecksPassed, $coverageDenominator, $stats.TotalServers,
+            (Get-mdiVerdictQualifier -ReportData $report -Statistics $stats)) -ForegroundColor Yellow
+        Write-mdiConsole -AsJson:$AsJson ('  {0} issue(s) describe what could not be verified; no failing check was measured.' -f $issueCount) -ForegroundColor Yellow
     } elseif ($result) {
         Write-mdiConsole -AsJson:$AsJson ''
         Write-mdiConsole -AsJson:$AsJson ('  READY  {0}/{1} checks passed across {2} server(s).{3}' -f
-            $stats.ChecksPassed, (Get-mdiCoverageDenominator -Measured $stats.ChecksTotal -Unread $stats.ChecksUnread),
+            $stats.ChecksPassed, $coverageDenominator,
             $stats.TotalServers,
             (Get-mdiVerdictQualifier -ReportData $report -Statistics $stats)) -ForegroundColor Green
     } else {
@@ -18649,7 +19116,7 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
         # common case rather than the edge one.
         Write-mdiConsole -AsJson:$AsJson ('  {0} issue(s) found: {1}/{2} checks passed across {3} server(s).{4}' -f
             $issueCount, $stats.ChecksPassed,
-            (Get-mdiCoverageDenominator -Measured $stats.ChecksTotal -Unread $stats.ChecksUnread),
+            $coverageDenominator,
             $stats.TotalServers,
             (Get-mdiVerdictQualifier -ReportData $report -Statistics $stats)) -ForegroundColor Yellow
         Write-mdiConsole -AsJson:$AsJson '  Open the report and start with the Issues found table on the Overview tab.' -ForegroundColor Yellow
