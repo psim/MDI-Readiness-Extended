@@ -3726,10 +3726,51 @@ function Resolve-mdiNnrTarget {
             # run. Serving order alone decided it - the same five hosts, the same budget. That is
             # precisely the false green this spreading was written to prevent, in its own words: "A
             # forest nobody probed is not a forest that passed."
+            #
+            # A DOTLESS domain key is served after every QUALIFIED one, for the same reason and by
+            # the same rule as the nameless queue below it: it is not established to be a domain of
+            # its own, and a key nobody could establish must not cost a domain that WAS established
+            # the slot it was entitled to.
+            #
+            # The dotless key arrives from the suffix split twenty lines above, which takes whatever
+            # follows the first dot of the name that resolved. In a DISJOINT namespace that suffix is
+            # the NetBIOS name - DNS fabrikam.local, NetBIOS FABCORP - and a member of a disjoint
+            # namespace is routinely written that way; this file's own Resolve-mdiDomainScopeDnsName
+            # uses ws4.FABCORP as the example. FABCORP and fabrikam.local ARE ONE DOMAIN, but they are
+            # different strings and no string rule turns one into the other, so they key as two
+            # domains and the second one takes a slot out of a GLOBAL budget.
+            #
+            # Measured on the shipped function, five operator-named hosts across the lab's four
+            # domains at -MaxTargets 4, differing in NOTHING but where the FABCORP-suffixed host sat
+            # in the list:
+            #
+            #   ws1.mdilab, ws2.emea, ws3.apac, ws4.fabrikam, ws5.FABCORP    all four reached
+            #   ws1.mdilab, ws5.FABCORP, ws2.emea, ws3.apac, ws4.fabrikam    fabrikam.local NONE
+            #   ws5.FABCORP, ws1.mdilab, ws2.emea, ws3.apac, ws4.fabrikam    fabrikam.local NONE
+            #
+            # The caller still received four targets and the NNR card still reported a result for the
+            # run, so the second forest - the one the cross-forest trust exists to cover - was never
+            # probed and nothing said so. That is this sampler's own stated failure, one queue over
+            # from the nameless one already fixed for it: a forest nobody probed is not a forest that
+            # passed. Serving ORDER alone decided it, on the same five hosts and the same budget.
+            #
+            # Ordering only, never dropping or merging. A SINGLE-LABEL DNS domain is legal - this
+            # file says so in Resolve-mdiDomainScopeDnsName - so a dotless key can be a real domain
+            # and must still be served; it is merely served after the domains that cannot be anything
+            # else. An estate whose domains are all dotless is ordered among itself exactly as before,
+            # and a single-domain estate is untouched. Measured on the same function: the cased
+            # spelling ws5.FABRIKAM.LOCAL and the absolute ws5.fabrikam.local. starve nothing either
+            # before or after this change, because Get-mdiProbeDomainKey already folds case and the
+            # DNS root dot - so this must not be, and is not, a second copy of that rule.
             $byDomain = @($byHost | Group-Object -Property { Get-mdiProbeDomainKey -Domain @($_.Group)[0].Domain })
-            $namedDomain = @($byDomain | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_.Name) })
+            $qualifiedDomain = @($byDomain | Where-Object {
+                    -not [string]::IsNullOrWhiteSpace([string] $_.Name) -and ([string] $_.Name) -match '\.'
+                })
+            $unqualifiedDomain = @($byDomain | Where-Object {
+                    -not [string]::IsNullOrWhiteSpace([string] $_.Name) -and ([string] $_.Name) -notmatch '\.'
+                })
             $namelessDomain = @($byDomain | Where-Object { [string]::IsNullOrWhiteSpace([string] $_.Name) })
-            $queues = @(@($namedDomain + $namelessDomain) | ForEach-Object { , @($_.Group) })
+            $queues = @(@($qualifiedDomain + $unqualifiedDomain + $namelessDomain) | ForEach-Object { , @($_.Group) })
             $picked = New-Object System.Collections.ArrayList
             $depth = 0
             while ($picked.Count -lt $MaxTargets) {
@@ -14583,12 +14624,17 @@ function Get-mdiUnexaminedDomain {
     # check. A domain in a second forest whose controllers were never contacted was reported as
     # examined on all three surfaces that share this definition.
     $examined = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    # ROWS, counted before the placeholder narrowing, because the escape hatch below asks whether the
-    # scan produced anything AT ALL - a question about the report, not about coverage. See the comment
-    # on $anyServerSeen for the measurement.
-    $rowsSeen = 0
+    # Rows that CARRY A DOMAIN FIELD AT ALL, counted before the placeholder narrowing, because the
+    # escape hatch below asks whether the scan reached anything that could speak about a domain - a
+    # question about the report, not about coverage. See the comment on $anyServerSeen.
+    #
+    # Test-mdiDetailEntry, not $srv.PSObject.Properties['Domain'], for the reason
+    # Get-mdiProbeTargetKey states at length: PSObject.Properties over an IDictionary enumerates the
+    # dictionary's own .NET members and never its entries, so a hashtable-shaped row carrying a
+    # perfectly good Domain would be judged not to have one.
+    $rowsCarryingDomain = 0
     foreach ($srv in @($Server | Where-Object { $_ })) {
-        $rowsSeen++
+        if (Test-mdiDetailEntry -Details $srv -Name 'Domain') { $rowsCarryingDomain++ }
         if (Test-mdiServerIsPlaceholder -Server $srv) { continue }
         $d = & $normalise $srv.Domain
         if (-not [string]::IsNullOrWhiteSpace($d)) { [void] $examined.Add($d) }
@@ -14610,37 +14656,39 @@ function Get-mdiUnexaminedDomain {
     # already reported as an empty scan) from "servers were found but not one of them was a domain
     # controller" - which is the case this function has to catch.
     #
-    # It counts ROWS. It used to read `$examined.Count -gt 0` - the number of distinct DOMAIN NAMES -
-    # which is the same mistake, one variable over, as the `if ($dcDomains.Count -gt 0)` guard
-    # directly below that was already removed for defeating the rule it was meant to protect. A row
-    # that named no domain is still a row the scan produced, so counting names made an estate the run
-    # HAD enumerated look like an estate it never reached, and the escape hatch then charged nothing.
+    # It counts ROWS THAT CARRY A DOMAIN FIELD. Two earlier spellings were both wrong, in opposite
+    # directions, and the test tree measures both:
     #
-    # The shape that reaches it is the one the product emits ITSELF: the domain controller pass emits
-    # a DISCOVERY PLACEHOLDER for every directory record it could not name (Domain set, FQDN
-    # "Domain controller (not named) n of m", IsPlaceholder = $true), and Get-mdiCAReadiness and
-    # Get-mdiEntraConnectReadiness emit the same contract when their role cannot be enumerated. Those
-    # rows are excluded from $examined - correctly, and this function's header says why - so an estate
-    # in which EVERY row is one of them collected no names at all. An ordinary low-privilege
-    # cross-forest run reaches that: -Forest over mdilab.local + fabrikam.local where the domain
-    # controller records carry no dNSHostName and AD CS enumeration is denied.
+    #   $examined.Count -gt 0   the number of distinct domain names among NON-PLACEHOLDER rows. A
+    #                           placeholder-only estate collected no names, so the hatch fired and an
+    #                           estate nobody could name was certified READY with no finding of any
+    #                           kind - the largest false green this tool can produce, and what
+    #                           TotalDiscoveryFailureIsNotFullCoverage.Tests.ps1 was written for.
     #
-    # Measured on the shipped function, scope mdilab.local + fabrikam.local:
+    #   $rowsSeen -gt 0         every row, whatever it held. A row with NO DOMAIN FIELD AT ALL - a
+    #                           projection that selected other columns, which says nothing about any
+    #                           domain - was then enough to open the whole comparison and charge a
+    #                           scoped domain it cannot speak about. Measured: 23 assertions across
+    #                           10 files went red, including DiscoveryScope's "servers carrying no
+    #                           Domain do not silently pass every domain", which pins that case at
+    #                           zero findings.
     #
-    #   3 unnamed-record placeholders, no other row      unexamined: NONE      -> READY
-    #   the SAME 3 rows plus one reached CA              unexamined: BOTH      -> NOT READY
-    #   zero domain controllers, all rows placeholders   unexamined: NONE      -> READY
-    #   zero domain controllers, one reached CA          unexamined: BOTH      -> NOT READY
+    # The two cases look alike and are not. THE RULE IS THIS CODEBASE'S OWN, stated in
+    # Get-mdiUnreadCheckName: "Absence is deliberately NOT treated as unread ... Only a property that
+    # is PRESENT and unreadable counts." A Domain field that is present and blank is discovery having
+    # TRIED and failed to name the machine - real evidence about a real row. A Domain field that is
+    # absent is a row that was never asked the question.
     #
-    # So adding a healthy server to a broken estate made the verdict WORSE, and the completely broken
-    # estate got the best verdict of the four. All three disclosure surfaces are gated here at once -
-    # the 'Domain not examined' unread charge, the High Discovery issue and $domainsExamined - so a
-    # cross-forest run that named not one machine reported READY with no finding of any kind.
+    #   row with Domain = 'mdilab.local'   carries one -> hatch does NOT fire -> coverage compared
+    #   discovery placeholder              carries one -> hatch does NOT fire -> charged unexamined
+    #   row with Domain = '' / $null / ' ' carries one -> hatch does NOT fire -> charged unexamined
+    #   row with NO Domain field           carries none -> hatch FIRES        -> no per-domain finding
+    #   no rows at all                     carries none -> hatch FIRES        -> the empty scan
     #
-    # Placeholders still contribute NOTHING to coverage; only the empty-scan test changed. A run that
-    # produced no rows whatever is still the empty scan this hatch exists for, and every estate with a
-    # named server behaves exactly as before.
-    $anyServerSeen = $rowsSeen -gt 0
+    # Placeholders still contribute NOTHING to coverage - they are excluded from $examined above and
+    # the header says why. They are read here only to answer "did the scan reach anything that could
+    # speak about a domain", which is the question this hatch actually asks.
+    $anyServerSeen = $rowsCarryingDomain -gt 0
     if ($null -ne $DomainControllerServer) {
         $dcDomains = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         foreach ($dc in @($DomainControllerServer | Where-Object { $_ })) {
