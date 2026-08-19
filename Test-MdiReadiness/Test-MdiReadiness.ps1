@@ -2238,6 +2238,17 @@ function Get-mdiConfiguredDnsServer {
     $result
 }
 
+function Get-mdiHostNameAddress {
+    <#
+        The addresses this computer's own host name resolves to.
+
+        Split out of Get-mdiLocalProbeAddress as a seam. The resolver failing is the condition that
+        made the self-probe guard fabricate a pass, and a static .NET call cannot be made to fail
+        from a test, so the failure could never be pinned while it was inlined.
+    #>
+    @([Net.Dns]::GetHostAddresses([Net.Dns]::GetHostName()))
+}
+
 function Get-mdiLocalProbeAddress {
     <#
         The IP addresses that belong to the machine running the probe plan.
@@ -2253,13 +2264,59 @@ function Get-mdiLocalProbeAddress {
         IPv6 any address - but NOT a domain controller's own routable address, because that address
         is entirely usable for everybody except the machine that owns it.
 
-        Loopback is included so both cases are handled by one list. Failure returns an EMPTY list,
-        which restores exactly the previous behaviour: a fault in this helper must never be able to
-        suppress probes that would otherwise have run.
+        THE INTERFACE LIST IS ASKED FIRST, AND IT IS WHY THIS FUNCTION IS CORRECT.
+
+        This read only ever asked DNS - [Net.Dns]::GetHostAddresses([Net.Dns]::GetHostName()) - inside
+        a try whose catch was EMPTY, and then appended the loopback pair unconditionally. "Which
+        addresses are mine" is a fact the local IP stack HOLDS and DNS only reports second-hand, so a
+        resolver fault - a SocketException while the DNS service restarts, a scavenged host record, a
+        resolver refusing this caller - silently reduced the guard to loopback alone. Every one of
+        this machine's own routable addresses then looked remote, and was probed.
+
+        That does not merely lose a measurement, it FABRICATES one, and it moves the verdict towards
+        a pass. Measured end to end on the shipped functions, one all-self DomainController plan with
+        -MultiForest, the two runs differing in nothing but whether the lookup threw:
+
+            guard built from DNS, DNS answers   isRequiredPortsOk = N/A    measured 0   succeeded 0
+            guard built from DNS, DNS throws    isRequiredPortsOk = True   measured 4   succeeded 4
+
+        The four are LdapTcp, LdapGcTcp, LdapsTcp and LdapsGcTcp, all Required - LdapsTcp and
+        LdapsGcTcp because -MultiForest promotes 636 and 3269 - and all four "Connected" to the
+        machine issuing the probe. The honest N/A the intact guard produces is not a suppressed
+        probe: the self target is reported "Not tested - this domain controller is the server running
+        the probe", which is exactly what an operator needs to see.
+
+        It is reachable on an ordinary estate rather than a contrived one: fabrikam.local holds a
+        single domain controller, so on that controller the whole DomainController sample for its
+        domain is the machine itself.
+
+        Both sources are UNIONED rather than one replacing the other, so nothing that used to be
+        recognised as self can stop being recognised. Every failure is contained per source and per
+        adapter: a fault in this helper must never be able to suppress probes that would otherwise
+        have run, and it must never be able to invent one either. Loopback is appended so both cases
+        are handled by one list.
     #>
     $addresses = New-Object -TypeName System.Collections.ArrayList
+    # The authoritative source, and the one that does not depend on name resolution. Every unicast
+    # address is taken whatever the adapter's operational status: an address this machine holds is
+    # served by the local stack, and a probe aimed at it proves nothing either way.
     try {
-        foreach ($ip in [Net.Dns]::GetHostAddresses([Net.Dns]::GetHostName())) {
+        foreach ($nic in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+            try {
+                foreach ($unicast in $nic.GetIPProperties().UnicastAddresses) {
+                    $canonical = ConvertTo-mdiCanonicalIPAddress -Value $unicast.Address
+                    if ($null -ne $canonical) { [void] $addresses.Add($canonical) }
+                }
+            } catch {
+            }
+        }
+    } catch {
+    }
+    # Kept as a second opinion, not as the only one. A host name can resolve to an address the
+    # adapter enumeration does not report - a cluster or NLB name, an address held by a component
+    # that does not surface as a unicast address - and that address is still served locally.
+    try {
+        foreach ($ip in Get-mdiHostNameAddress) {
             $canonical = ConvertTo-mdiCanonicalIPAddress -Value $ip
             if ($null -ne $canonical) { [void] $addresses.Add($canonical) }
         }
@@ -2651,8 +2708,9 @@ function Get-mdiPortProbeScriptText {
         # Get-mdiLocalProbeAddress is what stops the sensor probing ITSELF and reporting the result as
         # an open network path. Invoke-mdiPortProbePlan calls it, and this script runs on the sensor
         # with nothing but the functions named here - so omitting it would not degrade the check, it
-        # would make every port probe on every server fail with a command-not-found.
-        'Get-mdiLocalProbeAddress',
+        # would make every port probe on every server fail with a command-not-found. Get-mdiHostNameAddress
+        # is the resolver seam it calls, and it travels for the same reason and with the same consequence.
+        'Get-mdiLocalProbeAddress', 'Get-mdiHostNameAddress',
         'Test-mdiLocalTcpListener', 'Test-mdiLocalUdpListener', 'Get-mdiConfiguredDnsServer', 'Invoke-mdiPortProbePlan'
     )
     # Every probe primitive is shipped, including Test-mdiCloudConnectivity even when no workspace was
