@@ -8833,7 +8833,7 @@ function ConvertTo-mdiMeasuredNumber {
     $null
 }
 
-function Format-mdiLatencyMs {
+function Format-mdiWholeNumber {
     <#
         A millisecond reading as whole-millisecond TEXT, at any magnitude.
 
@@ -8857,6 +8857,30 @@ function Format-mdiLatencyMs {
     if ($null -eq $number) { return '' }
     if ([double]::IsNaN($number) -or [double]::IsInfinity($number)) { return '' }
     ([math]::Round($number)).ToString('0', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Format-mdiLatencyMs {
+    <#
+        A millisecond reading as whole-millisecond text. The rule itself lives in
+        Format-mdiWholeNumber, which the capacity tab needs for exactly the same reason: three
+        renderers normalised a value correctly with ConvertTo-mdiMeasuredNumber and then CAST the
+        result, which reintroduces the failure the normaliser exists to prevent, this time for a value
+        that is perfectly readable and merely large. Measured on the shipped Get-mdiCapacityHtml:
+
+            BusyPacketsPerSec = 1e30   THREW  Cannot convert value "1E+30" to type "System.Int64"
+            SampleSeconds     = 1e30   THREW  Cannot convert value "1E+30" to type "System.Int32"
+
+        The "1E+30" in those messages is the proof that the parse had already SUCCEEDED and the cast
+        is what failed.
+
+        This name is kept because it is what the latency table reads, and because the millisecond unit
+        belongs to the caller rather than to the formatter.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Value
+    )
+
+    Format-mdiWholeNumber -Value $Value
 }
 
 function Get-mdiCheckProperty {
@@ -12545,9 +12569,42 @@ function Get-mdiEntraConnectReadiness {
 }
 
 function ConvertTo-mdiHtmlEncoded {
-    param ([Parameter(Mandatory = $false)] [AllowNull()] [string] $Text)
+    <#
+        HTML-encoded text, from a value of ANY shape.
+
+        -Text is [object] and the string conversion happens HERE, not at the call site. It was
+        [string], and a [string] parameter cannot be bound from a COLLECTION at all: PowerShell
+        refuses the argument transformation before the function body runs, so the exception is raised
+        in the CALLER and takes down whatever section that caller was building. Measured against a
+        replica of the shipped signature:
+
+            $null, '', 42, $true, a hashtable, a PSCustomObject   BOUND
+            @(42), @(1,2), @(), @(@{}), [byte[]]                  BIND FAILED
+
+        Note @() - an EMPTY list fails too, and an empty list is an ordinary field shape.
+
+        Measured end to end on the shipped renderers: Get-mdiSensorV3Html with SensorState = @(42),
+        and Get-mdiRequiredPortsHtml with a port record whose Name = @(42), both died with
+        "Cannot process argument transformation on parameter 'Text'", losing the whole section for
+        one field on one server.
+
+        An array IS an ordinary shape here rather than a contrived one - Get-mdiProbeTargetKey's own
+        header records "a six-row estate holding one row whose Domain was @('fabrikam.local')" from a
+        JSON round trip - and an AST walk of this file counted 130 call sites, of which 75 pass a
+        value with no [string] cast of their own. Most of those are direct record-field reads:
+        $issue.Severity, $probe.Name, $failure.Detail, $record.Detail and so on. Fixing the parameter
+        fixes all 75 at once and cannot drift, whereas casting at 75 call sites is a rule that has to
+        be remembered every time a new one is added.
+
+        Behaviour is unchanged for every input that worked before: the 55 guarded call sites already
+        pass a string, and for an unguarded scalar an inside cast produces exactly what PowerShell's
+        automatic bind coercion produced. Only collections change - from a thrown exception to the
+        ordinary [string] join, which is what the guarded call sites do today.
+    #>
+    param ([Parameter(Mandatory = $false)] [AllowNull()] [object] $Text)
     if ($null -eq $Text) { return '' }
-    $Text -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;'
+    $value = [string] $Text
+    $value -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;'
 }
 
 function ConvertTo-mdiTableCellEncoded {
@@ -16663,14 +16720,47 @@ function Get-mdiClockSpread {
             [PSCustomObject]@{ FQDN = [string] $srv.FQDN; SkewSeconds = $value }
         })
 
-    # The tolerance each measurement was taken under, not a restated constant. The largest is used
-    # when they differ, so a stricter run cannot be judged by a looser one's threshold by accident.
+    # The tolerance each measurement was taken under, not a restated constant. The STRICTEST is used
+    # when they differ, because the spread is judged against it and the loosest is a false green.
+    #
+    # This read '-Maximum', directly under a comment claiming "the largest is used when they differ,
+    # so a stricter run cannot be judged by a looser one's threshold by accident" - which is what
+    # -Minimum does and the exact opposite of what -Maximum does. The comment stated the safe rule
+    # and the line implemented its inverse.
+    #
+    # Measured on the shipped function, the extended lab's three sites with clocks 8 minutes apart -
+    # dc2022 at -240s, dc3.emea at 0s, dcfab01 across the fabrikam.local trust at +240s, a 480s
+    # spread that FAILS the five-minute MDI requirement this whole function exists to test:
+    #
+    #   every row records 5      tolerance 5      spread 480   IsWithin False
+    #   ONE row records 60       tolerance 60     spread 480   IsWithin TRUE
+    #   ONE row records 1440     tolerance 1440   spread 480   IsWithin TRUE
+    #
+    # and in the other direction, a 160s spread with one row recording a 1-minute tolerance:
+    #
+    #   ONE row records 1        tolerance 5      spread 160   IsWithin TRUE
+    #
+    # so the strictest tolerance anybody recorded was discarded in favour of the loosest. All three
+    # consumers take that answer: Get-mdiTimeSyncHtml renders the green sentence "inside the 60
+    # minute(s) MDI requires between sensor servers" - a requirement of five minutes, restated as
+    # sixty by the report that exists to quote it - Get-mdiIssueList raises no spread finding, and
+    # Test-mdiReadinessResult does not withhold READY.
+    #
+    # SCOPE, stated no more strongly than it was measured: a single run stamps one
+    # -MaxClockSkewMinutes on every row through Get-mdiTimeSync, so a stock single-run report cannot
+    # hold two different tolerances and this is not a live false green in that pipeline. It is the
+    # rule itself being backwards on the one line that decides it, on a field whose whole purpose is
+    # to be re-read later - "a report read back later is still judged against the tolerance it was
+    # taken under" - and reachable by any report assembled, merged or edited outside one run.
+    #
+    # With every row recording the same tolerance, which is every stock report, Minimum and Maximum
+    # return the same value and nothing changes.
     $tolerance = 5
     $reported = @(foreach ($srv in @($Server | Where-Object { $_.Details.TimeSyncDetails })) {
             $value = 0
             if ([int]::TryParse([string] $srv.Details.TimeSyncDetails.MaxSkewMinutes, [ref] $value) -and $value -gt 0) { $value }
         })
-    if ($reported.Count -gt 0) { $tolerance = ($reported | Measure-Object -Maximum).Maximum }
+    if ($reported.Count -gt 0) { $tolerance = ($reported | Measure-Object -Minimum).Minimum }
 
     if ($measured.Count -lt 2) {
         return [PSCustomObject]@{
@@ -16725,7 +16815,36 @@ function Get-mdiTimeSyncHtml {
         # [long] for the same reason Get-mdiTimeSync produces one: a skew of more than 68 years does
         # not fit in an Int32, and re-narrowing it here would throw while BUILDING the report - losing
         # the whole HTML file rather than one cell.
-        $skew = if ($null -ne $sync.SkewSeconds) { [string] ([long] $sync.SkewSeconds) + ' s' } else { 'n/a' }
+        #
+        # PARSED, not cast. The guard above was a bare $null test, so every shape that is not $null
+        # reached [long] and the two halves of this project's signature defect both appeared here.
+        # Measured on the shipped function, one otherwise complete server, SkewSeconds replaced one
+        # shape at a time:
+        #
+        #   ''          '0 s'   <- a PERFECTLY SYNCHRONISED CLOCK, for a server nobody timed
+        #   $true       '1 s'   <- the same illusion, from a flag
+        #   '   '       THREW  Cannot convert value "   " to type "System.Int64"
+        #   'n/a'       THREW   (also 'unknown', a hashtable, an array)
+        #   1e30        THREW  Value was either too large or too small for an Int64
+        #
+        # and with three good clocks beside one unreadable fourth, every throwing shape destroyed the
+        # ENTIRE time synchronization table. '0 s' is the more dangerous half: the skew cell carries
+        # the same colour class as the verdict beside it, so an unread clock rendered as the tightest
+        # possible synchronisation on a row that can be painted green.
+        #
+        # The overflow direction above was guarded deliberately; the non-numeric direction was not.
+        #
+        # [long]::TryParse and NOT ConvertTo-mdiMeasuredNumber, deliberately: Get-mdiClockSpread reads
+        # THIS SAME FIELD and already parses it exactly this way, with its own comment saying a skew
+        # that came back as a string, or as anything that is not a number, must not be silently turned
+        # into 0. Two readers of one field answering differently is the contradiction this codebase
+        # spends most of its guards on, so the card is aligned to the spread rather than given a third
+        # rule of its own. The visible consequence is that a decimal such as '12.7' now reads 'n/a'
+        # here as it already did there - and it is not a shape Get-mdiTimeSync emits, which produces a
+        # [long].
+        $skewValue = [long] 0
+        $skew = if ($null -ne $sync.SkewSeconds -and
+            [long]::TryParse([string] $sync.SkewSeconds, [ref] $skewValue)) { [string] $skewValue + ' s' } else { 'n/a' }
         $cellClass = if ($ok) { 'green' } elseif ($notTested) { 'muted-cell' } else { 'red' }
         $cellLabel = if ($ok) { 'Yes' } elseif ($notTested) { 'Not tested' } else { 'No' }
         [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="{1}">{2}</td><td class="{1}">{3}</td><td class="mono">{4}</td><td class="left">{5}</td></tr>' -f
@@ -16809,8 +16928,8 @@ function Get-mdiCapacityHtml {
     if ($partial.Count -gt 0) {
         # Drawn from the SAMPLED servers only. Taken across all of them it read the maximum of a set
         # containing servers with no SampleSeconds at all.
-        $seconds = [int] (@($sampled | ForEach-Object { ConvertTo-mdiMeasuredNumber -Value $_.Details.CapacityDetails.SampleSeconds } |
-                    Where-Object { $null -ne $_ }) | Measure-Object -Maximum).Maximum
+        $seconds = Format-mdiWholeNumber -Value ((@($sampled | ForEach-Object { ConvertTo-mdiMeasuredNumber -Value $_.Details.CapacityDetails.SampleSeconds } |
+                        Where-Object { $null -ne $_ }) | Measure-Object -Maximum).Maximum)
         # The whole concatenation is parenthesised before -f: the format operator binds tighter than +,
         # so without the parentheses only the last fragment would be formatted and every placeholder in
         # the earlier fragments would render literally as {0}, {1} and so on.
@@ -16900,10 +17019,10 @@ function Get-mdiCapacityHtml {
         # line and that one must read one field the same way, or the headline and the row contradict
         # each other. It coerced before, which happened to answer the string 'False' correctly and
         # the number 0 wrongly.
-        $sampleText = if ($null -eq $sampleSeconds) { $na } else { '{0} s' -f [int] $sampleSeconds }
+        $sampleText = if ($null -eq $sampleSeconds) { $na } else { '{0} s' -f (Format-mdiWholeNumber -Value $sampleSeconds) }
         $sampleClass = 'mono'
         if ((ConvertTo-mdiBoolean $c.FullBusyWindow) -eq $false) {
-            $sampleText = if ($null -eq $sampleSeconds) { 'partial' } else { '{0} s, partial' -f [int] $sampleSeconds }
+            $sampleText = if ($null -eq $sampleSeconds) { 'partial' } else { '{0} s, partial' -f (Format-mdiWholeNumber -Value $sampleSeconds) }
             $sampleClass = 'mono amber'
             if ($class -eq 'green') { $class = 'amber' }
             $status = $status + ' (estimate)'
@@ -16911,12 +17030,12 @@ function Get-mdiCapacityHtml {
 
         # On a short sample the automatic spike test is inert, so the ratio is surfaced instead.
         $peakClass = 'mono'
-        $peakText = if ($null -eq $peak) { $na } else { [string][long] $peak }
+        $peakText = if ($null -eq $peak) { $na } else { Format-mdiWholeNumber -Value $peak }
         if ($null -ne $peak -and $null -ne $average -and $average -gt 0) {
             $ratio = $peak / $average
             if ($ratio -ge $capacity.SpikeRatio) {
                 $peakClass = 'mono amber'
-                $peakText = '{0} ({1}x avg)' -f [long] $peak, (ConvertTo-mdiSvgNumber ([math]::Round($ratio, 1)))
+                $peakText = '{0} ({1}x avg)' -f (Format-mdiWholeNumber -Value $peak), (ConvertTo-mdiSvgNumber ([math]::Round($ratio, 1)))
             }
         }
 
@@ -16928,7 +17047,7 @@ function Get-mdiCapacityHtml {
         [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="{1}">{2}</td><td class="{3}">{4}</td><td class="mono">{5}</td><td class="mono">{6}</td><td class="{7}">{8}</td><td class="mono">{9}</td><td class="mono">{10} core / {11} GB</td><td class="mono">{12} / {13} GB</td><td class="mono">{14}</td><td class="mono">{15}</td><td class="left">{16}</td></tr>' -f
                 (ConvertTo-mdiHtmlEncoded ([string] $srv.FQDN)), $class, (ConvertTo-mdiHtmlEncoded $status),
                 $sampleClass, (ConvertTo-mdiHtmlEncoded $sampleText),
-                [long] $busy, $(if ($null -eq $average) { $na } else { [string][long] $average }),
+                (Format-mdiWholeNumber -Value $busy), $(if ($null -eq $average) { $na } else { Format-mdiWholeNumber -Value $average }),
                 $peakClass, (ConvertTo-mdiHtmlEncoded $peakText),
                 (ConvertTo-mdiHtmlEncoded ([string] $c.Band)),
                 $(if ($null -eq $requiredCpu) { $na } else { ConvertTo-mdiSvgNumber $requiredCpu }),
