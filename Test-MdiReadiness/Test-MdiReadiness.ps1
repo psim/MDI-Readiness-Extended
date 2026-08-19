@@ -3431,12 +3431,38 @@ function Get-mdiProbeDomainKey {
         A domain that cannot be read keys as the empty string rather than throwing or being dropped,
         for the same reason Get-mdiProbeTargetKey does it: unknown is what it is, and an unreadable
         row must not cost a READABLE domain the slot it was entitled to.
+
+        That last sentence was the INTENT and not the behaviour. The key was built with a bare
+        [string] cast, which is a test of the RENDERING and not of the value - the identical mistake
+        ConvertTo-mdiReadableDomainName was written for, three hundred lines below, and whose header
+        already names THIS function as one of the three hardened for a row whose Domain was
+        @('fabrikam.local'). Every non-string renders to something non-blank, so an unreadable Domain
+        did not key as the empty string at all; it keyed as its own distinct junk string and became a
+        DOMAIN in its own right, entitled to its own share of a bounded probe budget. Measured on the
+        shipped function:
+
+            Domain value                      key produced
+            $null / '' / '   ' / @()          ''                                (as documented)
+            @('fabrikam.local')               'fabrikam.local'                  (unwrapped, correct)
+            12345                             '12345'                <-- its own domain group
+            $true                             'True'                 <-- its own domain group
+            @{}                               'System.Collections.Hashtable'    <-- its own group
+            [PSCustomObject]@{...}            '@{Name=fabrikam.local}'          <-- its own group
+            @('a','b')                        'a b'                             <-- its own group
+
+        Routed through ConvertTo-mdiReadableDomainName, which is this codebase's single definition of
+        "is this a domain name anybody read". It unwraps a one-element collection, still accepts the
+        all-numeric single-label STRING '12345' that a directory really can return, and refuses only
+        values that render to something no directory returned - so nothing that used to be read stops
+        being read, and the sentence above is now true.
     #>
     param (
         [Parameter(Mandatory = $false)] [AllowNull()] [object] $Domain
     )
 
-    ([string] $Domain).Trim().TrimEnd('.').Trim()
+    $readable = ConvertTo-mdiReadableDomainName -Value $Domain
+    if ($null -eq $readable) { return '' }
+    $readable.Trim().TrimEnd('.').Trim()
 }
 
 function Resolve-mdiNnrTarget {
@@ -3676,8 +3702,34 @@ function Resolve-mdiNnrTarget {
             # The domain key is Get-mdiProbeDomainKey, shared with Resolve-mdiLdapTarget. The two
             # samplers spread the same estate for the same reason and had drifted into two different
             # spellings of "which domain is this"; see that function for the measurement.
-            $queues = @($byHost | Group-Object -Property { Get-mdiProbeDomainKey -Domain @($_.Group)[0].Domain } |
-                    ForEach-Object { , @($_.Group) })
+            #
+            # The queue of hosts whose domain COULD NOT BE READ is served LAST, after every readable
+            # domain has been offered a slot. It used to take its place in enumeration order like any
+            # other domain, and Get-mdiProbeDomainKey's header states the rule it broke: "an
+            # unreadable row must not cost a READABLE domain the slot it was entitled to".
+            #
+            # This function PRODUCES that queue itself, twenty lines above: the operator-supplied
+            # branch tags a target from the name that resolved, and its own comment says "A name with
+            # no dot, and a target supplied as a bare IP address, both yield $null". So one dotless
+            # host or one bare IP in -NnrTargetComputer creates a nameless domain that then competes
+            # with the real ones. Measured on the shipped function, five operator-supplied hosts
+            # across two forests at MaxTargets=2, differing in nothing but where the dotless host sat
+            # in the list:
+            #
+            #   -NnrTargetComputer                                      hosts probed              fabrikam.local
+            #   ws1.mdilab, ws2.mdilab, ws3.fabrikam, ws4.fabrikam      ws1.mdilab, ws3.fabrikam  reached
+            #   ws1.mdilab, WSFLAT, ws2.mdilab, ws3.fabrikam, ws4.fab   ws1.mdilab, WSFLAT        NO TARGET
+            #   ws1.mdilab, ws2.mdilab, ws3.fabrikam, ws4.fab, WSFLAT   ws1.mdilab, ws3.fabrikam  reached
+            #
+            # The middle row is the defect: the second forest received no NNR target at all, the
+            # caller still got two targets back, and the NNR card still reported a result for the
+            # run. Serving order alone decided it - the same five hosts, the same budget. That is
+            # precisely the false green this spreading was written to prevent, in its own words: "A
+            # forest nobody probed is not a forest that passed."
+            $byDomain = @($byHost | Group-Object -Property { Get-mdiProbeDomainKey -Domain @($_.Group)[0].Domain })
+            $namedDomain = @($byDomain | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_.Name) })
+            $namelessDomain = @($byDomain | Where-Object { [string]::IsNullOrWhiteSpace([string] $_.Name) })
+            $queues = @(@($namedDomain + $namelessDomain) | ForEach-Object { , @($_.Group) })
             $picked = New-Object System.Collections.ArrayList
             $depth = 0
             while ($picked.Count -lt $MaxTargets) {
