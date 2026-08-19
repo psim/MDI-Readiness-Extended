@@ -6464,8 +6464,14 @@ function Get-mdiV3ActionableBlocker {
     # "present and empty" look like once read, and those are the two cases that must be told apart.
     # A dictionary is checked by key, because a report that has been through another tool's JSON
     # handling arrives as a hashtable rather than as a PSCustomObject.
+    #
+    # Cast to [Collections.IDictionary] before Contains, for the reason Test-mdiDetailEntry states in
+    # full: the bare call resolves against the object's OWN type, and a Dictionary[string,object] or
+    # SortedDictionary exposes IDictionary.Contains(object) only as an explicit implementation, so the
+    # string argument bound to nothing and the call THREW instead of answering. This function is one
+    # of the three that took the same external shape and made the same bare call.
     $hasProperty = if ($Detail -is [Collections.IDictionary]) {
-        $Detail.Contains('ActionableBlockers')
+        ([Collections.IDictionary] $Detail).Contains('ActionableBlockers')
     } else {
         $null -ne $Detail.PSObject.Properties['ActionableBlockers']
     }
@@ -12975,12 +12981,51 @@ function Set-mdiDetailEntry {
 }
 
 function Test-mdiDetailEntry {
+    <#
+        Whether a Details object carries an entry of this name, whichever shape it has.
+
+        THE CAST TO [Collections.IDictionary] IS THE WHOLE POINT, and it is not decoration. The test
+        used to be the bare `$Details.Contains($Name)`, and PowerShell resolves that method against
+        the object's OWN type, not against the interface the line above just proved it implements.
+        Hashtable and OrderedDictionary expose the non-generic Contains(object), so they answered.
+        A Dictionary[string,object] exposes Contains(KeyValuePair[string,object]) as its public
+        overload and IDictionary.Contains(object) only as an EXPLICIT implementation, which method
+        resolution does not see - so a string argument bound to nothing and the call THREW:
+
+            Cannot find an overload for "Contains" and the argument count: "1".
+
+        Not a wrong answer - an EXCEPTION, out of a function called inside Where-Object filters and
+        inside the per-server merge, where it does not produce a bad row, it aborts the pass.
+        Measured on the shipped accessors, one entry present in every shape:
+
+            shape                          Test-mdiDetailEntry   Get-mdiDetailValue
+            Hashtable                      True                  x
+            OrderedDictionary              True                  x
+            PSCustomObject                 True                  x
+            Generic.Dictionary[string,obj] THREW                 THREW
+            SortedDictionary               THREW                 THREW
+
+        The two shapes anybody would think to test are the two that work, which is why it survived.
+        Its siblings did not have it: Get-mdiDetailEntry, Set-mdiDetailEntry, Copy-mdiDetails and
+        ConvertTo-mdiRecordObject all handle every dictionary shape, and this file's own docstrings
+        assert in three separate measurement tables that Generic.Dictionary behaves "the same as
+        Hashtable". ConvertTo-mdiRecordObject states the contract these accessors exist to keep:
+        "the shape that reaches here comes from whatever produced the report, not from this script."
+
+        Get-mdiUnexaminedDomain now asks this question of every server row to decide whether the row
+        can speak about a domain at all, so on a dictionary-shaped inventory the throw lands in the
+        COVERAGE comparison - the one place this tool must never stop measuring.
+
+        The cast reaches the explicit implementation and answers on every IDictionary: Hashtable,
+        OrderedDictionary, Generic.Dictionary, SortedDictionary, ListDictionary and
+        HybridDictionary all return True for a key that is present.
+    #>
     param (
         [Parameter(Mandatory = $false)] [AllowNull()] [object] $Details,
         [Parameter(Mandatory = $true)] [string] $Name
     )
     if ($null -eq $Details) { return $false }
-    if ($Details -is [Collections.IDictionary]) { return $Details.Contains($Name) }
+    if ($Details -is [Collections.IDictionary]) { return ([Collections.IDictionary] $Details).Contains($Name) }
     $null -ne $Details.PSObject.Properties[$Name]
 }
 
@@ -12988,6 +13033,12 @@ function Get-mdiDetailValue {
     <#
         The value of a single Details entry, whichever shape the Details object has. Returns $null when
         the entry is absent.
+
+        Cast to [Collections.IDictionary] before Contains, for the reason Test-mdiDetailEntry states
+        at length: the bare call resolves against the object's own type and THROWS on a
+        Dictionary[string,object] or a SortedDictionary, whose IDictionary.Contains(object) is an
+        explicit implementation. The indexer needs no cast - every IDictionary exposes one - but the
+        guard in front of it did.
     #>
     param (
         [Parameter(Mandatory = $false)] [AllowNull()] [object] $Details,
@@ -12995,7 +13046,7 @@ function Get-mdiDetailValue {
     )
     if ($null -eq $Details) { return $null }
     if ($Details -is [Collections.IDictionary]) {
-        if ($Details.Contains($Name)) { return $Details[$Name] }
+        if (([Collections.IDictionary] $Details).Contains($Name)) { return $Details[$Name] }
         return $null
     }
     $prop = $Details.PSObject.Properties[$Name]
