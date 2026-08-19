@@ -4015,8 +4015,33 @@ function ConvertTo-mdiReadableDomainName {
         [Parameter(Mandatory = $false)] [AllowNull()] [object] $Value
     )
 
+    # UNWRAPPED ONLY WHEN THERE IS SOMETHING TO UNWRAP. A bare `-is [PSObject]` test is true for any
+    # value that has passed through a pipeline cmdlet - Select-Object, Sort-Object, Where-Object,
+    # ForEach-Object all hand back a PSObject-wrapped string - and .BaseObject on that wrapper is
+    # $null, so the assignment REPLACED A NAME THAT HAD BEEN READ PERFECTLY WELL WITH $null. This
+    # function is the codebase's single definition of "is this a domain name anybody read", so the
+    # loss did not stop at a label: it reached the two IDENTITY KEYS built on top of it. Measured on
+    # the shipped functions with rows built the way a pipeline really builds them,
+    # `$names | Select-Object -Unique | ForEach-Object { [PSCustomObject]@{ FQDN = 'dc1'; Domain = $_ } }`
+    # - a PSCustomObject STORES the wrapper and hands it straight back on property access:
+    #
+    #   Get-mdiProbeDomainKey     mdilab.local -> ''     fabrikam.local -> ''     both domains lost
+    #   Get-mdiServerIdentityKey  dc1@mdilab   -> 'dc1'  dc1@fabrikam   -> 'dc1'  ONE KEY, TWO FORESTS
+    #
+    # Two controllers that share a short name and differ only by forest are exactly what a
+    # cross-forest estate contains, and they merged into a single host whose two halves can carry
+    # opposite verdicts - the healthy half then appears in the ready count. The shipped
+    # Get-mdiAddresslessDomainController reproduces the input shape on its own, because its last
+    # pipeline stage is `| Select-Object -Unique`.
+    #
+    # A PSObject whose BaseObject is $null carries nothing to unwrap, so this cannot lose a value,
+    # and every shape that was refused before is still refused: $null, '', whitespace, a hashtable, a
+    # PSCustomObject, a boolean, an int and a multi-element list. The numeric STRING '12345' and a
+    # one-element collection are still accepted.
     $candidate = $Value
-    if ($candidate -is [System.Management.Automation.PSObject]) { $candidate = $candidate.BaseObject }
+    if ($candidate -is [System.Management.Automation.PSObject] -and $null -ne $candidate.BaseObject) {
+        $candidate = $candidate.BaseObject
+    }
     # A string is itself IEnumerable, and a hashtable is enumerable but not a list, so the unwrap is
     # deliberately narrowed to IList and applied ONCE. Looping would not terminate on a value that
     # enumerates to itself, and a multi-element collection is not one domain name however it renders.
@@ -4024,7 +4049,9 @@ function ConvertTo-mdiReadableDomainName {
         $items = @($candidate)
         if ($items.Count -ne 1) { return $null }
         $candidate = $items[0]
-        if ($candidate -is [System.Management.Automation.PSObject]) { $candidate = $candidate.BaseObject }
+        if ($candidate -is [System.Management.Automation.PSObject] -and $null -ne $candidate.BaseObject) {
+            $candidate = $candidate.BaseObject
+        }
     }
     if ($candidate -isnot [string]) { return $null }
     if ([string]::IsNullOrWhiteSpace($candidate)) { return $null }
@@ -11773,11 +11800,41 @@ function Get-mdiDomainControllerReadiness {
         # names to connect to and there is no name to connect to.
         $unnamedDc = [int] $resolved.Unnamed
         if ($resolved.Servers.Count -eq 0) {
-            # A discovery failure is fatal to the whole report: every later check runs per server, so an
-            # empty list silently produces a clean-looking report of nothing. It is raised rather than
-            # swallowed so the run cannot be mistaken for a completed scan.
-            Write-mdiWarning ('Unable to enumerate the domain controllers of {0} over Active Directory Web Services or LDAP: {1}' -f $Domain, $resolved.Error)
-            Write-mdiWarning 'No domain controller was checked. Verify that this computer can reach a domain controller and that the account running the script is allowed to read the directory.'
+            # ASKED THE SAME WAY AS Get-mdiDomainControllerInventory, which is the other half of this
+            # pair and had already been corrected. An empty Servers list is NOT by itself a failed
+            # enumeration: the directory can ANSWER and return records that carry no usable name, in
+            # which case Unnamed holds how many and Error is $null. That is a real branch of
+            # Resolve-mdiDomainController - "every record was nameless" returns
+            # @{ Servers = @(); Method = 'LDAP'; Error = $null; Unnamed = n } - not a hypothetical.
+            #
+            # Asking only about Servers.Count charged that answer as a failed enumeration and said so
+            # twice. Measured on the shipped functions, one domain answering with 3 nameless records:
+            #
+            #   Unable to enumerate the domain controllers of fabrikam.local over Active Directory
+            #   Web Services or LDAP:                                  <- nothing after the colon
+            #   No domain controller was checked. Verify that this computer can reach a domain
+            #   controller and that the account running the script is allowed to read the directory.
+            #
+            # The first is empty because there was no error to interpolate - the identical defect
+            # Get-mdiDomainControllerInventory's own comment records having fixed. The second is
+            # worse than empty, because it is WRONG: it sends the operator to check reachability and
+            # a directory-read permission that are both in perfect order. The true cause - computer
+            # objects carrying neither dNSHostName nor name - is already stated by
+            # Resolve-mdiDomainController's warning and by the placeholder rows this function emits
+            # below, so one run diagnosed one estate two contradictory ways at once.
+            #
+            # A cross-forest read is what makes the shape ordinary rather than contrived: over a
+            # forest trust the caller is a foreign principal and dNSHostName is not in the partial
+            # attribute set a global catalog replicates, so the domain answers and the names do not.
+            if ($unnamedDc -gt 0) {
+                Write-mdiWarning ('The directory in {0} answered, but every domain controller record it returned carries neither a DNS host name nor a name, so none of them could be contacted. They are reported as not examined rather than omitted from the scan.' -f $Domain)
+            } else {
+                # A discovery failure is fatal to the whole report: every later check runs per server, so an
+                # empty list silently produces a clean-looking report of nothing. It is raised rather than
+                # swallowed so the run cannot be mistaken for a completed scan.
+                Write-mdiWarning ('Unable to enumerate the domain controllers of {0} over Active Directory Web Services or LDAP: {1}' -f $Domain, $resolved.Error)
+                Write-mdiWarning 'No domain controller was checked. Verify that this computer can reach a domain controller and that the account running the script is allowed to read the directory.'
+            }
             $DomainController = $null
         } else {
             $DomainController = @($resolved.Servers | Select-Object -ExpandProperty Name)
@@ -14702,6 +14759,52 @@ function Get-mdiUnexaminedDomain {
     )
 
     $normalise = { param($n) ([string] $n).Trim().TrimEnd('.') }
+    # COVERAGE is claimed with the readable name, never with the RENDERING of one.
+    #
+    # $normalise above is a bare [string] cast, and this codebase has twice written down what that
+    # tests: the rendering, not the value. ConvertTo-mdiReadableDomainName's own header lists the
+    # renderings - a hashtable to 'System.Collections.Hashtable', a PSCustomObject to
+    # '@{DnsRoot=fabrikam.local}', 12345 to '12345', $true to 'True' - and exists to be the single
+    # definition of "is this a domain name anybody read". Five readers use it: Get-mdiProbeDomainKey,
+    # both forest walkers, Get-mdiServerIdentityKey, and Get-mdiProbeTargetKey through the first.
+    # This function - THE definition of coverage, shared by the statistics, the issue list and the
+    # verdict - was the sixth, and it was still asking the rendering.
+    #
+    # Admitting an unreadable value is not the whole of it. A rendering test also makes two
+    # unreadable values COMPARE EQUAL when they render alike, and a serialiser mangles a domain the
+    # same way wherever it appears - so the scope entry and the row that should have matched it are
+    # mangled TOGETHER. The domain then marks itself examined. Measured on the shipped function,
+    # mdilab.local scanned normally beside a second scoped domain, the second domain's scope entry
+    # and its domain controller's Domain field carrying the same unreadable value:
+    #
+    #   scope readable,   rows readable      no finding          (control)
+    #   scope UNREADABLE, rows readable      charged
+    #   scope readable,   rows UNREADABLE    charged
+    #   scope AND rows unreadable, hashtable      NO FINDING     <- certified as examined
+    #   scope AND rows unreadable, pscustomobject NO FINDING     <- certified as examined
+    #   scope AND rows unreadable, 12345          NO FINDING     <- certified as examined
+    #   scope AND rows unreadable, $true          NO FINDING     <- certified as examined
+    #   scope AND rows unreadable, DIFFERENT      charged
+    #
+    # domainsExamined came back $true, no Discovery finding was raised and no domain-level unread
+    # check was charged, on all three surfaces at once. That is this function's own stated worst
+    # case, in the words of the comment forty lines below: "an estate nobody could name was
+    # certified READY with no finding of any kind - the largest false green this tool can produce".
+    # Get-mdiServerIdentityKey, reading the SAME Domain field on the SAME rows, refused every one of
+    # those values and keyed the host without a domain.
+    #
+    # Only the two COVERAGE sets are narrowed. The scope list below still uses $normalise, so an
+    # unreadable scope entry is still charged and still shown to the operator under whatever it
+    # renders as - dropping it would replace a visible false red with a silent loss, and the three
+    # rows above that already charge correctly must keep charging. A one-element collection is
+    # unwrapped rather than refused, because that is the shape a pipeline really produces and the
+    # reader already reads it.
+    $normaliseRead = {
+        param($n)
+        $readable = ConvertTo-mdiReadableDomainName -Value $n
+        if ($null -eq $readable) { return '' }
+        ([string] $readable).Trim().TrimEnd('.')
+    }
     $scoped = @($ScopedDomain | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })
     if ($scoped.Count -eq 0) { return @() }
 
@@ -14730,7 +14833,7 @@ function Get-mdiUnexaminedDomain {
     foreach ($srv in @($Server | Where-Object { $_ })) {
         if (Test-mdiDetailEntry -Details $srv -Name 'Domain') { $rowsCarryingDomain++ }
         if (Test-mdiServerIsPlaceholder -Server $srv) { continue }
-        $d = & $normalise $srv.Domain
+        $d = & $normaliseRead $srv.Domain
         if (-not [string]::IsNullOrWhiteSpace($d)) { [void] $examined.Add($d) }
     }
     # A domain counts as examined only when a DOMAIN CONTROLLER from it was scanned. Callers used to
@@ -14793,7 +14896,7 @@ function Get-mdiUnexaminedDomain {
             # controllers marking that domain covered - reached through a domain controller record
             # that returned but could not be named, rather than through a certification authority.
             if (Test-mdiServerIsPlaceholder -Server $dc) { continue }
-            $d = & $normalise $dc.Domain
+            $d = & $normaliseRead $dc.Domain
             if (-not [string]::IsNullOrWhiteSpace($d)) { [void] $dcDomains.Add($d) }
         }
         # Assigned UNCONDITIONALLY. It used to be guarded by "if ($dcDomains.Count -gt 0)", which
