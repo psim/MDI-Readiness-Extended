@@ -216,10 +216,18 @@ Assert-That '  ...and carry no FQDN property to count by' (
 
 # The shipped expression, extracted from the file and executed against those rows. If the property it
 # keys on ever stops existing, this evaluates to 0 and the assertion fails.
+#
+# Two spellings are accepted because the count moved out of an inline expression and into
+# Get-mdiDomainControllerHostCount, which keys each row by name IN ITS OWN DOMAIN so that a dc01 in
+# each of two forests is two controllers rather than one. What this block pins is unchanged and is
+# still checked by EXECUTING whatever the shipped line actually computes: a multi-homed DC counts
+# once, and a populated forest never counts zero. Matching only the old inline form would have made
+# this assertion a spelling test that fired on a refactor and stayed silent on a wrong answer.
 $rawScript = Get-Content -LiteralPath $target -Raw
 $countLineIndex = $rawScript.IndexOf('Found {0} domain controller(s) in {1} domain(s)')
 $countLineWindow = if ($countLineIndex -ge 0) { $rawScript.Substring($countLineIndex, [Math]::Min(260, $rawScript.Length - $countLineIndex)) } else { '' }
-$countExpression = [regex]::Match($countLineWindow, '@\(\$dcInventory[^\r\n]*?\)\.Count')
+$countExpression = [regex]::Match($countLineWindow,
+    '(?:@\(\$dcInventory[^\r\n]*?\)\.Count|\(Get-mdiDomainControllerHostCount[^\r\n]*?\$dcInventory\))')
 Assert-That 'the shipped count expression was found' ($countExpression.Success) "(window: $($countLineWindow.Length) chars)"
 if ($countExpression.Success) {
     $dcInventory = $inventoryRows

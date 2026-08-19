@@ -3932,6 +3932,43 @@ function Resolve-mdiLdapTarget {
     @($targets)
 }
 
+function Get-mdiDomainControllerHostKey {
+    # The single ruler for "which MACHINE is this inventory row". A name is not a host once there is
+    # more than one forest in scope: mdilab.local and fabrikam.local may each legitimately hold a
+    # dc01, and they are different machines at different addresses. The row's Domain is therefore
+    # part of the key, exactly as Get-mdiAddresslessDomainController already keyed it.
+    #
+    # Measured on the shipped expression this replaced, over the same rows:
+    #   six machines, a dc01 in EACH forest      truth=6   raw Name ruler said 5   UNDER-COUNT
+    #   ONE machine, four legitimate spellings   truth=1   raw Name ruler said 4   OVER-COUNT
+    #
+    # A row whose Name nobody could read keys as the empty string and is dropped by the caller,
+    # because a controller that was never read is not a controller that was found. Domain is COERCED
+    # to a string because ConvertTo-mdiCanonicalComputerName types -Domain as [string] and cannot
+    # bind an Object[], which would raise a terminating parameter-transformation error.
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Row
+    )
+
+    if ($null -eq $Row) { return '' }
+    if ([string]::IsNullOrWhiteSpace([string] $Row.Name)) { return '' }
+
+    $key = ConvertTo-mdiCanonicalComputerName -Value $Row.Name -Domain ([string] $Row.Domain)
+    if ([string]::IsNullOrWhiteSpace([string] $key)) { return '' }
+    return ([string] $key).ToLowerInvariant()
+}
+
+function Get-mdiDomainControllerHostCount {
+    # How many distinct CONTROLLERS the inventory holds. Kept as a function rather than an inline
+    # expression in Main so the number the operator is shown is a thing that can be measured.
+    param (
+        [Parameter(Mandatory = $true)] [AllowNull()] [AllowEmptyCollection()] [object[]] $Inventory
+    )
+
+    @(@($Inventory) | ForEach-Object { Get-mdiDomainControllerHostKey -Row $_ } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique).Count
+}
+
 function Get-mdiAddresslessDomainController {
     param (
         [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $Inventory
@@ -20653,8 +20690,12 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
         # the whole scope and shared by all the probes.
         $dcInventory = @(Get-mdiDomainControllerInventory -Domain $domainsInScope)
         $addresslessDomainControllers = @(Get-mdiAddresslessDomainController -Inventory $dcInventory)
-        # Counted as distinct HOSTS, keyed on Name - which is the property this inventory actually
-        # carries. An earlier version of this line counted distinct FQDN, which the records do not have,
+        # Counted as distinct HOSTS through Get-mdiDomainControllerHostCount, which is the SAME ruler
+        # Get-mdiAddresslessDomainController uses on the line above over these identical rows. Keying
+        # on the bare Name discarded the row's Domain, and a name is not a host once a second forest
+        # is in scope: measured over six machines with a dc01 in EACH forest, the bare-Name ruler
+        # reported five, and a controller that is never counted is one whose gaps are never looked
+        # for. An earlier version of this line counted distinct FQDN, which the records do not have,
         # so Select-Object returned nothing and the line reported "Found 0 domain controller(s)" for a
         # populated forest: a fix for a double-count that replaced it with a zero-count.
         #
@@ -20662,7 +20703,7 @@ if ($PSCmdlet.ShouldProcess($targetDescription, 'Create MDI related configuratio
         # observed and each one is a separate NNR target; only the number shown to the operator is per
         # host, so a multi-homed DC is not counted twice.
         Write-mdiVerbose ('Found {0} domain controller(s) in {1} domain(s)' -f
-            @($dcInventory | Where-Object { $_.Name } | Select-Object -ExpandProperty Name -Unique).Count, $domainsInScope.Count)
+            (Get-mdiDomainControllerHostCount -Inventory $dcInventory), $domainsInScope.Count)
 
         $ldapTargets = @(Resolve-mdiLdapTarget -DomainControllers $dcInventory -MaxPerDomain $MaxLdapTargetsPerDomain)
         # A scoped domain that produced NO LDAP target is a hole in the port plan, whether that is
