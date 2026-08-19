@@ -3347,14 +3347,43 @@ function Get-mdiProbeTargetKey {
     $named = [string] (ConvertTo-mdiCanonicalComputerName -Value $Target.Name -Domain ([string] $Target.Domain))
     if (-not [string]::IsNullOrWhiteSpace($named)) { return $named }
 
-    # Read through PSObject.Properties rather than $Target.IP so that a row carrying no IP property
-    # at all - a hashtable-shaped row, a projection that selected only Name and Domain - keys as the
-    # empty string instead of throwing under Set-StrictMode.
-    $ipProperty = $Target.PSObject.Properties['IP']
-    if ($null -eq $ipProperty) { return '' }
+    # Read through the SHAPE-AGNOSTIC accessors rather than $Target.IP, so that a row carrying no IP
+    # property at all - a projection that selected only Name and Domain - keys as the empty string
+    # instead of throwing under Set-StrictMode.
+    #
+    # Test-mdiDetailEntry / Get-mdiDetailValue, NOT $Target.PSObject.Properties['IP'] directly. This
+    # function reads Name and Domain off the row by direct member access, which an IDictionary row
+    # answers correctly, and then read the ADDRESS through PSObject.Properties - which on an
+    # IDictionary enumerates the .NET members (Count, Keys, Values, IsReadOnly...), never the
+    # entries. Copy-mdiDetails states that fact in its own docstring and every other reader of a
+    # possibly-dictionary row in this script branches on [Collections.IDictionary]; this one did not.
+    # So a hashtable-shaped row carrying a perfectly readable IP was judged to have no address at
+    # all and fell through to the bare empty string - THE VERY COLLAPSE THE '?unnamed?' KEY ABOVE
+    # EXISTS TO STOP, still in force for exactly those rows, and reading Name and Domain off the
+    # same row one line earlier had already succeeded.
+    #
+    # Measured on the shipped functions, four unnameable rows across fabrikam.local,
+    # emea.mdilab.local and apac.mdilab.local plus one named mdilab.local domain controller, at
+    # -MaxTargets 1:
+    #
+    #   PSCustomObject rows   4 distinct host keys   Resolve-mdiNnrTarget  1 target
+    #   Hashtable rows        1 distinct host key    Resolve-mdiNnrTarget  4 targets, mdilab.local NONE
+    #   [ordered] rows        1 distinct host key    Resolve-mdiNnrTarget  4 targets, mdilab.local NONE
+    #
+    # Both harms the docstring above names, at once: the cap BLOWN to four targets for a budget of
+    # one, and a READABLE domain holding a real, nameable domain controller starved of any target at
+    # all while the NNR card still reported a result for the run.
+    #
+    # Scope stated no more strongly than it was measured, exactly as the sibling guards in
+    # Resolve-mdiLdapTarget are: today's producer, Get-mdiDomainControllerInventory, emits
+    # PSCustomObject rows, and a -AsJson round trip returns PSCustomObject as well, so this is not a
+    # live false green in the shipped pipeline. It is one reader of a row disagreeing with the rest
+    # of the script about how a row is read, and the fix belongs on the key.
+    if (-not (Test-mdiDetailEntry -Details $Target -Name 'IP')) { return '' }
+    $ipValue = Get-mdiDetailValue -Details $Target -Name 'IP'
 
-    $address = ConvertTo-mdiCanonicalIPAddress -Value $ipProperty.Value
-    if ($null -eq $address) { $address = ([string] $ipProperty.Value).Trim() }
+    $address = ConvertTo-mdiCanonicalIPAddress -Value $ipValue
+    if ($null -eq $address) { $address = ([string] $ipValue).Trim() }
     if ([string]::IsNullOrWhiteSpace($address)) { return '' }
 
     '?unnamed?{0}?{1}' -f (Get-mdiProbeDomainKey -Domain $Target.Domain), $address
