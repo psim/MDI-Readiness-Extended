@@ -15,78 +15,26 @@ The version is defined once, in the `$settings` block of the script, and appears
 footer, in the `-AsJson` output and in each baseline history entry, so any report or trend can be
 traced back to the build that produced it.
 
-## [Unreleased]
+## [1.1.7] - 2026-08-19
+
+Correctness release. Nineteen defects fixed, each with a mutation-tested regression test.
+
+No parameter, report section or JSON field changed, so an existing `-BaselinePath` history and any
+`-AsJson` consumer keep working.
 
 ### Fixed
 
-- A Network Name Resolution target the operator named, which resolves perfectly, was reported as a
-  host whose ADDRESS COULD NOT BE RESOLVED, when the truth was that the sampler dropped it for want
-  of budget. Main built the unresolved list against the plan AFTER `-MaxNnrTargets` had been spent,
-  so "resolved" silently meant "resolved AND survived the budget" and a budget drop was
-  indistinguishable from a host DNS cannot find. Measured on the shipped functions at the shipped
-  default of `-MaxNnrTargets 5` with eight named workstations, every one of which resolves: ws1-ws5
-  were probed, ws6, ws7 and ws8 were reported unresolved, and 3 of 3 resolve fine. All three
-  disclosure surfaces stated an address failure that had not happened - the console warning, a High
-  "could not be resolved to an address" finding, and the verdict - each charging an unread check and
-  blocking READY. The verdict was right, because those hosts genuinely were not probed, but the
-  cause was invented: the remedy it implied (fix name resolution) cannot work, and the one that
-  would (raise `-MaxNnrTargets`) was never mentioned. A control with a genuinely unresolvable host
-  confirms the wording is correct in that case, so this was wrong specifically for the budget drop.
-  Naming workstations is exactly what `-NnrTargetComputer` is for, and the tool's own console tip
-  recommends it, so naming more than five is ordinary usage at default settings.
-  `Resolve-mdiNnrTarget` now reports what RESOLVED through a `-ResolvedName` out-parameter taken
-  before the cap, Main compares the request against that, and named hosts that resolved but did not
-  fit the budget are disclosed separately as `NnrSampledOutTargets` - charged one unread each,
-  raising their own High finding that names `-MaxNnrTargets` as the remedy, and still blocking READY
-  because they genuinely were not probed.
-
-- A domain in scope that received no Network Name Resolution probe target reached READY with a
-  green score, because nothing recorded that it had been skipped. The two probe budgets are not the
-  same kind of number, and the difference is invisible until the scope holds more than one domain:
-  `-MaxLdapTargetsPerDomain` is spent PER DOMAIN, so every domain is guaranteed targets, while
-  `-MaxNnrTargets` is a single GLOBAL pool the domains compete for. `Resolve-mdiNnrTarget` spreads
-  that pool per domain - its own comment says why, "A forest nobody probed is not a forest that
-  passed" - but spreading can only honour that while the budget is at least as large as the number
-  of domains in scope, and the shipped default is 5. Measured on the shipped sampler at that
-  default, three controllers per domain: five domains in scope were all probed, six left the sixth
-  with no target at all, and eight left three domains unprobed - while the per-domain LDAP budget
-  starved none of them on the same estate. So a domain whose controllers were fully scanned,
-  passing both the unexamined-domain gate and the LDAP plan gap, could have its name resolution
-  never measured. It was not merely undisclosed but UNRECORDED: the report carried no resolved NNR
-  target list and no per-domain NNR coverage, so no surface could raise it, and the only NNR
-  disclosure is a global host count ("name resolution 5 of 18 host(s)") that reads identically
-  whether the sample spread across every domain or an entire domain got nothing. Now recorded as
-  `NnrPlanGapDomains` and read by the same three consumers as the LDAP gap - one unread charged per
-  domain, a High "Not measured" finding naming it, and READY refused. The rule deliberately differs
-  from the LDAP one: an operator-supplied target takes its Domain from its own DNS suffix, so a
-  bare IP address yields `$null` by design and a disjoint NetBIOS suffix (`ws4.FABCORP`) yields a
-  name in no scope; measured with four targets named as IP addresses the naive rule charged ALL
-  FOUR scoped domains, so any target the run cannot place silences the charge rather than licensing
-  it. This trades no false green for a false red.
-
-- Merging the two role passes over one host decided "is this check mandatory?" with its own inline
-  `-eq 'Required'` instead of `Test-mdiRequirementIsMandatory`, the one definition of that rule, and
-  the copy had drifted in both directions at once. `'All'` ranks alongside `'Required'` - every one
-  must pass, and a measured failure blocks the verdict - so an All-class check that was measured
-  FAILING never reached `Blockers`, and one that was never read never reached `UnknownChecks`
-  either: it left the merge with no trace on either disclosure surface. In the other direction,
-  PowerShell's `-eq` coerces its right operand to the left operand's type, so a `Requirement` that
-  came back from a JSON round trip as the boolean `true` satisfied `$true -eq 'Required'` and a
-  value nobody could read was charged as a blocking failure. Both filters now use the shared rule.
-  This merge runs whenever one host is discovered under two roles - a domain controller that is also
-  a certification authority or an AD FS server - and its sibling branch exists for earlier-version
-  and foreign reports, which is exactly what produces `"Requirement":true`.
-
-- A run that measured real failures published `Readiness: "N/A"` - "not enough evidence to decide" -
-  whenever any server had been only partially scanned. The partial-scan test was reached before
-  known failures were considered, so it decided the machine-readable verdict on its own: with
-  `PartialScanCount=1` and five checks observed failing the published value was the string `N/A`,
-  while the same five failures without a partial scan correctly published `false`. A pipeline gating
-  on `Readiness` reads `N/A` as "nothing proven wrong" and does not fail the build. A measured
-  failure now outranks an incomplete scan, which is what the function's contract always stated. The
-  `N/A` verdict is unchanged where the run genuinely could not decide - nothing scanned, or a
-  partial or unread run with nothing observed failing.
-
+- A domain left unprobed by the global `-MaxNnrTargets` budget was reported as ready, and a target
+  the budget dropped was reported as one whose address could not be resolved.
+- A measured failure was published as `Readiness: "N/A"`, which a pipeline gating on that field
+  reads as nothing proven wrong.
+- A mandatory check that failed was painted as advisory on the prerequisite chart, disagreeing with
+  the verdict that had already blocked on it.
+- A resolver failure collapsed the self-probe guard and fabricated a pass on required LDAP and
+  LDAPS ports.
+- Rows arriving as dictionaries lost their checks, their addresses and recorded measurements, and
+  gained .NET members as failures.
+- A schema version was invented for a domain whose schema was never read.
 ## [1.1.6] - 2026-08-18
 
 Correctness release. Thirty-one defects fixed, each with a mutation-tested regression test.
