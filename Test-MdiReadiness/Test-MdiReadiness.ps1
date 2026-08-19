@@ -13636,13 +13636,54 @@ function Get-mdiServerIdentityKey {
         is a value or an exception. A row nobody could read must not be able to delete the servers
         that WERE read, on the one function every counter, the merge and the role de-duplication
         share.
+
+        ...AND THAT COERCION TRADED A CRASH FOR A FABRICATION, which is the failure this codebase
+        keeps naming: a loud failure replaced by a quiet one is not a fix. [string] tests the
+        RENDERING, not the value. The DOMAIN half of the key is only ever used to QUALIFY a dotless
+        name - ConvertTo-mdiCanonicalComputerName appends it verbatim to any name carrying no dot -
+        so every non-string rendered non-blank and became a DNS SUFFIX. Measured on the shipped
+        function, the operator-supplied row `-CAServer CAFAB01` (line 12097 keeps a short name as the
+        FQDN, and the comment above it says that is the case -CAServer exists for):
+
+            Domain value          key produced
+            $null / '' / '   '    'cafab01'                              left bare, correct
+            @('fabrikam.local')   'cafab01.fabrikam.local'               unwrapped, correct
+            12345                 'cafab01.12345'              <-- a suffix nobody read
+            $true                 'cafab01.true'               <-- a suffix nobody read
+            @{}                   'cafab01.system.collections.hashtable' <-- a suffix nobody read
+
+        Those are not merely wrong keys, they are keys that LOOK RESOLVED: a fully qualified name is
+        this codebase's evidence that a host's domain was learned. The consequence is the one this
+        header already states two paragraphs above - "one physical server was counted twice and its
+        two halves could carry different verdicts. The healthy-looking half then appeared in the
+        ready count" - reached through a value nobody read rather than through a spelling variant.
+
+        Routed through ConvertTo-mdiReadableDomainName, exactly as Get-mdiProbeDomainKey and
+        Get-mdiProbeTargetKey already are. It tests the TYPE rather than the spelling, which is the
+        only test that can work here: 'System.Collections.Hashtable' is legal DNS characters
+        throughout. An all-numeric single-label STRING '12345' is still accepted because a directory
+        really can return one, so nothing that used to be read stops being read.
+
+        A domain that cannot be read leaves the name BARE rather than being dropped, which is what
+        $null and the empty string already did. An unqualified name is the honest answer for a row
+        whose domain nobody read, and it keeps such rows separate from named hosts instead of
+        merging them into one.
+
+        WHAT THIS DELIBERATELY DOES NOT DO: it does not try to tell a DISJOINT NetBIOS name from a
+        single-label DNS domain. 'FABCORP' is a string a directory or an operator really supplied,
+        and a single-label DNS domain is legal - Resolve-mdiDomainScopeDnsName says so in its own
+        header - so the two are indistinguishable at this layer without asking the directory. That
+        function is where the NetBIOS spelling is resolved, and where it deliberately keeps the
+        operator's spelling when the directory cannot be asked.
     #>
     param (
         [Parameter(Mandatory = $false)] [AllowNull()] [object] $Server
     )
 
     if ($null -eq $Server) { return '' }
-    $key = ConvertTo-mdiCanonicalComputerName -Value ([string] $Server.FQDN) -Domain ([string] $Server.Domain)
+    $readableDomain = ConvertTo-mdiReadableDomainName -Value $Server.Domain
+    if ($null -eq $readableDomain) { $readableDomain = '' }
+    $key = ConvertTo-mdiCanonicalComputerName -Value ([string] $Server.FQDN) -Domain $readableDomain
     if ([string]::IsNullOrWhiteSpace([string] $key)) { return '' }
     return $key.ToLowerInvariant()
 
