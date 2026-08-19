@@ -1233,6 +1233,10 @@ function Test-mdiTcpPort {
         [Parameter(Mandatory = $true)] [string] $ComputerName,
         [Parameter(Mandatory = $true)] [int] $Port,
         [int] $TimeoutMs = 1500,
+        # The budget the FIRST attempt was given, carried into the retry frame so the failure detail
+        # can name it. The retry recurses with -TimeoutMs set to the longer budget, so inside that
+        # frame $TimeoutMs is the retry budget and the operator's own number is otherwise lost.
+        [int] $FirstMs = 0,
         [switch] $IsRetry
     )
 
@@ -1311,7 +1315,7 @@ function Test-mdiTcpPort {
             # rule and a dead port look identical from here, and that is stated rather than implied.
             if (-not $IsRetry) {
                 $retryMs = [Math]::Max($TimeoutMs * 3, 5000)
-                $retry = Test-mdiTcpPort -ComputerName $ComputerName -Port $Port -TimeoutMs $retryMs -IsRetry
+                $retry = Test-mdiTcpPort -ComputerName $ComputerName -Port $Port -TimeoutMs $retryMs -FirstMs $TimeoutMs -IsRetry
                 if ($retry.Success) {
                     return [PSCustomObject]@{ Success = $true
                         Detail = ('Connected on the second attempt after {0} ms - the first {1} ms probe timed out, so this path is open but slow' -f $retry.LatencyMs, $TimeoutMs)
@@ -1321,12 +1325,15 @@ function Test-mdiTcpPort {
                 return $retry
             }
             [PSCustomObject]@{ Success = $false
-                # BOTH budgets are named. This reported $TimeoutMs, which on the retry call IS the
-                # retry budget - so a 1500 ms probe that was retried for 5000 ms printed "no response
-                # within 5000 ms", a wait that never happened, and the real first-attempt budget
-                # vanished from the report. The SUCCESS path three lines up already discloses both
-                # ("the first {1} ms probe timed out"); only the failure path had lost one.
-                Detail = ('Blocked - no response within {0} ms, retried and still silent (consistent with a firewall dropping the traffic)' -f $TimeoutMs)
+                # BOTH budgets are named, and now actually are. This reported $TimeoutMs alone,
+                # which on the retry call IS the retry budget - so a 1500 ms probe that was retried
+                # for 5000 ms printed "no response within 5000 ms" and the operator's own budget
+                # vanished from the report. The SUCCESS path above already discloses both ("the
+                # first {1} ms probe timed out"); only the failure path had lost one. $FirstMs is
+                # zero when this function is called with -IsRetry directly, and the single budget it
+                # was actually given is named instead - a number that was never used must not appear.
+                Detail = ('Blocked - no response within {0} and still silent (consistent with a firewall dropping the traffic)' -f
+                    $(if ($FirstMs -gt 0) { '{0} ms, retried for {1} ms' -f $FirstMs, $TimeoutMs } else { '{0} ms, retried' -f $TimeoutMs }))
                 LatencyMs = $null
             }
         }
@@ -1394,6 +1401,10 @@ function Test-mdiUdpPort {
         [Parameter(Mandatory = $true)] [int] $Port,
         [Parameter(Mandatory = $true)] [byte[]] $Payload,
         [int] $TimeoutMs = 1500,
+        # The budget the FIRST datagram was given, carried into the retry frame for the same reason
+        # as its TCP sibling: the retry recurses with -TimeoutMs set to the longer budget, so inside
+        # that frame $TimeoutMs is the retry budget and the operator's own number is otherwise lost.
+        [int] $FirstMs = 0,
         # NBSTAT, DNS and CLDAP all carry a caller-chosen identifier that the answer must echo. Passing it
         # in lets a reply be checked against the request rather than accepting any datagram that arrives.
         [int] $ExpectedTransactionId = -1,
@@ -1497,7 +1508,7 @@ function Test-mdiUdpPort {
             $retryMs = [Math]::Max($TimeoutMs * 2, 3000)
             $retry = Test-mdiUdpPort -ComputerName $ComputerName -Port $Port -Payload $Payload `
                 -TimeoutMs $retryMs -ExpectedTransactionId $ExpectedTransactionId `
-                -ResponseValidator $ResponseValidator -IsRetry
+                -ResponseValidator $ResponseValidator -FirstMs $TimeoutMs -IsRetry
             if ($retry.Success) {
                 return [PSCustomObject]@{ Success = $true
                     Detail = ('Replied on the second attempt after {0} ms - the first datagram went unanswered within {1} ms' -f $retry.LatencyMs, $TimeoutMs)
@@ -1521,7 +1532,14 @@ function Test-mdiUdpPort {
         $socketError = $_
         $detail = switch ($socketError.Exception.SocketErrorCode) {
             'ConnectionReset' { 'Closed - ICMP port unreachable (host reachable, no service listening)' }
-            'TimedOut' { 'Blocked - no response within {0} ms, retried and still silent (filtered by a firewall or no service listening)' -f $TimeoutMs }
+            'TimedOut' {
+                # Both budgets are named, for the same reason as the TCP sibling: this built the
+                # message from $TimeoutMs alone, which in the retry frame IS the retry budget, so a
+                # 1500 ms probe retried for 3000 ms printed "no response within 3000 ms" and the
+                # operator's own budget never appeared. The success path above already names both.
+                'Blocked - no response within {0} and still silent (filtered by a firewall or no service listening)' -f
+                $(if ($FirstMs -gt 0) { '{0} ms, retried for {1} ms' -f $FirstMs, $TimeoutMs } else { '{0} ms, retried' -f $TimeoutMs })
+            }
             default {
                 if (Test-mdiIsNotRunError $socketError) {
                     'Not tested - {0} - {1}' -f $socketError.Exception.SocketErrorCode, ($socketError.Exception.Message -replace '[\r\n]+', ' ')
@@ -3219,9 +3237,39 @@ function Get-mdiProbeTargetKey {
         ConvertTo-mdiCanonicalComputerName owns the rule, exactly as it does for
         Get-mdiAddresslessDomainController: it qualifies a dotless name with the row's own domain,
         leaves an already-qualified name alone, returns a bare IP address unchanged rather than
-        stapling a domain onto it, and returns nothing for a name that cannot be read. A row that
-        yields no key keys as the empty string, which is what an unnameable row already did, so it
-        is neither merged into a named host nor dropped.
+        stapling a domain onto it, and returns nothing for a name that cannot be read.
+
+        AN UNNAMEABLE ROW IS ITS OWN HOST. Returning the bare empty string for every row that could
+        not be named kept such a row out of any NAMED host's group - but it merged all of them into
+        EACH OTHER, and that is the very collapse this function was written to stop, still in force
+        for exactly the rows nobody could read. Every unnameable row keys the same, so rows in
+        different domains, and in different FORESTS, were one host to both samplers.
+
+        Measured on the shipped functions, an estate of one unnameable mdilab.local row, dc01,
+        dcfab01, THREE unnameable fabrikam.local rows and dc02.emea.mdilab.local:
+
+            Resolve-mdiLdapTarget -MaxPerDomain 1   6 targets; fabrikam.local got FOUR
+            Resolve-mdiLdapTarget -MaxPerDomain 2   7 targets; fabrikam.local got FOUR
+            Resolve-mdiNnrTarget  -MaxTargets 2     5 targets; emea.mdilab.local got NONE
+
+        Two harms at once, and the second is the one that matters. The cap is BLOWN - four targets
+        for a budget of one, five for a budget of two - which is spent against the generated command
+        line length limit and the port-probe time budget this script already throws and warns on. And
+        a READABLE domain is STARVED: the four unnameable rows counted as ONE host, that host was
+        attributed to whichever domain enumerated first, and emea.mdilab.local - a real domain with a
+        real, nameable domain controller - received no NNR target at all while the NNR card still
+        reported a result for the run. A forest nobody probed is not a forest that passed.
+
+        So a row that cannot be NAMED is identified by its ADDRESS IN ITS OWN DOMAIN instead. The
+        prefix carries a '?', which cannot occur in a DNS name or an IP address, so an unnameable key
+        can never collide with a named one. Two addresses of one unnameable host therefore count as
+        two hosts - unknowable is what "which host is this" genuinely is without a name, and erring
+        that way can only probe that row's own domain more, never starve another domain of the slot
+        it was entitled to. Only a row that has neither a readable name NOR a readable address still
+        keys as the empty string: nothing whatever was read off it, and it must not be merged into a
+        named host nor dropped.
+
+        A null row keys as the empty string, unchanged.
 
         Domain is COERCED to a string here rather than handed straight to the -Domain parameter,
         which is typed [string]. An inventory row can carry a wrong type - a collection, a number -
@@ -3237,7 +3285,21 @@ function Get-mdiProbeTargetKey {
     )
 
     if ($null -eq $Target) { return '' }
-    [string] (ConvertTo-mdiCanonicalComputerName -Value $Target.Name -Domain ([string] $Target.Domain))
+
+    $named = [string] (ConvertTo-mdiCanonicalComputerName -Value $Target.Name -Domain ([string] $Target.Domain))
+    if (-not [string]::IsNullOrWhiteSpace($named)) { return $named }
+
+    # Read through PSObject.Properties rather than $Target.IP so that a row carrying no IP property
+    # at all - a hashtable-shaped row, a projection that selected only Name and Domain - keys as the
+    # empty string instead of throwing under Set-StrictMode.
+    $ipProperty = $Target.PSObject.Properties['IP']
+    if ($null -eq $ipProperty) { return '' }
+
+    $address = ConvertTo-mdiCanonicalIPAddress -Value $ipProperty.Value
+    if ($null -eq $address) { $address = ([string] $ipProperty.Value).Trim() }
+    if ([string]::IsNullOrWhiteSpace($address)) { return '' }
+
+    '?unnamed?{0}?{1}' -f (Get-mdiProbeDomainKey -Domain $Target.Domain), $address
 }
 
 function Get-mdiProbeDomainKey {
@@ -17981,9 +18043,48 @@ function Set-MdiReadinessReport {
         (Get-mdiVerdictQualifier -ReportData $ReportData)
     $issueCount = @(Get-mdiIssueList -Statistics $stats -ReportData $ReportData).Count
     $issueBadge = if ($issueCount -gt 0) { '<span class="count bad">' + $issueCount + '</span>' } else { '' }
-    $schemaText = if ($ReportData.DomainSchemaVersion.details) {
-        '{0} (version {1})' -f [string] $ReportData.DomainSchemaVersion.details, [string] $ReportData.DomainSchemaVersion.schemaVersion
-    } else { 'n/a' }
+    # The version NUMBER is appended only when a version was actually read.
+    #
+    # Get-DomainSchemaVersion returns schemaVersion = 0 beside the sentence 'Not tested - the schema
+    # version could not be read' whenever the directory did not answer, and the per-domain runner's
+    # catch writes the string 'N/A' into the same field. Both were formatted exactly like a
+    # successful read, so the report headline said:
+    #
+    #     Schema Not tested - the schema version could not be read (version 0)
+    #
+    # A sentence stating that nothing was measured, carrying a number that reads as a measurement.
+    # There is no schema version 0 - 13, Windows 2000, is the lowest Active Directory has ever had -
+    # so the number was invented by this line rather than read from any directory.
+    #
+    # The cross-forest lab is what makes this ordinary rather than rare: a second forest reached over
+    # a trust is precisely the domain whose rootDSE read fails while every other domain in scope
+    # answers, and Get-DomainSchemaVersion's own comment records having measured that against
+    # fabrikam.local. The headline is also the one place the schema appears, so there is no second
+    # surface that would have contradicted it.
+    #
+    # details is read as a STRING, and through its .Detail property when it is not one. The
+    # per-domain runner's catch at the end of this script wraps details in a
+    # [PSCustomObject]@{ Detail = ... } for every sibling of this item, and a PSCustomObject is
+    # truthy - so the old guard passed it through to [string], which renders an object as its
+    # '@{Name=Value}' stringification. Measured on the shipped renderer, that put
+    # '@{Detail=Could not be read: ...} (version N/A)' in the headline.
+    $schemaNode = $ReportData.DomainSchemaVersion
+    $schemaDetails = if ($null -eq $schemaNode -or $null -eq $schemaNode.details) {
+        ''
+    } elseif ($schemaNode.details -is [string]) {
+        $schemaNode.details.Trim()
+    } else {
+        ([string] $schemaNode.details.Detail).Trim()
+    }
+    $schemaMeasured = 0
+    $schemaRead = [int]::TryParse((([string] $schemaNode.schemaVersion).Trim()), [ref] $schemaMeasured) -and $schemaMeasured -gt 0
+    $schemaText = if ([string]::IsNullOrWhiteSpace($schemaDetails)) {
+        'n/a'
+    } elseif ($schemaRead) {
+        '{0} (version {1})' -f $schemaDetails, $schemaMeasured
+    } else {
+        $schemaDetails
+    }
 
     $body = @'
 <!DOCTYPE html>
