@@ -5460,6 +5460,31 @@ function Get-mdiMatchingTrustee {
 
             # Ordinal, case-insensitive, and literal - no wildcard interpretation of either side.
             $candidateLeaf = ($candidate -replace '^.*\\', '') -replace '@.*$', ''
+            # A LEAF THAT NAMES NOBODY MATCHES NOBODY. The blank test above rejects a candidate that is
+            # $null, empty or whitespace; it does not reject a DOMAIN PREFIX WITH NO ACCOUNT. 'FABCORP\'
+            # is not whitespace, so it passes that test, and its leaf is the EMPTY STRING - as is the
+            # leaf of 'MDILAB\', 'fabrikam.local\', '@fabrikam.local', '\' and '@'. Two empty leaves
+            # compare EQUAL, so a name identifying nobody was returned as a candidate for a DIFFERENT
+            # name that also identifies nobody. Measured on the shipped matcher:
+            #
+            #   -Account 'FABCORP\'        -Trustee @('MDILAB\')         -> MDILAB\ [Ambiguous]
+            #   -Account 'FABCORP\'        -Trustee @('CONTOSO\')        -> CONTOSO\ [Ambiguous]
+            #   -Account '@fabrikam.local' -Trustee @('@mdilab.local')   -> @mdilab.local [Ambiguous]
+            #
+            # and through the caller, Get-mdiDeletedObjectsPermission then told the operator "A trustee
+            # with the same account name was found ... Unconfirmed: CONTOSO\ (requested FABCORP\)" and
+            # sent them to dsacls to hunt a same-named trustee that does not exist, on a container whose
+            # DACL had been read perfectly well. No account name was found on either side. The honest
+            # branch already existed and is reached the moment a leaf is non-blank: 'FABCORP\' against
+            # 'FABCORP\svc-mdi' correctly reports that the account could not be resolved to a SID.
+            #
+            # This header says 'Ambiguous' appears only where the tool genuinely cannot tell. Matching
+            # FABCORP\ to CONTOSO\ is not a case of not being able to tell.
+            #
+            # The disjoint namespace is what makes the shape ordinary: FABCORP is the NetBIOS name of
+            # fabrikam.local and is not its first DNS label, so a truncated or half-parsed entry on the
+            # cross-forest side is a domain prefix with the account lost.
+            if ([string]::IsNullOrWhiteSpace($candidateLeaf) -or [string]::IsNullOrWhiteSpace($accountLeaf)) { continue }
             if ([string]::Equals($candidateLeaf, $accountLeaf, [StringComparison]::OrdinalIgnoreCase)) {
                 [PSCustomObject]@{ Trustee = $candidate; Confidence = 'Ambiguous' }
             }
@@ -7093,9 +7118,29 @@ function New-mdiRemediationScript {
         # firewall rule rather than the one rule that record was entitled to. An unreadable port maps
         # to no rule and is filtered here rather than left to be dropped silently by
         # `Select-Object -Unique`, so the rules the OTHER records are entitled to are still emitted.
+        #
+        # "Unreadable" means NOT A NUMBER, not merely blank. The blank test alone let every
+        # non-numeric shape through to `$ruleMap[[int] $port]`, and [int] of one of those THROWS -
+        # out of New-mdiRemediationScript entirely, so the operator got NO SCRIPT AT ALL rather than
+        # a script missing one rule. Measured on the shipped function, one sensor that cannot resolve
+        # ws4.fabrikam.local by any NNR method, with the RDP record's Port replaced one shape at a
+        # time:
+        #
+        #     3389 (control)   317 lines, 3 firewall rules
+        #     '3389'           317 lines, 3 rules      a JSON round trip produces this
+        #     $null / $true    292 lines, 2 rules      already filtered, rule dropped
+        #     'n/a'              0 lines, NO SCRIPT    Cannot convert value "n/a" to Int32
+        #     'timed out'        0 lines, NO SCRIPT
+        #     @{}                0 lines, NO SCRIPT    [string] @{} is not whitespace, so it passed
+        #     '9999...9'         0 lines, NO SCRIPT    too large for an Int32
+        #
+        # Get-mdiRequiredPortsHtml carries a fix for this same family on LatencyMs, and
+        # Merge-mdiRequiredPortsDetails already ranks these very records with the defensive
+        # `[int] ($_.Port -as [int])`. This was the reader that did not.
         foreach ($port in @($blockedNnr | ForEach-Object { $_.Port } |
-                    Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } | Select-Object -Unique | Sort-Object)) {
-            $rule = $ruleMap[[int] $port]
+                    Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } |
+                    Where-Object { $null -ne ($_ -as [int]) } | Select-Object -Unique | Sort-Object)) {
+            $rule = $ruleMap[($port -as [int])]
             if ($null -eq $rule) { continue }
             # A create-only fix (Get-NetFirewallRule by NAME, create if absent) left a rule that already
             # existed with the wrong protocol, port, profile, action, enabled state or - most dangerously -
@@ -7168,7 +7213,31 @@ function New-mdiRemediationScript {
             if ($forTarget.Count -eq 0) { continue }
             foreach ($address in @($forTarget | ForEach-Object { [string] $_.TargetIP } | Select-Object -Unique)) {
                 $forAddress = @($forTarget | Where-Object { [string] $_.TargetIP -eq [string] $address })
-                $unscripted = @($forAddress | Where-Object { -not $ruleMap.ContainsKey([int] $_.Port) })
+                # ($_.Port -as [int]), not [int] $_.Port. This is the same defensive form the sibling
+                # reader of these very records already uses in Merge-mdiRequiredPortsDetails
+                # (`[int] ($_.Port -as [int])`), and the asymmetry cost the whole file: [int] of an
+                # unreadable value THROWS, and this call sits inside the remediation generator, so one
+                # bad Port on one NNR record did not lose that record - it lost the entire script.
+                #
+                # Measured on the shipped function, one sensor that cannot resolve ws4.fabrikam.local
+                # by any NNR method, with the RDP record's Port replaced one shape at a time:
+                #
+                #     3389 (control)   317 lines, 3 firewall rules
+                #     '3389'           317 lines, 3 rules      a JSON round trip produces this
+                #     $null / $true    292 lines, 2 rules      rule dropped, finding stays manual
+                #     'n/a'              0 lines, NO SCRIPT    Cannot convert value "n/a" to Int32
+                #     'timed out'        0 lines, NO SCRIPT
+                #     @{}                0 lines, NO SCRIPT
+                #     '9999...9'         0 lines, NO SCRIPT    too large for an Int32
+                #
+                # An operator asking for a remediation script got no file at all, over a field that is
+                # not even the one being remediated. A record whose port cannot be read simply has no
+                # rule written for it, so it stays in "needs manual attention" - which is the honest
+                # outcome and the one this branch already produces for $null.
+                $unscripted = @($forAddress | Where-Object {
+                        $portNumber = $_.Port -as [int]
+                        ($null -eq $portNumber) -or (-not $ruleMap.ContainsKey($portNumber))
+                    })
                 if ($forAddress.Count -eq 0 -or $unscripted.Count -gt 0) { continue }
                 foreach ($server in @($forAddress | ForEach-Object { [string] $_.Server } | Select-Object -Unique)) {
                     & $markCovered $server (Get-mdiNnrIssueText -Target $target -TargetIP $address)
