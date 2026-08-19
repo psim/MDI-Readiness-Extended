@@ -8764,6 +8764,32 @@ function ConvertTo-mdiMeasuredNumber {
     $null
 }
 
+function Format-mdiLatencyMs {
+    <#
+        A millisecond reading as whole-millisecond TEXT, at any magnitude.
+
+        The probe latency table used to render with [int] [math]::Round($value), on both the per-row
+        cell and the stated average. Int32 tops out at 2147483647, so a reading above that - the
+        arithmetic on an absurd stored value, not a plausible round trip - threw
+        "Value was either too large or too small for an Int32" and destroyed the whole of
+        Get-mdiRequiredPortsHtml, taking the readiness-critical "Ports that need attention" table with
+        it. A number that is perfectly readable must never be the reason a page fails to render.
+
+        Rounding is [math]::Round's default MidpointRounding.ToEven, which is what [int] applied too,
+        so every value in the plausible range formats exactly as it did before. InvariantCulture,
+        matching ConvertTo-mdiMeasuredNumber on the way in: a report generated on a machine using a
+        comma as the group separator must still read the same on one that does not.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Value
+    )
+
+    $number = ConvertTo-mdiMeasuredNumber -Value $Value
+    if ($null -eq $number) { return '' }
+    if ([double]::IsNaN($number) -or [double]::IsInfinity($number)) { return '' }
+    ([math]::Round($number)).ToString('0', [Globalization.CultureInfo]::InvariantCulture)
+}
+
 function Get-mdiCheckProperty {
     <#
         The boolean readiness checks on a server object, with the status flags removed.
@@ -17331,7 +17357,47 @@ function Get-mdiRequiredPortsHtml {
         [void] $lines.Add('</table></div>')
     }
     # Latency separates "blocked" from "reachable but slow", which matters when a sensor sits across a WAN link
-    $timed = @($records | Where-Object { $null -ne $_.LatencyMs -and $_.Success })
+    #
+    # The reading is NORMALISED ONCE, here, and the filter, the sort, the average and the cell all read
+    # that same number. Success is normalised for this reason already - Get-mdiPortResultRecord runs it
+    # through ConvertTo-mdiBoolean - but LatencyMs was not: it reached this block exactly as it arrived,
+    # and this block answered it with a bare $null guard followed by three hard [int] casts. That is the
+    # pair of mistakes ConvertTo-mdiMeasuredNumber exists to end, and it failed in BOTH directions at
+    # once. Measured on the shipped function, one otherwise complete successful LDAPS record with
+    # LatencyMs replaced one shape at a time (and again with that record beside three good ones):
+    #
+    #     130         '130 ms' amber                     (correct)
+    #     $null       excluded                           (correct - nothing was measured, and it says so)
+    #     ''          '0 ms' GREEN, average 274 -> 206   <- the fastest possible probe, for one nobody timed
+    #     $true       '1 ms' GREEN                       <- the same, from a flag
+    #     '   '       THREW, whole table lost
+    #     'n/a'       THREW, whole table lost
+    #     'timed out' THREW, whole table lost
+    #     @{}         THREW, whole table lost
+    #     huge string THREW, whole table lost            (too large for Int32, on the cell AND the average)
+    #
+    # The throw is the worse of the two: it takes down the WHOLE of Get-mdiRequiredPortsHtml, and the
+    # "Ports that need attention" table it also renders is the readiness-critical one. Three perfectly
+    # good rows plus one unreadable fourth produced no network ports section at all.
+    #
+    # The sibling sort forty lines above already uses the defensive form, [int] ($_.Port -as [int]), and
+    # its comment claimed "The same cast is already applied to LatencyMs a few lines below for exactly
+    # this reason". It was not the same cast - -as yields $null where a bare [int] throws - so the claim
+    # of parity was itself the thing that hid this.
+    #
+    # This is ordinary rather than contrived now that sensors sit in HQ-Site, EMEA-Site and Branch-Site
+    # and probe across the fabrikam.local trust: a probe that succeeded without a stopwatch reading, and
+    # a report that has been through a JSON round trip in another tool, hand-edited, or produced by an
+    # older version, are the two shapes this table is fed from.
+    $timedRecord = @($records | Where-Object { $_.Success } | ForEach-Object {
+            [PSCustomObject]@{ Record = $_; LatencyMs = ConvertTo-mdiMeasuredNumber -Value $_.LatencyMs }
+        })
+    $timed = @($timedRecord | Where-Object { $null -ne $_.LatencyMs })
+    # A successful probe carrying no readable reading is COUNTED AND STATED, not dropped in silence.
+    # Dropping it would trade the crash for the quieter failure of a page that looks complete while
+    # some of the estate was never timed, and there is no colour or row here for a reader to notice
+    # the absence from.
+    $untimed = @($timedRecord | Where-Object { $null -eq $_.LatencyMs }).Count
     if ($timed.Count -gt 0) {
         # Only the slowest handful earn a row, but until now nothing said so: the lead sentence claimed
         # every successful probe was listed, and the average was taken over the whole population while
@@ -17339,28 +17405,42 @@ function Get-mdiRequiredPortsHtml {
         # on screen. A reader cannot tell measured-and-omitted from never-measured unless the omission
         # is stated, so the count shown, the count measured, and the population the average covers are
         # now all on the page.
-        $slowest = @($timed | Sort-Object { [int] $_.LatencyMs } -Descending | Select-Object -First 10)
-        $average = [int] [math]::Round((($timed | Measure-Object -Property LatencyMs -Average).Average))
+        $slowest = @($timed | Sort-Object -Property LatencyMs -Descending | Select-Object -First 10)
+        # Formatted, not cast. [int] [math]::Round(...) overflows on a reading that exceeds Int32 and
+        # took the table down for a value that was perfectly readable.
+        $average = Format-mdiLatencyMs -Value (($timed | Measure-Object -Property LatencyMs -Average).Average)
         [void] $lines.Add('<h4>Probe latency</h4>')
+        $untimedNote = if ($untimed -gt 0) {
+            ' {0} further successful probe(s) carried no readable round-trip time and are not counted here.' -f $untimed
+        }
+        else { '' }
         if ($slowest.Count -lt $timed.Count) {
-            [void] $lines.Add(('<p class="muted">Round-trip time of the {0} slowest of {1} successful probes. Average {2} ms across all {1} of them. ' -f
-                    $slowest.Count, $timed.Count, $average) +
+            [void] $lines.Add(('<p class="muted">Round-trip time of the {0} slowest of {1} successful probes. Average {2} ms across all {1} of them.{3} ' -f
+                    $slowest.Count, $timed.Count, $average, $untimedNote) +
                 'Consistently high values point at a slow or saturated link rather than a blocked port.</p>')
         }
         else {
             [void] $lines.Add('<p class="muted">Round-trip time of each successful probe. Average ' + $average +
-                ' ms. Consistently high values point at a slow or saturated link rather than a blocked port.</p>')
+                ' ms.' + $untimedNote + ' Consistently high values point at a slow or saturated link rather than a blocked port.</p>')
         }
         [void] $lines.Add('<div class="table-scroll"><table>')
         [void] $lines.Add('<tr><th style="text-align:left">Sensor server</th><th style="text-align:left">Probe</th><th style="text-align:left">Target</th><th>Latency</th></tr>')
         foreach ($row in $slowest) {
-            $latency = [int] $row.LatencyMs
+            $latency = $row.LatencyMs
             $cls = if ($latency -ge 1000) { 'red' } elseif ($latency -ge 250) { 'amber' } else { 'green' }
             [void] $lines.Add(('<tr><td style="text-align:left">{0}</td><td style="text-align:left">{1}</td><td style="text-align:left">{2}</td><td class="{3}">{4} ms</td></tr>' -f
-                    (ConvertTo-mdiHtmlEncoded $row.Server), (ConvertTo-mdiHtmlEncoded $row.Name),
-                    (ConvertTo-mdiHtmlEncoded $row.Target), $cls, $latency))
+                    (ConvertTo-mdiHtmlEncoded $row.Record.Server), (ConvertTo-mdiHtmlEncoded $row.Record.Name),
+                    (ConvertTo-mdiHtmlEncoded $row.Record.Target), $cls, (Format-mdiLatencyMs -Value $latency)))
         }
         [void] $lines.Add('</table></div>')
+    }
+    elseif ($untimed -gt 0) {
+        # Every successful probe was unreadable. Saying nothing here would present a report in which the
+        # latency section simply does not exist, which reads as "nothing was slow" rather than as
+        # "nothing was timed".
+        [void] $lines.Add('<h4>Probe latency</h4>')
+        [void] $lines.Add(('<p class="muted">{0} probe(s) succeeded but carried no readable round-trip time, so no latency is reported. ' -f $untimed) +
+            'This says nothing about whether those paths are slow.</p>')
     }
 
     $probedFrom = @($Server | ForEach-Object { $_.Details.RequiredPortsDetails.ProbedFrom } | Where-Object { $_ } | Select-Object -Unique)
