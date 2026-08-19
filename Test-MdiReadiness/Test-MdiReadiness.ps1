@@ -4196,11 +4196,31 @@ function Merge-mdiDomainControllerEndpoint {
         # a boolean becomes through an -AsJson round trip) and the INTEGER 1 both compare equal to
         # $true and would read as a completed measurement. Measured: with -eq $true in place of this
         # line, those two forms leak through and the regression test loses two assertions.
-        $completeProperty = $source.PSObject.Properties['AddressResolutionComplete']
-        $sourceComplete = if ($null -eq $completeProperty) {
+        # Read with the SHAPE-AGNOSTIC accessors, not $source.PSObject.Properties[...]. This loop
+        # already reads .Name, .IP and .Addresses off the same row by direct member access, which an
+        # IDictionary answers correctly; asking PSObject.Properties whether the flag is PRESENT does
+        # not, because on a hashtable or an [ordered] hashtable it enumerates the dictionary's own
+        # .NET members (Count, Keys, Values, IsReadOnly) and never its entries - the fact
+        # Copy-mdiDetails states in its own docstring. A source that had EXPLICITLY recorded $false
+        # was therefore read as having recorded nothing, and the positive default below was applied
+        # over the top of a real measurement.
+        #
+        # That is this comment's own failure mode returning by a different route: the value is not
+        # merely lost, it comes back as the OPPOSITE definite answer, and it is the flag the DNS
+        # fallback in Get-mdiDomainControllerInventory is gated on. Measured on the shipped function,
+        # one source row carrying AddressResolutionComplete = $false:
+        #
+        #   PSCustomObject row   AddressResolutionComplete=False   carried
+        #   Hashtable row        AddressResolutionComplete=True    fabricated
+        #   [ordered] row        AddressResolutionComplete=True    fabricated
+        #
+        # The ABSENT default is deliberately unchanged and still positive: a source with no such
+        # property at all is treated as complete, which is what both current producers are.
+        $sourceComplete = if (-not (Test-mdiDetailEntry -Details $source -Name 'AddressResolutionComplete')) {
             $true
         } else {
-            ($completeProperty.Value -is [bool]) -and $completeProperty.Value
+            $completeValue = Get-mdiDetailValue -Details $source -Name 'AddressResolutionComplete'
+            ($completeValue -is [bool]) -and $completeValue
         }
 
         $entry = $byName[$key]
@@ -18073,7 +18093,30 @@ function Set-MdiReadinessReport {
             if ($null -eq $row.DeletedObjects) { continue }
             $status = $row.DeletedObjects.isDeletedObjectsPermissionOk
             $detail = [string] $row.DeletedObjects.details.Detail
-            $measured = if ($null -eq $row.PSObject.Properties['DeletedObjectsMeasured']) { $true } else { [bool] $row.DeletedObjectsMeasured }
+            # Test-mdiDetailEntry / Get-mdiDetailValue, not $row.PSObject.Properties[...]. The line
+            # above reads $row.DeletedObjects by direct member access, which an IDictionary answers
+            # correctly, while PSObject.Properties over one enumerates its .NET members and never its
+            # entries - so a row that had EXPLICITLY recorded DeletedObjectsMeasured = $false was read
+            # as never having recorded it, and the positive default below was applied over a real
+            # measurement. The field's two sibling readers already use direct access
+            # ($domainRow.DeletedObjectsMeasured -ne $false in the remediation script, and
+            # $Domain.DeletedObjectsMeasured in the domain check definitions), so the three readers of
+            # one field disagreed about the same row.
+            #
+            # It decides how an 'N/A' result is PRESENTED, which makes the loss a false green: measured
+            # renders the neutral "Not applicable", unmeasured renders "Not tested" with the detail
+            # "The Deleted Objects permission could not be read on this domain". Measured through the
+            # rendered report, a dictionary row recording $false produced
+            # <span class="pill na">Not applicable</span> - "there is nothing to fix here" over a
+            # permission nobody could read.
+            #
+            # The absent default stays $true, deliberately: a legacy report predating the property
+            # must keep reading as measured, which is the reason that default exists.
+            $measured = if (-not (Test-mdiDetailEntry -Details $row -Name 'DeletedObjectsMeasured')) {
+                $true
+            } else {
+                [bool] (Get-mdiDetailValue -Details $row -Name 'DeletedObjectsMeasured')
+            }
             $statusText = [string] $status
             $display = $statusText
             $pillClass = 'bad'
