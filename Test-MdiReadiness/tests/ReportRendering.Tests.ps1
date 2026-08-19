@@ -145,8 +145,18 @@ Assert-That 'the migration KPI compares against $true' ($text -match 'MigrationE
 Assert-That 'the migration cell renders a third state' ($text -match 'Not determined</td>')
 
 Write-Host 'Nothing is dropped from the port matrix' -ForegroundColor Cyan
+# The ids are read off the RECORDS, so a probe whose id is absent, renamed or unrecognised still has
+# a row to land in. This used to pin the literal `Select-Object -ExpandProperty Id -Unique`, which
+# was replaced because -ExpandProperty RAISES on a record that has no Id property at all and took the
+# whole table down with it; the intent - ids come from the results, not only from the settings - is
+# unchanged and is what is pinned here.
 Assert-That 'probe ids come from the results, not only the settings' (
-    $text -match '\$recordProbeId = @\(\$records \| Select-Object -ExpandProperty Id -Unique\)')
+    $text -match '\$recordProbeId = @\(\$records \| ForEach-Object \{')
+Assert-That '  ...read off each record rather than expanded' (
+    $text -match '\$recordId = \[string\] \$_\.Id')
+Assert-That '  ...and an unreadable id keys as a stated marker, so the record is not dropped' (
+    $text -match "\`$unidentifiedProbeId = '\(unidentified probe\)'" -and
+    $text -match 'if \(\[string\]::IsNullOrWhiteSpace\(\$recordId\)\) \{ \$unidentifiedProbeId \} else \{ \$recordId \}')
 Assert-That '  ...orphans are appended rather than skipped' (
     $text -match '\$orphanProbeId = @\(\$recordProbeId \| Where-Object \{ \$_ -notin \$knownProbeId \}\)')
 Assert-That '  ...and an orphan still gets a description' ($text -match 'has no entry in the shipped port list')

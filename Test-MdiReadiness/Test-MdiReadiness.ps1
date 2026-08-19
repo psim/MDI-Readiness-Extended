@@ -6983,7 +6983,29 @@ function New-mdiRemediationScript {
         $sensorIps = @($sensorIpList | Select-Object -Unique | Sort-Object)
         $sensorHosts = @($sensorWithAddress)
         $sensorNoAddress = @($sensorNoAddressList)
-        $blockedTargets = @($blockedNnr | Select-Object -ExpandProperty Target -Unique | Sort-Object)
+        # ForEach-Object, not -ExpandProperty, and the unreadable targets are COUNTED rather than left
+        # to fall off the end of the pipeline.
+        #
+        # Get-mdiPortResultRecord re-stamps Target and TargetIP on every record it builds, so Target
+        # can be $null here but never ABSENT - unlike Port below, this read cannot raise, and saying
+        # otherwise would overstate it. What it did instead is the quiet version of the same harm:
+        # -ExpandProperty yields the nulls, `-Unique` DROPS them, $blockedTargets came back empty, and
+        # the whole NNR section - gated on $blockedTargets.Count a few lines down - was omitted with
+        # nothing said. Measured on this function with three primary NNR methods all measured REFUSED
+        # against one target whose Target field could not be read: 3 rules when it is readable, 0
+        # rules and NO warning when it is not.
+        #
+        # That is the contradiction the Group-resolution comment above already names, arriving through
+        # the target instead of through the family: the report states "no NNR method could resolve X"
+        # and the script generated FROM that report is silent about X. A rule can only be created ON a
+        # named computer, so an unnameable target genuinely cannot receive one; the warning is what
+        # keeps the two halves of the decision saying the same thing.
+        $blockedTargets = @($blockedNnr | ForEach-Object { [string] $_.Target } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique | Sort-Object)
+        $blockedNnrUnnameable = @($blockedNnr | Where-Object { [string]::IsNullOrWhiteSpace([string] $_.Target) }).Count
+        if ($blockedNnrUnnameable -gt 0) {
+            Write-mdiWarning ('{0} blocked Network Name Resolution result(s) carry no readable target, so no inbound firewall rule could be generated for them. Their name resolution will still fail; re-run Test-MdiReadiness.ps1 to obtain the target names.' -f $blockedNnrUnnameable)
+        }
         $blockedTargetLabels = @($blockedNnr | ForEach-Object {
                 # Target and TargetIP are COERCED. Get-mdiTargetLabel types both as [string], these
                 # records cross a JSON boundary - probe results are produced on the remote host and
@@ -7066,7 +7088,13 @@ function New-mdiRemediationScript {
         & $add '            if (@($RemoteAddress).Count -eq 0 -or @($RemoteAddress | Where-Object { [string]::IsNullOrWhiteSpace([string] $_) }).Count -gt 0) {'
         & $add '                Write-Warning ''No valid sensor source address was provided, so the MDI NNR inbound firewall rules were skipped on this device. Opening them without a -RemoteAddress scope would expose the ports to the entire network.'''
         & $add '            } else {'
-        foreach ($port in @($blockedNnr | Select-Object -ExpandProperty Port -Unique | Sort-Object)) {
+        # ForEach-Object, not -ExpandProperty, for the reason $blockedTargets states above: one record
+        # with no Port property would raise ExpandPropertyNotFound and lose every generated NNR
+        # firewall rule rather than the one rule that record was entitled to. An unreadable port maps
+        # to no rule and is filtered here rather than left to be dropped silently by
+        # `Select-Object -Unique`, so the rules the OTHER records are entitled to are still emitted.
+        foreach ($port in @($blockedNnr | ForEach-Object { $_.Port } |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } | Select-Object -Unique | Sort-Object)) {
             $rule = $ruleMap[[int] $port]
             if ($null -eq $rule) { continue }
             # A create-only fix (Get-NetFirewallRule by NAME, create if absent) left a rule that already
@@ -8682,6 +8710,60 @@ function ConvertTo-mdiBoolean {
     $null
 }
 
+function ConvertTo-mdiMeasuredNumber {
+    <#
+        A stored NUMERIC measurement as a real number, or $null when it says "nothing was measured".
+
+        The numeric twin of ConvertTo-mdiBoolean, and it exists for the same reason. A capacity or
+        traffic figure that has been through a JSON round trip in another tool, a hand-edited report
+        or an older version of this script can carry '', 'N/A', 'unknown', whitespace, $true or a
+        collection - and a bare [long]/[double] cast answers those in the two worst possible ways.
+        Measured on the shipped Get-mdiCapacityHtml with one otherwise complete capacity block,
+        BusyPacketsPerSec replaced one shape at a time:
+
+            4200        busy cell '4200'      (correct)
+            ''          busy cell '0'         <- a measurement nobody took
+            $true       busy cell '1'         <- a measurement nobody took
+            'N/A'       THREW  Cannot convert value "N/A" to type "System.Int64"
+            'unknown'   THREW  Cannot convert value "unknown" to type "System.Int64"
+            '   '       THREW  Cannot convert value "   " to type "System.Int64"
+
+        Both outcomes are wrong in the way this tool must never be wrong: the first prints a hard
+        figure under a green "Yes - sensor supported" verdict for a server whose traffic was never
+        read, and the second destroys the entire capacity tab - and with it the report - because one
+        server out of an estate carried an unreadable field.
+
+        Parsed explicitly rather than cast, and BOOLEANS ARE REFUSED OUTRIGHT: [long] $true is 1,
+        which would turn a flag into a packet rate. TryParse already declines the text 'True', so the
+        explicit guard is what stops a future numeric fast-path from quietly accepting one. A
+        collection is refused for the same reason - PowerShell casts a one-element array to its
+        element and would silently accept @(4200) as a reading while answering @() as 0.
+
+        InvariantCulture, matching ConvertTo-mdiSvgNumber on the way out: a report generated on a
+        machine using a comma as the decimal separator must still be readable on one that does not.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Value
+    )
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [bool]) { return $null }
+    if ($Value -is [Collections.IEnumerable] -and $Value -isnot [string]) { return $null }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal] -or
+        $Value -is [single] -or $Value -is [int16] -or $Value -is [byte]) {
+        return [double] $Value
+    }
+    $text = ([string] $Value).Trim()
+    if ($text -eq '') { return $null }
+    $parsed = [double] 0
+    if ([double]::TryParse($text, [Globalization.NumberStyles]::Float -bor [Globalization.NumberStyles]::AllowThousands,
+            [Globalization.CultureInfo]::InvariantCulture, [ref] $parsed)) {
+        return $parsed
+    }
+    # 'N/A' and anything else unrecognised mean "no measurement", never zero.
+    $null
+}
+
 function Get-mdiCheckProperty {
     <#
         The boolean readiness checks on a server object, with the status flags removed.
@@ -8756,6 +8838,18 @@ function Get-mdiUnreadCheckName {
         [Parameter(Mandatory = $false)] [AllowEmptyCollection()] [string[]] $ExcludeName = @()
     )
 
+    # Normalised first, for the reason Get-mdiCheckProperty states at length: PSObject.Properties over
+    # an IDictionary enumerates the DICTIONARY'S OWN .NET MEMBERS instead of its entries, so a row
+    # written as a dictionary has no 'N/A' entry left to find. This fails in the FALSE GREEN direction,
+    # which is the one this codebase exists to prevent - the checks nobody could measure simply stop
+    # being counted. Measured on the shipped function with one server written both ways:
+    #
+    #     PSCustomObject row   2 unread   isDeletedObjectsPermissionOk, isObjectAuditingOk
+    #     Hashtable row        0 unread
+    #
+    # Get-mdiUnreadCheckCount reads this list, so the score charged that server nothing for two checks
+    # it never read: a clean sweep of whatever was left, on measurements nobody took.
+    $Server = ConvertTo-mdiRecordObject -Value $Server
     @($Server.PSObject.Properties | Where-Object {
             $_.Name -notin $script:mdiInformationalProperty -and
             $_.Name -notin $script:mdiStatusFlag -and
@@ -13383,6 +13477,36 @@ function Merge-mdiServerByFqdn {
     $unreachableRole = @{}
     foreach ($srv in $Server) {
         if ($null -eq $srv) { continue }
+        # Normalised BEFORE anything reads the row, because every property walk below goes through
+        # PSObject.Properties - and over an IDictionary that enumerates the DICTIONARY'S OWN .NET
+        # MEMBERS instead of its entries. Three of them (IsReadOnly, IsFixedSize, IsSynchronized) are
+        # real booleans, and the merge loop's own $isCheck test accepts "a real [bool] on either side"
+        # from ANY property by design, so they are Add-Member'd onto the surviving row as genuine
+        # readiness checks while every real entry of that role is never looked at.
+        #
+        # This is the same defect Get-mdiCheckProperty carries a fix for, on the same rows, but that
+        # fix cannot catch this one: this path MATERIALISES the plumbing as real NoteProperties on an
+        # object-shaped row, so by the time the readers see it there is nothing dictionary-shaped left
+        # to normalise. Measured on the shipped functions, one host holding two roles - a domain
+        # controller plus a certification authority - with the CA role row written both ways:
+        #
+        #   CA row PSCustomObject   isAdvancedAuditingOk=True  isPowerSchemeOk=False
+        #   CA row Hashtable        isAdvancedAuditingOk=True  IsFixedSize=False IsReadOnly=False
+        #                                                      IsSynchronized=False
+        #
+        # So the genuine FAILURE isPowerSchemeOk=False was deleted from the merged host and three
+        # checks that cannot exist took its place. ChecksTotal went 3 to 5, and end to end the
+        # generated remediation script gained three invented findings - "[High] dcfab01.fabrikam.local:
+        # Is Read Only check failed" and its two siblings - with the manual-attention count going 2 to
+        # 4. A cross-forest run is where the row shape stops being hypothetical: -MultiForest reaches a
+        # second forest through another tool's JSON, an -AsJson round trip or a hand-edited report,
+        # and any of those hands a role row back as a dictionary.
+        #
+        # Normalising HERE also repairs the first-role branch below: $srv.PSObject.Copy() on a
+        # Hashtable returns another Hashtable, so a host whose FIRST discovered role was dictionary-
+        # shaped left $target dictionary-shaped too and every later role merged against its .NET
+        # members as well.
+        $srv = ConvertTo-mdiRecordObject -Value $srv
         if ([string]::IsNullOrWhiteSpace([string] $srv.FQDN)) { [void] $merged.Add($srv); continue }
         # Stated once, in Get-mdiServerIdentityKey, because the report's COUNTERS have to reach the
         # same answer. They used to normalise the name differently and the two disagreed about how
@@ -14363,6 +14487,12 @@ function Get-mdiDomainCheckDefinition {
     $resolveMeasured = {
         param($Companion, $Result)
         if ($null -ne $Companion) { return [bool] $Companion }
+        # Normalised for the same reason Test-mdiDomainCheckNotAsserted normalises: this presence test
+        # walks PSObject.Properties, which over an IDictionary enumerates the dictionary's own .NET
+        # members and never its entries, so a dictionary-shaped result carrying Measured = $true
+        # resolved to $null - "no information either way" - and the renderer then had nothing to
+        # distinguish a check that did not run from an informational N/A.
+        $Result = ConvertTo-mdiRecordObject -Value $Result
         if ($null -ne $Result -and $null -ne $Result.PSObject.Properties['Measured']) { return [bool] $Result.Measured }
         return $null
     }
@@ -14373,6 +14503,65 @@ function Get-mdiDomainCheckDefinition {
         @{ Name = 'AD FS auditing'; Result = $Domain.AdfsAuditing; Value = $Domain.AdfsAuditing.isAdfsAuditingOk; Measured = (& $resolveMeasured $Domain.AdfsAuditingMeasured $Domain.AdfsAuditing); RoleMayBeAbsent = $true },
         @{ Name = 'Deleted Objects container permission'; Result = $Domain.DeletedObjects; Value = $Domain.DeletedObjects.isDeletedObjectsPermissionOk; Measured = (& $resolveMeasured $Domain.DeletedObjectsMeasured $Domain.DeletedObjects); RoleMayBeAbsent = $false }
     )
+}
+
+function Get-mdiForestDiscoveryRecord {
+    <#
+        The report's ForestDiscovery record, normalised so its ENTRIES can be read whatever shape it
+        arrived in.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $ReportData
+    )
+    if ($null -eq $ReportData) { return $null }
+    ConvertTo-mdiRecordObject -Value $ReportData.ForestDiscovery
+}
+
+function Test-mdiForestEnumerationIncomplete {
+    <#
+        Whether forest discovery states that it did NOT finish. THE definition, in one place.
+
+        Three surfaces decide this independently - the score (Get-mdiReportStatistics), the findings
+        table (Get-mdiIssueList) and the verdict (Test-mdiReadinessResult) - and the issue list's own
+        comment says the conditions "mirror Test-mdiReadinessResult exactly so the two cannot
+        diverge". They were three copies of one rule, and all three asked the question through
+        $ReportData.ForestDiscovery.PSObject.Properties['Complete'].
+
+        PSObject.Properties over an IDictionary enumerates the DICTIONARY'S OWN .NET MEMBERS and
+        never its entries, so on a dictionary-shaped ForestDiscovery the presence test answers $null,
+        the guard is skipped, and the verdict keeps its DEFAULT of complete. A run that could not
+        enumerate the forest - and says so in its own Error field - was therefore certified as having
+        enumerated it. Measured on the shipped functions, one healthy two-domain cross-forest estate
+        whose every check passes, with Complete = $false and nothing differing but the record's shape:
+
+            ForestDiscovery shape   verdict     unread   findings naming the forest
+            PSCustomObject          NOT READY   1        1
+            Hashtable               READY       0        0
+            OrderedDictionary       READY       0        0
+            Generic.Dictionary      READY       0        0
+
+        So all three surfaces went silent at once and the run came back READY. Every unreadable
+        Complete the object column correctly refuses - $null, '', 'Unknown', 0, 1, 'no' - also
+        returned READY with no finding once the record was dictionary-shaped.
+
+        This is the false green this guard exists to prevent, in the words of Get-mdiForestDomain
+        itself: "A -Forest run that quietly examined one domain out of five and then reported READY
+        is a false green over four domains nobody looked at." A cross-forest estate is where the
+        shape stops being hypothetical - -MultiForest reaches a second forest, and a cross-forest
+        report is the one most likely to be round-tripped through -AsJson, handed between tools or
+        hand-edited, which is the arrival vector ConvertTo-mdiRecordObject exists for.
+
+        ABSENCE is not incompleteness: a report written before the property existed carries no
+        Complete at all, and charging it would invent a gap on every historical baseline. Only a
+        Complete that is PRESENT and does not normalise to $true counts.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $ReportData
+    )
+    $discovery = Get-mdiForestDiscoveryRecord -ReportData $ReportData
+    if ($null -eq $discovery) { return $false }
+    if ($null -eq $discovery.PSObject.Properties['Complete']) { return $false }
+    (ConvertTo-mdiBoolean $discovery.Complete) -ne $true
 }
 
 function Get-mdiReportStatistics {
@@ -14518,9 +14707,7 @@ function Get-mdiReportStatistics {
     # beside a High finding saying the forest domains could not be enumerated and a NOT READY verdict.
     # Charged one unread, the same treatment an unexamined domain and an unreachable server already
     # get, and for the same reason: not looked at is not passed.
-    if ($null -ne $ReportData.ForestDiscovery -and
-        $null -ne $ReportData.ForestDiscovery.PSObject.Properties['Complete'] -and
-        (ConvertTo-mdiBoolean $ReportData.ForestDiscovery.Complete) -ne $true) {
+    if (Test-mdiForestEnumerationIncomplete -ReportData $ReportData) {
         $serverScores = @($serverScores) + @([PSCustomObject]@{
                 FQDN   = 'Forest not fully enumerated'
                 Passed = 0
@@ -15238,18 +15425,21 @@ function Get-mdiIssueList {
         # A -Forest run that fell back to a single domain examined none of the others. A Complete value
         # that is not a measurement at all is treated the same way: it does not prove enumeration
         # finished, and the verdict no longer accepts it either.
-        if ($null -ne $ReportData.ForestDiscovery -and
-            $null -ne $ReportData.ForestDiscovery.PSObject.Properties['Complete'] -and
-            (ConvertTo-mdiBoolean $ReportData.ForestDiscovery.Complete) -ne $true) {
-            $reason = if ([string]::IsNullOrWhiteSpace([string] $ReportData.ForestDiscovery.Error)) {
+        if (Test-mdiForestEnumerationIncomplete -ReportData $ReportData) {
+            # Read from the NORMALISED record for the same reason the predicate above normalises: on a
+            # dictionary-shaped record the presence tests below answer $null, so the finding would name
+            # no scope and give no reason even once the guard itself fired.
+            $discovery = Get-mdiForestDiscoveryRecord -ReportData $ReportData
+            $reason = if ([string]::IsNullOrWhiteSpace([string] $discovery.Error)) {
                 'forest discovery did not report whether it completed'
-            } else { [string] $ReportData.ForestDiscovery.Error }
-            $scopeDomains = if ($null -ne $ReportData.PSObject.Properties['DomainsInScope']) {
-                @($ReportData.DomainsInScope)
-            } elseif ($null -ne $ReportData.ForestDiscovery.PSObject.Properties['Domains']) {
-                @($ReportData.ForestDiscovery.Domains)
-            } elseif ($null -ne $ReportData.PSObject.Properties['Domain']) {
-                @($ReportData.Domain)
+            } else { [string] $discovery.Error }
+            $reportRecord = ConvertTo-mdiRecordObject -Value $ReportData
+            $scopeDomains = if ($null -ne $reportRecord.PSObject.Properties['DomainsInScope']) {
+                @($reportRecord.DomainsInScope)
+            } elseif ($null -ne $discovery.PSObject.Properties['Domains']) {
+                @($discovery.Domains)
+            } elseif ($null -ne $reportRecord.PSObject.Properties['Domain']) {
+                @($reportRecord.Domain)
             } else { @() }
             $scopeDomainNames = @(
                 $scopeDomains |
@@ -16496,9 +16686,25 @@ function Get-mdiCapacityHtml {
     # rolling 15-minute average" directly above a row reading "Missing core data - Unable to read the
     # processor information over WMI". A claim about a measurement, over the row saying it never
     # happened. Reachable from any -CapacityPlanning run where WMI to a domain controller fails.
-    $sampled = @($servers | Where-Object { $_.Details.CapacityDetails.FullBusyWindow -is [bool] })
-    $notSampled = @($servers | Where-Object { $_.Details.CapacityDetails.FullBusyWindow -isnot [bool] })
-    $partial = @($sampled | Where-Object { $_.Details.CapacityDetails.FullBusyWindow -eq $false })
+    # ConvertTo-mdiBoolean, not `-is [bool]`. This split decides which HEADLINE governs every number
+    # in the table, and reading the raw value made it disagree with the ROW rendered from the same
+    # field forty lines below - which coerces, so it already treated the STRING 'False' as a partial
+    # sample. Measured on the shipped function, one fully populated capacity block, FullBusyWindow
+    # replaced one shape at a time:
+    #
+    #   $false     headline "Estimate only"          row "Yes (estimate) / 900 s, partial"
+    #   'False'    headline "could not be sampled"   row "Yes (estimate) / 900 s, partial"
+    #   'True'     headline "could not be sampled"   row "Yes / 900 s"
+    #
+    # So a server that WAS sampled, and whose own row shows a full set of measurements, was announced
+    # as one whose capacity could not be read - and worse, the "Estimate only - this is not a formal
+    # sizing" caveat, which governs how every figure below must be read, was replaced by a claim that
+    # there were no figures. The two halves of one page contradicted each other on the same field.
+    # ConvertTo-mdiBoolean is the normaliser the rest of this script already uses for exactly this,
+    # and it refuses 0, '' and 'N/A' as booleans, so an unreadable value still lands in notSampled.
+    $sampled = @($servers | Where-Object { $null -ne (ConvertTo-mdiBoolean $_.Details.CapacityDetails.FullBusyWindow) })
+    $notSampled = @($servers | Where-Object { $null -eq (ConvertTo-mdiBoolean $_.Details.CapacityDetails.FullBusyWindow) })
+    $partial = @($sampled | Where-Object { (ConvertTo-mdiBoolean $_.Details.CapacityDetails.FullBusyWindow) -eq $false })
     # The two facts are INDEPENDENT and both get said. Making them mutually exclusive branches meant
     # one genuinely short-sampled server suppressed the disclosure for every server that could not be
     # sampled at all: the tab printed only "This run sampled only 5 second(s) per server" - a claim
@@ -16508,7 +16714,8 @@ function Get-mdiCapacityHtml {
     if ($partial.Count -gt 0) {
         # Drawn from the SAMPLED servers only. Taken across all of them it read the maximum of a set
         # containing servers with no SampleSeconds at all.
-        $seconds = [int] (@($sampled.Details.CapacityDetails.SampleSeconds) | Measure-Object -Maximum).Maximum
+        $seconds = [int] (@($sampled | ForEach-Object { ConvertTo-mdiMeasuredNumber -Value $_.Details.CapacityDetails.SampleSeconds } |
+                    Where-Object { $null -ne $_ }) | Measure-Object -Maximum).Maximum
         # The whole concatenation is parenthesised before -f: the format operator binds tighter than +,
         # so without the parentheses only the last fragment would be formatted and every placeholder in
         # the earlier fragments would render literally as {0}, {1} and so on.
@@ -16555,12 +16762,35 @@ function Get-mdiCapacityHtml {
         $c = $srv.Details.CapacityDetails
         $status = [string] $c.Status
 
-        if ($null -eq $c.BusyPacketsPerSec) {
+        # Every figure in this row is read through ConvertTo-mdiMeasuredNumber before it is cast, and
+        # the row falls back to the "n/a" line the moment the headline measurement cannot be read.
+        #
+        # The guard used to be `$null -eq $c.BusyPacketsPerSec` alone, and $null is not the only shape
+        # an unread figure takes. Measured on this function with one otherwise complete capacity block:
+        # '' printed a busy rate of 0 and $true printed 1 - a hard number under a green "Yes" verdict
+        # for a server whose traffic was never read - while 'N/A', 'unknown' and whitespace threw
+        # "Cannot convert value ... to type System.Int64" and destroyed the WHOLE capacity tab, and
+        # with it the report, over one field on one server of an estate.
+        $busy = ConvertTo-mdiMeasuredNumber -Value $c.BusyPacketsPerSec
+        if ($null -eq $busy) {
             [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="grey">{1}</td><td class="grey" colspan="9">n/a</td><td class="left">{2}</td></tr>' -f
                     (ConvertTo-mdiHtmlEncoded ([string] $srv.FQDN)), (ConvertTo-mdiHtmlEncoded $status),
                     (ConvertTo-mdiHtmlEncoded ([string] $c.Detail))))
             continue
         }
+        $average = ConvertTo-mdiMeasuredNumber -Value $c.AveragePacketsPerSec
+        $peak = ConvertTo-mdiMeasuredNumber -Value $c.PeakPacketsPerSec
+        $sampleSeconds = ConvertTo-mdiMeasuredNumber -Value $c.SampleSeconds
+        $physicalCores = ConvertTo-mdiMeasuredNumber -Value $c.PhysicalCores
+        $requiredCpu = ConvertTo-mdiMeasuredNumber -Value $c.RequiredCpu
+        $requiredRamGb = ConvertTo-mdiMeasuredNumber -Value $c.RequiredRamGb
+        $totalRamGb = ConvertTo-mdiMeasuredNumber -Value $c.TotalRamGb
+        $avgCpuPercent = ConvertTo-mdiMeasuredNumber -Value $c.AvgCpuPercent
+        $maxCpuPercent = ConvertTo-mdiMeasuredNumber -Value $c.MaxCpuPercent
+        $minAvailableRamGb = ConvertTo-mdiMeasuredNumber -Value $c.MinAvailableRamGb
+        # 'n/a' rather than 0 for a figure that is genuinely absent, which is the distinction the whole
+        # of this tool turns on: 0 packets/sec and 0 cores are claims, and nobody made them.
+        $na = 'n/a'
 
         $class = switch -Wildcard ($status) {
             'Yes' { 'green' }
@@ -16571,10 +16801,14 @@ function Get-mdiCapacityHtml {
         }
         # A verdict from a sample shorter than the busy window is provisional, so it is never shown
         # in plain green: that would imply more confidence than the measurement supports.
-        $sampleText = '{0} s' -f [int] $c.SampleSeconds
+        # ConvertTo-mdiBoolean here for the reason the $sampled/$partial split above states - this
+        # line and that one must read one field the same way, or the headline and the row contradict
+        # each other. It coerced before, which happened to answer the string 'False' correctly and
+        # the number 0 wrongly.
+        $sampleText = if ($null -eq $sampleSeconds) { $na } else { '{0} s' -f [int] $sampleSeconds }
         $sampleClass = 'mono'
-        if ($c.FullBusyWindow -eq $false) {
-            $sampleText = '{0} s, partial' -f [int] $c.SampleSeconds
+        if ((ConvertTo-mdiBoolean $c.FullBusyWindow) -eq $false) {
+            $sampleText = if ($null -eq $sampleSeconds) { 'partial' } else { '{0} s, partial' -f [int] $sampleSeconds }
             $sampleClass = 'mono amber'
             if ($class -eq 'green') { $class = 'amber' }
             $status = $status + ' (estimate)'
@@ -16582,32 +16816,40 @@ function Get-mdiCapacityHtml {
 
         # On a short sample the automatic spike test is inert, so the ratio is surfaced instead.
         $peakClass = 'mono'
-        $peakText = [string][long] $c.PeakPacketsPerSec
-        if ([long] $c.AveragePacketsPerSec -gt 0) {
-            $ratio = [double] $c.PeakPacketsPerSec / [double] $c.AveragePacketsPerSec
+        $peakText = if ($null -eq $peak) { $na } else { [string][long] $peak }
+        if ($null -ne $peak -and $null -ne $average -and $average -gt 0) {
+            $ratio = $peak / $average
             if ($ratio -ge $capacity.SpikeRatio) {
                 $peakClass = 'mono amber'
-                $peakText = '{0} ({1}x avg)' -f [long] $c.PeakPacketsPerSec, (ConvertTo-mdiSvgNumber ([math]::Round($ratio, 1)))
+                $peakText = '{0} ({1}x avg)' -f [long] $peak, (ConvertTo-mdiSvgNumber ([math]::Round($ratio, 1)))
             }
         }
 
-        $cores = '{0} core(s){1}' -f [int] $c.PhysicalCores, $(if ($c.HyperThreaded) { ' *' } else { '' })
-        $cpuUsed = if ($null -ne $c.AvgCpuPercent) { '{0}% avg / {1}% max' -f [int] $c.AvgCpuPercent, [int] $c.MaxCpuPercent } else { 'n/a' }
-        $ramFree = if ($null -ne $c.MinAvailableRamGb) { '{0} GB min' -f (ConvertTo-mdiSvgNumber ([double] $c.MinAvailableRamGb)) } else { 'n/a' }
+        $cores = if ($null -eq $physicalCores) { $na } else {
+            '{0} core(s){1}' -f [int] $physicalCores, $(if ((ConvertTo-mdiBoolean $c.HyperThreaded) -eq $true) { ' *' } else { '' })
+        }
+        $cpuUsed = if ($null -ne $avgCpuPercent -and $null -ne $maxCpuPercent) { '{0}% avg / {1}% max' -f [int] $avgCpuPercent, [int] $maxCpuPercent } else { $na }
+        $ramFree = if ($null -ne $minAvailableRamGb) { '{0} GB min' -f (ConvertTo-mdiSvgNumber $minAvailableRamGb) } else { $na }
         [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="{1}">{2}</td><td class="{3}">{4}</td><td class="mono">{5}</td><td class="mono">{6}</td><td class="{7}">{8}</td><td class="mono">{9}</td><td class="mono">{10} core / {11} GB</td><td class="mono">{12} / {13} GB</td><td class="mono">{14}</td><td class="mono">{15}</td><td class="left">{16}</td></tr>' -f
                 (ConvertTo-mdiHtmlEncoded ([string] $srv.FQDN)), $class, (ConvertTo-mdiHtmlEncoded $status),
                 $sampleClass, (ConvertTo-mdiHtmlEncoded $sampleText),
-                [long] $c.BusyPacketsPerSec, [long] $c.AveragePacketsPerSec,
+                [long] $busy, $(if ($null -eq $average) { $na } else { [string][long] $average }),
                 $peakClass, (ConvertTo-mdiHtmlEncoded $peakText),
                 (ConvertTo-mdiHtmlEncoded ([string] $c.Band)),
-                (ConvertTo-mdiSvgNumber ([double] $c.RequiredCpu)), (ConvertTo-mdiSvgNumber ([double] $c.RequiredRamGb)),
-                (ConvertTo-mdiHtmlEncoded $cores), (ConvertTo-mdiSvgNumber ([double] $c.TotalRamGb)),
+                $(if ($null -eq $requiredCpu) { $na } else { ConvertTo-mdiSvgNumber $requiredCpu }),
+                $(if ($null -eq $requiredRamGb) { $na } else { ConvertTo-mdiSvgNumber $requiredRamGb }),
+                (ConvertTo-mdiHtmlEncoded $cores),
+                $(if ($null -eq $totalRamGb) { $na } else { ConvertTo-mdiSvgNumber $totalRamGb }),
                 (ConvertTo-mdiHtmlEncoded $cpuUsed), (ConvertTo-mdiHtmlEncoded $ramFree),
                 (ConvertTo-mdiHtmlEncoded ([string] $c.Detail))))
     }
     [void] $lines.Add('</table></div>')
 
-    if (@($servers | Where-Object { $_.Details.CapacityDetails.HyperThreaded }).Count -gt 0) {
+    # ConvertTo-mdiBoolean, so the footnote and the ' *' marker beside the core count are decided by
+    # the same rule. Read raw, EVERY non-empty string is truthy: a server whose HyperThreaded arrived
+    # as the string 'False' - or as 'N/A' - printed the "Hyper-threading is enabled" footnote for an
+    # estate where nothing said so.
+    if (@($servers | Where-Object { (ConvertTo-mdiBoolean $_.Details.CapacityDetails.HyperThreaded) -eq $true }).Count -gt 0) {
         [void] $lines.Add('<p class="muted">* Hyper-threading is enabled. The published sizing figures exclude hyper-threaded cores, and Microsoft recommends not relying on them because they can cause sensor health issues. Only physical cores are counted above.</p>')
     }
 
@@ -16663,18 +16905,57 @@ function Get-mdiRequiredPortsHtml {
     # land in and disappeared from the headline matrix altogether - and a blocked REQUIRED port that
     # nobody can see is worse than one shown in the wrong order. Known ids keep their shipped order so
     # the table reads the same as before; anything left over is appended rather than dropped.
+    #
+    # Read with ForEach-Object, NOT `Select-Object -ExpandProperty Id`. -ExpandProperty over a record
+    # that has no such property at all raises ExpandPropertyNotFound - a non-terminating error under
+    # the default preference, a TERMINATING one under $ErrorActionPreference = 'Stop', which is what
+    # the generated remediation script and any caller that sets it run under. Measured on the shipped
+    # function with one otherwise complete LDAPS record built by Get-mdiPortResultRecord from a
+    # dictionary-shaped result carrying no 'Id' key:
+    #
+    #   Get-mdiRequiredPortsHtml   THREW  'Property "Id" cannot be found.'
+    #
+    # so a SINGLE record missing one key destroyed the ENTIRE network ports table. Every other absent
+    # key on the same record - Name, Protocol, Port, Scope, Detail, Target, TargetIP - is absorbed and
+    # the table renders, which is what proves this is the read and not the record. A record with no Id
+    # is not a record with no measurement: it can carry a REQUIRED port measured as refused, and it
+    # must land in a row rather than take the table down. Member enumeration yields $null for the
+    # absent property, so such records group under the null id and are described from the record
+    # itself by the orphan branch below.
+    #
+    # An unreadable id keys as a STATED MARKER rather than as $null. `Select-Object -Unique` DROPS a
+    # null from the pipeline - measured - so keying such a record as $null would have traded the
+    # crash for SILENT LOSS: the record, which can carry a REQUIRED port measured as refused, would
+    # have contributed no id, matched no row and vanished from the table with nothing said. A loud
+    # failure replaced by a quiet one is not a fix. The marker cannot collide with a shipped id, and
+    # the grouping predicate below reduces both sides to the same key so the two cannot disagree.
     $knownProbeId = @($settings.RequiredPorts.Id)
-    $recordProbeId = @($records | Select-Object -ExpandProperty Id -Unique)
+    $unidentifiedProbeId = '(unidentified probe)'
+    $recordProbeId = @($records | ForEach-Object {
+            $recordId = [string] $_.Id
+            if ([string]::IsNullOrWhiteSpace($recordId)) { $unidentifiedProbeId } else { $recordId }
+        } | Select-Object -Unique)
     $orphanProbeId = @($recordProbeId | Where-Object { $_ -notin $knownProbeId })
     foreach ($probeId in @($knownProbeId + $orphanProbeId)) {
-        $probeRecords = @($records | Where-Object { $_.Id -eq $probeId })
+        $probeRecords = @($records | Where-Object {
+                $recordId = [string] $_.Id
+                if ([string]::IsNullOrWhiteSpace($recordId)) { $probeId -eq $unidentifiedProbeId } else { $recordId -eq $probeId }
+            })
         if ($probeRecords.Count -eq 0) { continue }
         # An orphan has no shipped definition, so its description is rebuilt from the record itself.
         $probe = @($settings.RequiredPorts | Where-Object { $_.Id -eq $probeId })[0]
         if ($null -eq $probe) {
+            # The heading falls back to the probe id, and then to a STATED marker. A record that
+            # carries no Id property has no id to fall back to, so the heading came out as the empty
+            # string and the row - which can hold a REQUIRED port measured as refused - appeared in
+            # the table with no name at all. An unidentifiable probe must say so rather than render
+            # blank; a blank heading reads as a rendering glitch and is scrolled past.
+            $orphanName = [string] $probeRecords[0].Name
+            if ([string]::IsNullOrWhiteSpace($orphanName)) { $orphanName = [string] $probeId }
+            if ([string]::IsNullOrWhiteSpace($orphanName)) { $orphanName = 'Unidentified probe' }
             $probe = [PSCustomObject]@{
                 Notes    = 'This probe has no entry in the shipped port list; the details below come from the scan result itself.'
-                Name     = $(if ([string]::IsNullOrWhiteSpace([string] $probeRecords[0].Name)) { [string] $probeId } else { [string] $probeRecords[0].Name })
+                Name     = $orphanName
                 Protocol = [string] $probeRecords[0].Protocol
                 Port     = [string] $probeRecords[0].Port
                 Scope    = [string] $probeRecords[0].Scope
@@ -16817,7 +17098,24 @@ function Get-mdiRequiredPortsHtml {
         # is labelled Unknown. Without that filter a record carrying 636 or True - which an -AsJson
         # round trip, a hand-edited report or another tool can produce - was printed verbatim as the
         # requirement of the row.
-        $rankedRequirement = @($probeRecords | Select-Object -ExpandProperty Requirement |
+        #
+        # Read with ForEach-Object, NOT `Select-Object -ExpandProperty Requirement`, for the reason
+        # the Id read above states: -ExpandProperty over a record that HAS NO SUCH PROPERTY raises
+        # ExpandPropertyNotFound, and a record whose Requirement key was never written is precisely
+        # what a cross-forest report assembled from another tool's JSON, an older version or a hand
+        # edit hands back. Measured on the shipped function, one LDAPS record built by
+        # Get-mdiPortResultRecord from a dictionary-shaped result with no 'Requirement' key:
+        #
+        #   $ErrorActionPreference = 'Continue'   an error record printed mid-report, row rendered
+        #   $ErrorActionPreference = 'Stop'       THREW 'Property "Requirement" cannot be found.'
+        #
+        # The whole network ports table was lost to one absent key. The cell colour six lines above
+        # reads $failed.Requirement - member enumeration - and absorbs the same record silently, so
+        # the two readers of one field disagreed about how it is read; this is the sibling brought
+        # into line. Every UNREADABLE value ($null, '', whitespace, 636, 'Required.', $true) already
+        # ranks 0 and is filtered out here, and an ABSENT property must be treated the same way: as
+        # nothing read, never as a measurement, and never as a reason to lose the table.
+        $rankedRequirement = @($probeRecords | ForEach-Object { $_.Requirement } |
                 Where-Object { (Get-mdiRequirementRank -Requirement $_) -gt 0 } |
                 Sort-Object -Property @{ Expression = { Get-mdiRequirementRank -Requirement $_ } } -Descending)
         $requirement = if ($rankedRequirement.Count -gt 0) {
@@ -17091,7 +17389,34 @@ function Get-mdiSensorV3Html {
     foreach ($checkName in $checkNames) {
         $requirement = $null
         $cells = foreach ($srv in $servers) {
-            $check = @($srv.Details.SensorV3ReadyDetails.Checks | Where-Object { $_.Name -eq $checkName })[0]
+            # Normalised because the classification below asks PSObject.Properties whether this row
+            # carries a Measured flag - and over an IDictionary that enumerates the DICTIONARY'S OWN
+            # .NET MEMBERS instead of its entries, so the flag cannot be found and the "Not tested"
+            # arm never fires. The comment forty lines down states where these rows come from: they
+            # are "read back across the same base64/JSON boundary that already delivers 'Required.'
+            # and the number 636 on this field", and another tool's JSON handling, an -AsJson round
+            # trip or a hand-edited report all hand a Checks row back as a hashtable.
+            #
+            # The cell then falls through to the arms below, which read the STATUS of a check that was
+            # never run. Measured on the shipped function, one v3.x prerequisite with Measured = $false
+            # and nothing differing but the row's shape:
+            #
+            #   Status $false   PSCustomObject  muted "Not tested"   Hashtable/Ordered/Generic  RED "Fail"
+            #   Status 'N/A'    PSCustomObject  muted "Not tested"   Hashtable/Ordered/Generic  grey "N/A"
+            #
+            # Red reads as "measured and failed". This file already names that the most expensive
+            # wrong answer it can give, on the ports matrix, for exactly this reason: it sends an
+            # operator to fix a prerequisite on a server where the check never ran - here, typically
+            # because the sensor API could not be reached at all. Every unreadable Measured the object
+            # column correctly holds back - $null, '', 'Unknown', 'False', 0 - painted red as well
+            # once the row was dictionary-shaped.
+            #
+            # -MultiForest is what puts real traffic on this path: a cross-forest estate is assembled
+            # from a second forest's results, and that is the report most likely to arrive as a
+            # dictionary. Rows already object-shaped are returned unchanged.
+            $check = ConvertTo-mdiRecordObject -Value (
+                @($srv.Details.SensorV3ReadyDetails.Checks | Where-Object { $_.Name -eq $checkName })[0]
+            )
             if ($null -eq $check) {
                 '<td class="grey">N/A</td>'
             } else {
@@ -17783,7 +18108,31 @@ function Set-MdiReadinessReport {
 
     $convertServerTable = {
         param($Servers, $SkippedMessage, $EmptyMessage)
-        $serverList = @($Servers | Where-Object { $_ })
+        # Normalised on the way in, because the cells below are filled from
+        # $srv.PSObject.Properties[$p] - and over an IDictionary that enumerates the DICTIONARY'S OWN
+        # .NET MEMBERS instead of its entries, so every DESCRIPTIVE column comes back $null. The check
+        # columns survive on their own (Get-mdiEffectiveCheckProperty and Get-mdiUnreadCheckName both
+        # normalise already); the facts that were read successfully do not.
+        #
+        # Measured end to end on the shipped function, one cross-forest domain controller written both
+        # ways, counting how often each fact reaches the generated HTML:
+        #
+        #     row shape         FQDN   SensorVersion   CapturingComponent   MachineType
+        #     PSCustomObject     3          1                 2                  1
+        #     Hashtable          2          0                 1                  0
+        #     OrderedDictionary  2          0                 1                  0
+        #     Generic.Dictionary 2          0                 1                  0
+        #
+        # So the inventory row lost the host's NAME as well as the sensor version, the capture driver
+        # and the platform - the same straightforward data loss the comment below already names ("an
+        # estate where every check failed to read lost the facts that had been read successfully"),
+        # arriving through the row's shape instead of through the branch. A -MultiForest run is where
+        # that shape stops being hypothetical: a second forest's results are assembled from another
+        # tool's JSON or an -AsJson round trip, and either hands the rows back as dictionaries.
+        #
+        # Normalising here also makes the Sort-Object below and the column discovery agree with the
+        # cells, since all three then read the same object.
+        $serverList = @($Servers | Where-Object { $_ } | ForEach-Object { ConvertTo-mdiRecordObject -Value $_ })
         if ($serverList.Count -gt 0) {
             # Collected from the objects rather than through Get-Member, which throws on an empty pipeline,
             # and which only saw properties present on the first object.
@@ -18689,6 +19038,21 @@ function Test-mdiDomainCheckNotAsserted {
         [Parameter(Mandatory = $false)] [AllowNull()] [object] $Result
     )
 
+    # Normalised before the presence test, for the reason ConvertTo-mdiRecordObject states:
+    # PSObject.Properties over an IDictionary enumerates the DICTIONARY'S OWN .NET MEMBERS - Count,
+    # Keys, Values, IsReadOnly - and never its entries, so a result written as a dictionary answers
+    # $null here and falls back to the absent-means-false default. The DEFAULT invocation is the one
+    # that suffers: without -DirectoryServiceAccount the Deleted Objects check returns 'N/A' with
+    # NotAsserted = $true, so on a dictionary-shaped result a question NOBODY ASKED became a
+    # measurement gap again. Measured on the shipped functions, one HEALTHY cross-forest domain whose
+    # every other check passes, with nothing differing but the result's shape:
+    #
+    #     PSCustomObject   READY       0 unread   0 findings
+    #     Hashtable        NOT READY   1 unread   1 finding
+    #     OrderedDictionary/Generic.Dictionary   the same as Hashtable
+    #
+    # The direct read $Result.NotAsserted already worked on every shape; only the guard did not.
+    $Result = ConvertTo-mdiRecordObject -Value $Result
     if ($null -eq $Result) { return $false }
     if ($null -eq $Result.PSObject.Properties['NotAsserted']) { return $false }
     (ConvertTo-mdiBoolean $Result.NotAsserted) -eq $true
@@ -18889,11 +19253,7 @@ function Test-mdiReadinessResult {
     # Normalised rather than compared against the literal 'False'. A Complete property carrying $null,
     # '', 0, 1 or 'Unknown' is not a statement that discovery finished - it is the absence of one - and
     # every one of those returned READY with no issue raised.
-    $forestComplete = $true
-    if ($null -ne $ReportData.ForestDiscovery -and
-        $null -ne $ReportData.ForestDiscovery.PSObject.Properties['Complete']) {
-        $forestComplete = (ConvertTo-mdiBoolean $ReportData.ForestDiscovery.Complete) -eq $true
-    }
+    $forestComplete = -not (Test-mdiForestEnumerationIncomplete -ReportData $ReportData)
 
     # A server that was reached and then failed part way through is not a server that passed. Its
     # remaining checks were never run, so they are absent rather than false, and on a small estate the
