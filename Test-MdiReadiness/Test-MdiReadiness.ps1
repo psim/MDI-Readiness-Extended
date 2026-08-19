@@ -13891,6 +13891,76 @@ function Get-mdiServerIdentityKey {
     # ConvertTo-mdiCanonicalComputerName owns the trimming, case, address and short-name rules above.
 }
 
+function Get-mdiProbeRecordTargetKey {
+    <#
+        The one spelling-independent name for the HOST A PROBE RECORD NAMES - the counterpart of
+        Get-mdiServerIdentityKey, which answers the same question about a SERVER ROW.
+
+        Both counts in the sampling disclosure have to be measured with one ruler, because the
+        disclosure is the RATIO between them (Get-mdiReportStatistics, and the two consumers that
+        gate on `$portScope -gt $portProbed`):
+
+            PortCandidateHostCount   how many hosts the probes could have visited   <- denominator
+            PortDistinctTargetCount  how many hosts they actually visited           <- numerator
+
+        The header of Get-mdiServerIdentityKey above records that this exact pair was already
+        measured wrong once, when BOTH sides de-duplicated the raw FQDN string with
+        Select-Object -Unique. The denominator was then routed through Get-mdiServerIdentityKey and
+        the numerator was left as it was, so the halves of one ratio came to be counted by two
+        different rules - and the error simply changed direction. Select-Object -Unique is ORDINAL:
+        it separates 'dcfab01.fabrikam.local' from 'DCFAB01.FABRIKAM.LOCAL' and from the same name
+        written absolutely with its trailing dot, all of which the denominator now merges.
+
+        Measured on the shipped functions, a seven-controller estate over three sites and two
+        forests in which the plan probed FOUR of the seven, spelled as a real run spells them - a
+        multi-homed controller recording a name and an address, a disjoint-NetBIOS forest recording
+        the directory casing and the DNS answer:
+
+            same 4 hosts, canonical spelling   PortCandidateHostCount=7 PortDistinctTargetCount=4
+                                               -> "ports 4 of 7 host(s), raise -MaxLdapTargetsPerDomain"
+            same 4 hosts, spelled twice each   PortCandidateHostCount=7 PortDistinctTargetCount=8
+                                               -> NOTHING SAID ON ANY SURFACE
+
+        So three domain controllers that were never probed - one of them the only controller in an
+        AD site - were reported as a fully probed estate, on the ports card, in the console verdict
+        and in the run summary. A cross-site firewall is precisely the fault this tool exists to
+        find, and it is found only if the unprobed controller is either probed or disclosed.
+
+        The numerator ALSO has to refuse a target nobody could read, for the reason the whole
+        codebase keeps restating: [string] tests the RENDERING, not the value. A record whose Target
+        was a hashtable, a boolean or a bare int rendered non-blank and counted as a host that had
+        been probed, which is the same fabrication in the numerator that Get-mdiUnexaminedDomain
+        carried in its coverage test. Routed through ConvertTo-mdiReadableDomainName, the codebase's
+        single definition of "did anybody actually read this value", so an unreadable Target falls
+        through to TargetIP and an unreadable pair keys as the empty string and is dropped - a probe
+        that measured nothing cannot come back looking like a probe that measured something.
+
+        Returns the empty string when there is no usable name, which the callers discard.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Record
+    )
+
+    if ($null -eq $Record) { return '' }
+
+    # Target first and TargetIP only as a fallback, which is the order the counters have always
+    # used: a target recorded only as an address still counts once rather than being discarded.
+    $readable = ConvertTo-mdiReadableDomainName -Value $Record.Target
+    if ($null -eq $readable) { $readable = ConvertTo-mdiReadableDomainName -Value $Record.TargetIP }
+    if ($null -eq $readable) { return '' }
+
+    # -Domain '' deliberately. A probe record carries no domain of its own, and the denominator's
+    # short-name qualification uses the SERVER ROW's domain, which is not this record's to borrow.
+    # ConvertTo-mdiCanonicalComputerName appends nothing to a name that already carries a dot, so
+    # every fully qualified target - which is what a probe plan writes - keys identically on both
+    # sides of the ratio, and a dotless short name stays unqualified rather than being stamped with
+    # a domain nobody read.
+    $key = ConvertTo-mdiCanonicalComputerName -Value ([string] $readable) -Domain ''
+    if ([string]::IsNullOrWhiteSpace([string] $key)) { return '' }
+    return $key.ToLowerInvariant()
+}
+
 function Merge-mdiServerByFqdn {
     <#
         One row per physical server, carrying the union of every role's results.
@@ -15539,11 +15609,8 @@ function Get-mdiReportStatistics {
     # How many distinct HOSTS name resolution was probed against, regardless of how many sensors
     # probed each one. Identified by target name where there is one and by address otherwise, so a
     # target recorded only as an IP still counts once rather than being discarded.
-    $nnrDistinctTarget = @($nnrRecords | ForEach-Object {
-            $t = [string] $_.Target
-            if ([string]::IsNullOrWhiteSpace($t)) { $t = [string] $_.TargetIP }
-            $t
-        } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    $nnrDistinctTarget = @($nnrRecords | ForEach-Object { Get-mdiProbeRecordTargetKey -Record $_ } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
 
     # The same question the NNR card answers, asked of the ORDINARY port probes: was the estate
     # probed, or a sample of it? -MaxLdapTargetsPerDomain defaults to 2, so on any domain with more
@@ -15551,11 +15618,9 @@ function Get-mdiReportStatistics {
     # open 8/8, No required port blocked" with nothing saying so. That is the same illusion the NNR
     # card was corrected for: a green ratio over a fraction of the estate, on the surface an operator
     # reads first after an alert about blocked traffic.
-    $portDistinctTarget = @($portRecords | Where-Object { -not (Test-mdiProbeIsPrimaryNnr -Record $_) } | ForEach-Object {
-            $t = [string] $_.Target
-            if ([string]::IsNullOrWhiteSpace($t)) { $t = [string] $_.TargetIP }
-            $t
-        } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    $portDistinctTarget = @($portRecords | Where-Object { -not (Test-mdiProbeIsPrimaryNnr -Record $_) } |
+            ForEach-Object { Get-mdiProbeRecordTargetKey -Record $_ } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     # Drawn from the reachable domain controllers, which is the population the LDAP target list is
     # selected from. An unreachable DC is already reported as unreachable and must not also be counted
     # as a host the ports probe declined to visit, and a discovery placeholder is not a host at all.
