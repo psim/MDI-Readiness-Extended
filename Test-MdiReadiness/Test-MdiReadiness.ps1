@@ -8702,6 +8702,28 @@ function Get-mdiCheckProperty {
     param (
         [Parameter(Mandatory = $true)] [object] $Server
     )
+    # Normalised first, because PSObject.Properties over an IDictionary enumerates the DICTIONARY'S
+    # OWN .NET MEMBERS instead of its entries - and three of them (IsReadOnly, IsFixedSize,
+    # IsSynchronized) are real booleans, so the loop below accepted them as readiness checks. That is
+    # the same false red the name filter three lines down exists to stop (SiteName='False' reported as
+    # a "Site Name check" that does not exist), arriving through the boolean branch which has no such
+    # filter. Measured on the shipped function with one server written both ways:
+    #
+    #     PSCustomObject row   4 checks   isAdvancedAuditingOk=False isNtlmAuditingOk=True
+    #                                     isPowerSchemeOk=False      isSensorVersionOk=True
+    #     Hashtable row        3 checks   IsReadOnly=False IsFixedSize=False IsSynchronized=False
+    #
+    # So the SAME server lost every real check - including its two genuine FAILURES - and gained three
+    # that cannot exist. Through Get-mdiEffectiveCheckProperty that reaches the score, the issue list,
+    # the HTML matrix and the generated remediation script: measured end to end, the remediation an
+    # operator runs gained "[High] : Is Read Only check failed", "[High] : Is Fixed Size check failed"
+    # and "[High] : Is Synchronized check failed", and its manual-attention count went 1 to 4.
+    #
+    # ConvertTo-mdiRecordObject is the normaliser this script already uses for exactly this, on the
+    # port records, and its own comment names IsReadOnly among the members that get read instead of
+    # the entries. A dictionary row is not hypothetical here: another tool's JSON, a hand-edited
+    # report or an older version can hand one back, which is why that function exists at all.
+    $Server = ConvertTo-mdiRecordObject -Value $Server
     @(foreach ($prop in $Server.PSObject.Properties) {
             if ($prop.Name -in $script:mdiStatusFlag) { continue }
             if ($prop.Value -is [bool]) { $prop; continue }
@@ -13648,6 +13670,13 @@ function Get-mdiEffectiveCheckProperty {
     param (
         [Parameter(Mandatory = $true)] [object] $Server
     )
+
+    # The same normalisation Get-mdiCheckProperty applies, applied here too, because this function
+    # reads the summary through PSObject.Properties independently one block below. Without it a
+    # dictionary row's RequiredPorts summary was invisible - the property lookup found the
+    # dictionary's .NET members, not its entries - so the check the rest of this function exists to
+    # resolve was absent from a row that carried it.
+    $Server = ConvertTo-mdiRecordObject -Value $Server
 
     $pairs = New-Object -TypeName System.Collections.ArrayList
     foreach ($prop in (Get-mdiCheckProperty -Server $Server)) {
