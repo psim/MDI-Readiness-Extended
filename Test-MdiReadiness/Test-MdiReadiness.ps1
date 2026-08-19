@@ -3829,7 +3829,50 @@ function Resolve-mdiLdapTarget {
     # the guard belongs at the resolver because the probe cannot be the guard - Test-mdiTcpPort
     # against 127.0.0.1 answers Success=True / 'Connected', and on a domain controller 389/636/3268/3269
     # are all listening locally.
-    $representatives = @($DomainControllers | Where-Object { Test-mdiUsableComputerAddress -Value $_.IP } |
+    # ADMITTED ON ANY USABLE ADDRESS THE ROW CARRIES, AND PROJECTED ONTO THAT ADDRESS.
+    #
+    # Both filters below used to ask only Test-mdiUsableComputerAddress -Value $_.IP, while
+    # Get-mdiAddresslessDomainController - the OTHER reader of this same $dcInventory, one line away
+    # in Main - asks the question of @($_.Addresses) + @($_.IP). The two disagreed about what "has a
+    # usable address" means, and a row whose .IP was unusable while .Addresses held a usable one fell
+    # in the gap: excluded HERE for having no usable IP, and not reported there because it DID have a
+    # usable address. Measured on the shipped functions, one row
+    # Name=dcfab01.fabrikam.local IP=127.0.0.1 Addresses=@('127.0.0.1','10.10.1.50'):
+    #
+    #   Resolve-mdiLdapTarget                 0 targets
+    #   Get-mdiAddresslessDomainController    0 addressless
+    #
+    # The domain controller was in NEITHER list - never probed, never counted, and never reported as
+    # unreachable. That is strictly worse than the two disagreements this file has already fixed
+    # between these same two readers, which put a row in BOTH lists; a row in neither produces no
+    # record at all, and a fact with no record cannot be counted as missing by anything downstream.
+    # It is the outcome Get-mdiDomainControllerInventory calls "the most damaging outcome this tool
+    # has, because the report still reads as a complete scan of the estate".
+    #
+    # Stated no more strongly than it was measured, exactly as the sibling guards below are: today's
+    # producer, Get-mdiDomainControllerInventory, emits one row per USABLE address and assigns that
+    # address to .IP, so this is not a live false green in the shipped pipeline. It is a supplied
+    # inventory, an -AsJson round trip, another tool or a hand-edited report that reaches it - the
+    # same arrival vector every other guard in this function names.
+    #
+    # The expansion cannot change a shipped run: the rows it produces are de-duplicated by
+    # (identity, address) at the bottom of this function, which is the same pair the inventory
+    # already emits one row for. Measured on an unchanged three-controller estate at
+    # -MaxPerDomain 0, 1 and 2, and on a multi-homed pair: identical targets before and after.
+    $expanded = @(foreach ($dc in @($DomainControllers)) {
+            if ($null -eq $dc) { continue }
+            $usableAddresses = @(@($dc.Addresses) + @($dc.IP) | ForEach-Object {
+                    $canonical = ConvertTo-mdiCanonicalIPAddress -Value $_
+                    if ($null -ne $canonical -and (Test-mdiUsableComputerAddress -Value $canonical)) { $canonical }
+                } | Select-Object -Unique)
+            foreach ($address in $usableAddresses) {
+                $projected = $dc.PSObject.Copy()
+                $projected.IP = $address
+                $projected
+            }
+        })
+
+    $representatives = @($expanded | Where-Object { Test-mdiUsableComputerAddress -Value $_.IP } |
             Group-Object -Property { Get-mdiProbeTargetKey -Target $_ } |
             ForEach-Object { @($_.Group)[0] })
 
@@ -3876,7 +3919,7 @@ function Resolve-mdiLdapTarget {
     # readers of one inventory - a supplied inventory, an -AsJson round trip, another tool or a
     # hand-edited report reaches it - and the fix belongs on the key, where its two sibling fields
     # already are.
-    $targets = @($DomainControllers | Where-Object {
+    $targets = @($expanded | Where-Object {
                 (Test-mdiUsableComputerAddress -Value $_.IP) -and ($selectedKeys -contains (Get-mdiProbeTargetKey -Target $_))
             } |
             Group-Object -Property { Get-mdiProbeTargetKey -Target $_ }, {
