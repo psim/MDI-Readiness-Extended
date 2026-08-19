@@ -14583,7 +14583,12 @@ function Get-mdiUnexaminedDomain {
     # check. A domain in a second forest whose controllers were never contacted was reported as
     # examined on all three surfaces that share this definition.
     $examined = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    # ROWS, counted before the placeholder narrowing, because the escape hatch below asks whether the
+    # scan produced anything AT ALL - a question about the report, not about coverage. See the comment
+    # on $anyServerSeen for the measurement.
+    $rowsSeen = 0
     foreach ($srv in @($Server | Where-Object { $_ })) {
+        $rowsSeen++
         if (Test-mdiServerIsPlaceholder -Server $srv) { continue }
         $d = & $normalise $srv.Domain
         if (-not [string]::IsNullOrWhiteSpace($d)) { [void] $examined.Add($d) }
@@ -14604,7 +14609,38 @@ function Get-mdiUnexaminedDomain {
     # This is what distinguishes "nothing was found anywhere" (a different and more serious failure,
     # already reported as an empty scan) from "servers were found but not one of them was a domain
     # controller" - which is the case this function has to catch.
-    $anyServerSeen = $examined.Count -gt 0
+    #
+    # It counts ROWS. It used to read `$examined.Count -gt 0` - the number of distinct DOMAIN NAMES -
+    # which is the same mistake, one variable over, as the `if ($dcDomains.Count -gt 0)` guard
+    # directly below that was already removed for defeating the rule it was meant to protect. A row
+    # that named no domain is still a row the scan produced, so counting names made an estate the run
+    # HAD enumerated look like an estate it never reached, and the escape hatch then charged nothing.
+    #
+    # The shape that reaches it is the one the product emits ITSELF: the domain controller pass emits
+    # a DISCOVERY PLACEHOLDER for every directory record it could not name (Domain set, FQDN
+    # "Domain controller (not named) n of m", IsPlaceholder = $true), and Get-mdiCAReadiness and
+    # Get-mdiEntraConnectReadiness emit the same contract when their role cannot be enumerated. Those
+    # rows are excluded from $examined - correctly, and this function's header says why - so an estate
+    # in which EVERY row is one of them collected no names at all. An ordinary low-privilege
+    # cross-forest run reaches that: -Forest over mdilab.local + fabrikam.local where the domain
+    # controller records carry no dNSHostName and AD CS enumeration is denied.
+    #
+    # Measured on the shipped function, scope mdilab.local + fabrikam.local:
+    #
+    #   3 unnamed-record placeholders, no other row      unexamined: NONE      -> READY
+    #   the SAME 3 rows plus one reached CA              unexamined: BOTH      -> NOT READY
+    #   zero domain controllers, all rows placeholders   unexamined: NONE      -> READY
+    #   zero domain controllers, one reached CA          unexamined: BOTH      -> NOT READY
+    #
+    # So adding a healthy server to a broken estate made the verdict WORSE, and the completely broken
+    # estate got the best verdict of the four. All three disclosure surfaces are gated here at once -
+    # the 'Domain not examined' unread charge, the High Discovery issue and $domainsExamined - so a
+    # cross-forest run that named not one machine reported READY with no finding of any kind.
+    #
+    # Placeholders still contribute NOTHING to coverage; only the empty-scan test changed. A run that
+    # produced no rows whatever is still the empty scan this hatch exists for, and every estate with a
+    # named server behaves exactly as before.
+    $anyServerSeen = $rowsSeen -gt 0
     if ($null -ne $DomainControllerServer) {
         $dcDomains = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         foreach ($dc in @($DomainControllerServer | Where-Object { $_ })) {
