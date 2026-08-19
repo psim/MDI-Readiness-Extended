@@ -5441,6 +5441,42 @@ function Get-mdiMatchingTrustee {
     @(foreach ($item in $Trustee) {
             $candidate = [string] $item
             if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+            # A LEAF THAT NAMES NOBODY MATCHES NOBODY - tested HERE, above every branch below, because
+            # the identical-text branch is a branch too. The blank test above rejects a candidate that
+            # is $null, empty or whitespace; it does not reject a DOMAIN PREFIX WITH NO ACCOUNT.
+            # 'FABCORP\' is not whitespace, so it passes that test, and its leaf is the EMPTY STRING -
+            # as is the leaf of 'MDILAB\', 'fabrikam.local\', '@fabrikam.local', '\' and '@'.
+            #
+            # This rule used to sit further down, guarding only the name-comparison fallback, so it
+            # caught the WEAKER claim and missed the stronger one. Two strings that name nobody are
+            # never DIFFERENT text, and the identical-text branch below returns Confidence 'Verified' -
+            # which the caller at Get-mdiDeletedObjectsPermission treats as the account being satisfied
+            # and the check PASSING, where 'Ambiguous' would only have reported it unmeasured.
+            #
+            # Measured on the shipped matcher, the operator's account and the DACL trustee carrying the
+            # same truncated spelling, which is one shape read twice from one source:
+            #
+            #   -Account 'FABCORP\'        -Trustee @('FABCORP\')        -> FABCORP\ [Verified]
+            #   -Account 'MDILAB\'         -Trustee @('MDILAB\')         -> MDILAB\ [Verified]
+            #   -Account '@fabrikam.local' -Trustee @('@fabrikam.local') -> @fabrikam.local [Verified]
+            #   -Account '\'               -Trustee @('\')               -> \ [Verified]
+            #
+            # Six of six nobody-naming shapes verified, and the Deleted Objects permission check then
+            # reported the Directory Service Account correctly delegated when NO ACCOUNT WAS NAMED ON
+            # EITHER SIDE. That is the false green this whole function exists to prevent: the customer
+            # believes MDI can enumerate deleted objects when nothing was ever compared.
+            #
+            # The disjoint namespace is what makes the shape ordinary rather than contrived: FABCORP is
+            # the NetBIOS name of fabrikam.local and is not its first DNS label, so a truncated or
+            # half-parsed entry on the cross-forest side is a domain prefix with the account lost - and
+            # the caller's own comment records that the operator's side is built by hand from a config
+            # file or a CSV, where a trailing comma or an empty cell produces the same shape.
+            #
+            # A blank ACCOUNT leaf is refused for the same reason and in the same place: no trustee can
+            # be a match for a request that names nobody, whatever the trustee says.
+            $candidateLeaf = ($candidate -replace '^.*\\', '') -replace '@.*$', ''
+            if ([string]::IsNullOrWhiteSpace($candidateLeaf) -or [string]::IsNullOrWhiteSpace($accountLeaf)) { continue }
+
             # Identical text is the same principal whatever the resolver says.
             if ($candidate -eq $Account) {
                 [PSCustomObject]@{ Trustee = $candidate; Confidence = 'Verified' }
@@ -5458,33 +5494,9 @@ function Get-mdiMatchingTrustee {
                 continue
             }
 
-            # Ordinal, case-insensitive, and literal - no wildcard interpretation of either side.
-            $candidateLeaf = ($candidate -replace '^.*\\', '') -replace '@.*$', ''
-            # A LEAF THAT NAMES NOBODY MATCHES NOBODY. The blank test above rejects a candidate that is
-            # $null, empty or whitespace; it does not reject a DOMAIN PREFIX WITH NO ACCOUNT. 'FABCORP\'
-            # is not whitespace, so it passes that test, and its leaf is the EMPTY STRING - as is the
-            # leaf of 'MDILAB\', 'fabrikam.local\', '@fabrikam.local', '\' and '@'. Two empty leaves
-            # compare EQUAL, so a name identifying nobody was returned as a candidate for a DIFFERENT
-            # name that also identifies nobody. Measured on the shipped matcher:
-            #
-            #   -Account 'FABCORP\'        -Trustee @('MDILAB\')         -> MDILAB\ [Ambiguous]
-            #   -Account 'FABCORP\'        -Trustee @('CONTOSO\')        -> CONTOSO\ [Ambiguous]
-            #   -Account '@fabrikam.local' -Trustee @('@mdilab.local')   -> @mdilab.local [Ambiguous]
-            #
-            # and through the caller, Get-mdiDeletedObjectsPermission then told the operator "A trustee
-            # with the same account name was found ... Unconfirmed: CONTOSO\ (requested FABCORP\)" and
-            # sent them to dsacls to hunt a same-named trustee that does not exist, on a container whose
-            # DACL had been read perfectly well. No account name was found on either side. The honest
-            # branch already existed and is reached the moment a leaf is non-blank: 'FABCORP\' against
-            # 'FABCORP\svc-mdi' correctly reports that the account could not be resolved to a SID.
-            #
-            # This header says 'Ambiguous' appears only where the tool genuinely cannot tell. Matching
-            # FABCORP\ to CONTOSO\ is not a case of not being able to tell.
-            #
-            # The disjoint namespace is what makes the shape ordinary: FABCORP is the NetBIOS name of
-            # fabrikam.local and is not its first DNS label, so a truncated or half-parsed entry on the
-            # cross-forest side is a domain prefix with the account lost.
-            if ([string]::IsNullOrWhiteSpace($candidateLeaf) -or [string]::IsNullOrWhiteSpace($accountLeaf)) { continue }
+            # Ordinal, case-insensitive, and literal - no wildcard interpretation of either side. The
+            # leaves were reduced above, where the rule that a name identifying nobody matches nobody
+            # is applied to every branch rather than only to this one.
             if ([string]::Equals($candidateLeaf, $accountLeaf, [StringComparison]::OrdinalIgnoreCase)) {
                 [PSCustomObject]@{ Trustee = $candidate; Confidence = 'Ambiguous' }
             }
