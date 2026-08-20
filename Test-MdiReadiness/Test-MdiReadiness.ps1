@@ -3140,25 +3140,43 @@ function Get-mdiRequiredPorts {
     # A target with SOME measured methods is unaffected: AtLeastOne still fails it when every method
     # that RAN came back shut. Only a target with nothing measured at all leaves the list, because
     # there is no evidence to fail it on.
-    $nnrMeasuredProbes = @($nnrProbes | Where-Object { Test-mdiProbeWasMeasured -Record $_ })
+    # One ruler for "this record measured something that can be ATTRIBUTED to a target". A record
+    # whose Target AND TargetIP were both unreadable measured something about a host nobody can name,
+    # and a measurement that cannot be attributed can neither fail a target nor certify one. Before
+    # this, such a record was grouped by its RENDERING, which merged every unreadable target into one
+    # group with whichever readable-but-blank-rendering host sat beside it: measured on this function,
+    # a host that no NNR method resolved left the failure list on another host's NetBIOS answer and
+    # isRequiredPortsOk came back True with NnrFailedTargets empty.
+    $isAttributedMeasurement = {
+        param($Record)
+        (Test-mdiProbeWasMeasured -Record $Record) -and
+        -not [string]::IsNullOrEmpty((Get-mdiProbeRecordGroupKey -Record $Record))
+    }
+    $nnrMeasuredProbes = @($nnrProbes | Where-Object { & $isAttributedMeasurement $_ })
     # The other half of the guard, and the half that matters most. Excluding unmeasured NNR probes from
     # the failure list without ALSO recording that they were unmeasured turns the false red into the
     # "empty-scan false green" the mandatory comment above warns about in the same words: a target
     # whose every method went untested reports zero failed targets, and the verdict below certifies
     # the check. Measured while making this change: the first attempt fixed the red and produced
     # isRequiredPortsOk = True on a run where no NNR probe ran at all. A target with nothing measured
-    # is 'N/A' - not a failure and not a pass.
-    $nnrUnmeasuredTargets = @($nnrProbes | Group-Object -Property Target, TargetIP |
-            Where-Object { @($_.Group | Where-Object { Test-mdiProbeWasMeasured -Record $_ }).Count -eq 0 })
-    $nnrFailedTargets = @($nnrMeasuredProbes | Group-Object -Property Target, TargetIP |
+    # is 'N/A' - not a failure and not a pass. An unattributable target lands here for the same
+    # reason, so it makes the verdict 'N/A' instead of silently leaving it a pass.
+    #
+    # Grouped through Get-mdiProbeRecordGroupKey, whose header records what `-Property Target,
+    # TargetIP` did here: it groups on the RENDERING, and comparing two DISTINCT non-IComparable
+    # instances that render alike raises a TERMINATING error under the DEFAULT preference - one
+    # unreadable target destroyed the entire required-ports result for the server.
+    $nnrUnmeasuredTargets = @($nnrProbes | Group-Object -Property { Get-mdiProbeRecordGroupKey -Record $_ } |
+            Where-Object { @($_.Group | Where-Object { & $isAttributedMeasurement $_ }).Count -eq 0 })
+    $nnrFailedTargets = @($nnrMeasuredProbes | Group-Object -Property { Get-mdiProbeRecordGroupKey -Record $_ } |
             Where-Object { @($_.Group | Where-Object { $_.Success }).Count -eq 0 } |
             ForEach-Object {
                 $first = @($_.Group)[0]
-                if ([string]::IsNullOrWhiteSpace([string] $first.TargetIP)) {
-                    [string] $first.Target
-                } else {
-                    '{0} ({1})' -f [string] $first.Target, [string] $first.TargetIP
-                }
+                # Described from the READ halves, through the same label helper FailedRequired uses,
+                # so the two lists on one card cannot spell a target two ways. A record that reached
+                # here has at least one readable half; the unreadable ones were routed above.
+                Get-mdiTargetLabel -Target ([string] (ConvertTo-mdiReadableDomainName -Value $first.Target)) `
+                    -TargetIP ([string] (ConvertTo-mdiReadableDomainName -Value $first.TargetIP))
             })
 
     # The verdict is tri-state. When the probes could not be run ON the sensor, what was measured is a
@@ -14104,6 +14122,75 @@ function Get-mdiProbeRecordTargetKey {
     return $key.ToLowerInvariant()
 }
 
+function Get-mdiProbeRecordGroupKey {
+    <#
+        The one key for "which TARGET PATH did this probe record measure" - the name and the address
+        TOGETHER, used everywhere probe records are grouped into targets.
+
+        It is not the same question as Get-mdiProbeRecordTargetKey above, which answers "which HOST
+        does this record name" and deliberately falls back from Target to TargetIP so that a host
+        recorded only as an address still counts once. That fallback is right for COUNTING HOSTS and
+        wrong for GROUPING ROWS: a multi-homed controller is probed once per address, and the two
+        paths fail independently.
+
+        THE DEFECT THIS REPLACES. The NNR verdict and the NNR matrix both grouped with
+
+            Group-Object -Property Target, TargetIP
+
+        which groups on the STRING RENDERING of each property - the read this codebase keeps
+        restating is not the value. These records are not built in this process: they are JSON
+        produced by the probe script that ran ON the sensor and parsed back with ConvertFrom-Json, so
+        a JSON object in the Target field arrives as a PSCustomObject and EVERY record gets its OWN
+        instance. Measured on the shipped functions over the estate a real NNR run produces - two
+        targets, three methods each, one resolving by NetBIOS and one resolving by no method at all:
+
+            Target = a PSCustomObject   Get-mdiRequiredPorts     THREW
+            Target = a hashtable        Get-mdiRequiredPorts     THREW
+            Target = a PSCustomObject   Get-mdiRequiredPortsHtml THREW - the whole ports table lost
+            Target = $null / '' / '   ' / $true / @('x','y')
+                                        isRequiredPortsOk = True, NnrFailedTargets EMPTY
+
+        The throw is Group-Object comparing two DISTINCT instances that render alike - "Cannot
+        compare @{N=x} to @{N=x} because ... does not implement IComparable" - and it is TERMINATING
+        under the DEFAULT preference, not only under 'Stop'. So ONE unreadable target took down the
+        required-ports result for the WHOLE server, every other required port on that sensor
+        included, rather than its own row; it threw even when the two hosts carried DIFFERENT
+        addresses, because the name is compared first.
+
+        The pass is the same rendering read from the other side. $null and '' both render to the
+        empty string, every hashtable to 'System.Collections.Hashtable', so two DIFFERENT hosts land
+        in ONE group - and the group test is "did ANY member succeed", so the host that no NNR method
+        could resolve left the failure list on the strength of the other one's NetBIOS answer. In the
+        HTML matrix the same merge drew ONE row where two hosts had been probed, under a name that is
+        a .NET type.
+
+        Returns a STRING, so the grouping can never throw whatever the record carries. Both halves go
+        through ConvertTo-mdiReadableDomainName - the codebase's single definition of "did anybody
+        actually read this value", which accepts every real address spelling including IPv6 and a
+        one-element collection, and refuses every shape that only renders - and they are kept
+        SEPARATE rather than falling back one to the other, so the multi-homed separation the old
+        pair key gave is preserved exactly.
+
+        Returns the empty string when NEITHER half was read. The callers route those records to the
+        UNMEASURED population, never to the failed one: a measurement that cannot be attributed to a
+        host is not evidence about any host, so the verdict is 'N/A' - not a pass and not a failure -
+        which is the tri-state the verdict already documents in its own words.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Record
+    )
+
+    if ($null -eq $Record) { return '' }
+
+    $name = ConvertTo-mdiReadableDomainName -Value $Record.Target
+    $address = ConvertTo-mdiReadableDomainName -Value $Record.TargetIP
+    if ($null -eq $name -and $null -eq $address) { return '' }
+    # Lower-cased so one path spelled in two casings is one group, and separated by a character that
+    # cannot occur in either half, so 'a|b' with no address cannot collide with 'a' at address 'b'.
+    return ('{0}|{1}' -f ([string] $name), ([string] $address)).ToLowerInvariant()
+}
+
 function Merge-mdiServerByFqdn {
     <#
         One row per physical server, carrying the union of every role's results.
@@ -17054,7 +17141,55 @@ function Get-mdiOverviewHtml {
 
     # NNR success rate per method - the chart to read when troubleshooting the name resolution health alert
     if (@($stats.NnrRecords).Count -gt 0) {
-        $nnrBars = @(foreach ($grp in ($stats.NnrRecords | Group-Object -Property Name | Sort-Object Name)) {
+        # Grouped on a RENDERED STRING key, not on the raw Name property. This was the last NNR grouping
+        # still on the bare property spelling, and the bare spelling compares the VALUE: two records whose
+        # Name merely RENDERS the same collapse into ONE bar. Measured on the shipped function with method
+        # A answering 2 of 2 and method B answering 0 of 2:
+        #
+        #   two distinct dictionary names     ONE bar  '{System.Collections.DictionaryEntry}'  2/4 (50%)
+        #   a readable name beside one        ONE bar  '{System.Collections.DictionaryEntry}'  2/2 (100%) - toned OK
+        #   null / empty / whitespace name    ONE bar  '' (blank label)                        2/4 (50%)
+        #   two readable one-element arrays   ONE bar  '{NNR - NetBIOS}'                       2/4 (50%)
+        #
+        # so the method that resolved NOTHING was not drawn as failing - it was not drawn at all, and its
+        # zero was averaged into a healthy method on the one chart this report tells the operator to open
+        # for the "Low success rate of active name resolution" alert. The last line proves this is not only
+        # an unreadable-value problem: two names that WERE read, arriving as single-element collections the
+        # way ConvertFrom-Json hands back a one-element array, merged exactly the same way.
+        #
+        # Reachability is the same one already acted on for Target and TargetIP: Get-mdiPortResultRecord
+        # normalises Success, Applicable, Server, Target and TargetIP and carries every other property
+        # through untouched, so whatever the sensor JSON held for Name arrives here as it was.
+        #
+        # A single-element collection is unwrapped to the value inside it, which is the read the rest of
+        # the script already performs. Anything that is not a readable string keys as a STATED MARKER and
+        # is counted as UNREAD rather than as a measurement, so New-mdiBarChart tones it 'na' and the bar
+        # asserts nothing about a method nobody could name. A marker cannot be mistaken for a success rate;
+        # a merged bar reading 100% can.
+        $unidentifiedNnrMethod = '(unidentified method)'
+        $nnrBars = @(foreach ($grp in ($stats.NnrRecords | Group-Object -Property {
+                        $rawNnrMethodName = $_.Name
+                        # Unwrapped to the value INSIDE a single-element collection, and repeatedly rather than
+                        # once. ConvertFrom-Json returns a one-element array for a single-valued JSON array and a
+                        # nested array for a nested one, and measured, a doubly wrapped READABLE name was still an
+                        # Object[] after a single unwrap: it fell through to the marker and the report lost a name
+                        # that had actually been read. Bounded, and stopped as soon as unwrapping returns the same
+                        # object, so a hashtable - whose single "element" is the hashtable itself - cannot spin
+                        # here. A string is not an ICollection, so readable names never enter this loop at all.
+                        for ($nnrUnwrapDepth = 0; $nnrUnwrapDepth -lt 8; $nnrUnwrapDepth++) {
+                            if ($rawNnrMethodName -is [string]) { break }
+                            if (-not ($rawNnrMethodName -is [System.Collections.ICollection])) { break }
+                            $nnrInnerName = @($rawNnrMethodName)
+                            if ($nnrInnerName.Count -ne 1) { break }
+                            if ([object]::ReferenceEquals($nnrInnerName[0], $rawNnrMethodName)) { break }
+                            $rawNnrMethodName = $nnrInnerName[0]
+                        }
+                        if ($rawNnrMethodName -is [string] -and -not [string]::IsNullOrWhiteSpace($rawNnrMethodName)) {
+                            [string] $rawNnrMethodName
+                        } else {
+                            $unidentifiedNnrMethod
+                        }
+                    } | Sort-Object Name)) {
                 # Measured and never-run are separated here, the same way the KPI above and the detail
                 # matrix below separate them, and for the same reason. Total counted EVERY record, so a
                 # method that was never actually run scored 0 out of the probes that never happened and
@@ -17066,7 +17201,16 @@ function Get-mdiOverviewHtml {
                 # denominator as a neutral segment and a bar with nothing measured is toned 'na' rather
                 # than 'bad'. It was simply never handed the number, which is the same omission the
                 # per-check and per-server bars beside it were already fixed for.
-                $measured = @($grp.Group | Where-Object { Test-mdiProbeWasMeasured -Record $_ })
+                #
+                # A group nobody could name carries no measurement at all: every record in it is counted as
+                # unread, so Value and Total are 0 and New-mdiBarChart draws the bar neutral instead of
+                # publishing a success rate for a method that has no name to act on.
+                $unnamedNnrMethod = ([string] $grp.Name -eq $unidentifiedNnrMethod)
+                $measured = if ($unnamedNnrMethod) {
+                    @()
+                } else {
+                    @($grp.Group | Where-Object { Test-mdiProbeWasMeasured -Record $_ })
+                }
                 [PSCustomObject]@{
                     Label  = ([string] $grp.Name) -replace '^NNR - ', ''
                     Value  = @($measured | Where-Object { $_.Success }).Count
@@ -17998,13 +18142,20 @@ function Get-mdiRequiredPortsHtml {
             # by name alone merged those rows back into one - which would report a host as resolvable on
             # the strength of the NIC that answered while the other one, the one actually failing in the
             # portal, disappeared from the report entirely.
-            # Sorted by name and then NUMERICALLY by address. Group-Object on two properties builds a
+            # Both halves go through Get-mdiProbeRecordGroupKey rather than being grouped raw with
+            # `-Property Target, TargetIP`. That grouped on the RENDERING: measured on this function,
+            # a PSCustomObject target - which is what ConvertFrom-Json makes of a JSON object, one
+            # fresh instance per record - raised a TERMINATING comparison error and took the ENTIRE
+            # ports table down, and a hashtable target drew ONE row for TWO probed hosts under the
+            # name 'System.Collections.Hashtable'.
+            # Sorted by name and then NUMERICALLY by address. Group-Object on two properties built a
             # comma-joined Name, so sorting on it sorted the address as text and put .10 before .9 -
-            # two runs of an unchanged environment produced rows in a confusing order.
-            foreach ($targetGroup in ($srvNnr | Group-Object -Property Target, TargetIP | Sort-Object `
-                    @{ Expression = { [string] $_.Values[0] } },
+            # two runs of an unchanged environment produced rows in a confusing order. With one
+            # computed key the two halves are read back off the group's own first record instead.
+            foreach ($targetGroup in ($srvNnr | Group-Object -Property { Get-mdiProbeRecordGroupKey -Record $_ } | Sort-Object `
+                    @{ Expression = { [string] (ConvertTo-mdiReadableDomainName -Value (@($_.Group)[0]).Target) } },
                     @{ Expression = {
-                            Get-mdiIPAddressSortKey -Value ([string] $_.Values[1])
+                            Get-mdiIPAddressSortKey -Value ([string] (ConvertTo-mdiReadableDomainName -Value (@($_.Group)[0]).TargetIP))
                         }
                     })) {
                 $cells = foreach ($probe in $nnrProbes) {
@@ -18033,19 +18184,35 @@ function Get-mdiRequiredPortsHtml {
                 $primaryTested = @($targetGroup.Group | Where-Object {
                         (& $isPrimaryNnr $_) -and (Test-mdiProbeWasMeasured -Record $_)
                     }).Count -gt 0
-                $verdict = if ($primaryOk) { '<td class="green">Yes</td>' }
-                elseif (-not $primaryTested) { '<td class="muted-cell">Not tested</td>' }
-                else { '<td class="red">No</td>' }
-
                 # The address is shown next to the name, because on a multi-homed host the name alone
                 # no longer identifies which path was tested.
                 $first = @($targetGroup.Group)[0]
-                $targetLabel = if ([string]::IsNullOrWhiteSpace([string] $first.TargetIP)) {
-                    ConvertTo-mdiHtmlEncoded ([string] $first.Target)
+                $readableTarget = ConvertTo-mdiReadableDomainName -Value $first.Target
+                $readableTargetIP = ConvertTo-mdiReadableDomainName -Value $first.TargetIP
+                $targetWasRead = ($null -ne $readableTarget) -or ($null -ne $readableTargetIP)
+                # A row is still drawn for a target neither half of which anybody read, under a STATED
+                # marker - the same judgement the probe-id grouping one screen above makes, and for the
+                # same reason recorded there: "a loud failure replaced by a quiet one is not a fix". The
+                # row can carry primary methods measured as refused, so dropping it would trade a
+                # fabricated name for a silent deletion. What it must NOT do is render
+                # 'System.Collections.Hashtable' as a domain controller, which is what [string] did.
+                $targetLabel = if (-not $targetWasRead) {
+                    '<span class="muted">(target name not recorded)</span>'
+                } elseif ([string]::IsNullOrWhiteSpace([string] $readableTargetIP)) {
+                    ConvertTo-mdiHtmlEncoded ([string] $readableTarget)
+                } elseif ([string]::IsNullOrWhiteSpace([string] $readableTarget)) {
+                    '<span class="mono muted">{0}</span>' -f (ConvertTo-mdiHtmlEncoded ([string] $readableTargetIP))
                 } else {
                     '{0} <span class="mono muted">{1}</span>' -f
-                    (ConvertTo-mdiHtmlEncoded ([string] $first.Target)), (ConvertTo-mdiHtmlEncoded ([string] $first.TargetIP))
+                    (ConvertTo-mdiHtmlEncoded ([string] $readableTarget)), (ConvertTo-mdiHtmlEncoded ([string] $readableTargetIP))
                 }
+                # An unattributable row is never certified. Its cells still report what each method
+                # returned, but "Resolvable: Yes" is a statement about a HOST, and there is no host to
+                # make it about - the same reason the verdict routes these records to 'N/A'.
+                $verdict = if (-not $targetWasRead) { '<td class="muted-cell">Not tested</td>' }
+                elseif ($primaryOk) { '<td class="green">Yes</td>' }
+                elseif (-not $primaryTested) { '<td class="muted-cell">Not tested</td>' }
+                else { '<td class="red">No</td>' }
                 [void] $lines.Add(('<tr><td style="text-align:left">{0}</td><td style="text-align:left">{1}</td>{2}{3}</tr>' -f
                         (ConvertTo-mdiHtmlEncoded $srv), $targetLabel, ($cells -join ''), $verdict))
             }

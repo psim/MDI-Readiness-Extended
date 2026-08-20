@@ -170,9 +170,35 @@ Assert-That 'never-ran, refused and open give three different answers' (
 ''
 '[nnr measurement] the guard is present in both halves'
 # Asserted on the canonical text too, so neither half can be dropped again without a red test.
+#
+# THIS ASSERTION USED TO PIN A SPELLING, NOT A GUARD. It required the literal
+#
+#     $nnrMeasuredProbes = @($nnrProbes | Where-Object { Test-mdiProbeWasMeasured ...
+#
+# and went RED the moment the predicate was hoisted into $isAttributedMeasurement - a change that
+# STRENGTHENED the guard (it now demands a measurement AND an attributable target key) while every
+# one of the nine behavioural assertions above stayed green. A source guard that fails on a
+# refactor which improves the thing it guards is a false alarm, and a false alarm spends the
+# credibility the guard exists to have. So it is pinned by MEANING instead: the filter over
+# $nnrProbes must reach Test-mdiProbeWasMeasured, whether it names it inline or through a hoisted
+# predicate whose own definition names it. Dropping the guard entirely - the mutation this exists
+# to catch - still fails, because then nothing on either path names Test-mdiProbeWasMeasured.
 $src = Get-Content -LiteralPath $target -Raw
+$measuredAssignment = [regex]::Match($src, '\$nnrMeasuredProbes\s*=\s*@\(\s*\$nnrProbes\s*\|\s*Where-Object\s*\{([^}]*)\}')
+$guardReachesPredicate = $false
+if ($measuredAssignment.Success) {
+    $filterBody = $measuredAssignment.Groups[1].Value
+    if ($filterBody -match 'Test-mdiProbeWasMeasured') {
+        # Named inline.
+        $guardReachesPredicate = $true
+    } elseif ($filterBody -match '&\s*\$(\w+)') {
+        # Hoisted: the predicate it invokes must itself be defined in terms of the measured test.
+        $predicate = $Matches[1]
+        $guardReachesPredicate = $src -match ('\$' + [regex]::Escape($predicate) + '\s*=\s*\{[^}]*Test-mdiProbeWasMeasured')
+    }
+}
 Assert-That 'the NNR failure list is filtered through the measured-probe predicate' (
-    $src -match '\$nnrMeasuredProbes\s*=\s*@\(\$nnrProbes\s*\|\s*Where-Object\s*\{\s*Test-mdiProbeWasMeasured'
+    $guardReachesPredicate
 ) '(the NNR failure list is unguarded again)'
 Assert-That 'the not-measured verdict branch consults the NNR unmeasured count' (
     $src -match '\$mandatoryUnmeasured\.Count -gt 0 -or \$nnrUnmeasuredTargets\.Count -gt 0'
