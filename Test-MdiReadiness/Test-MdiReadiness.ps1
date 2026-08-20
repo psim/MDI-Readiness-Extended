@@ -3918,7 +3918,13 @@ function Resolve-mdiLdapTarget {
                     if ($null -ne $canonical -and (Test-mdiUsableComputerAddress -Value $canonical)) { $canonical }
                 } | Select-Object -Unique)
             foreach ($address in $usableAddresses) {
-                $projected = $dc.PSObject.Copy()
+                # Copy-mdiWritableRecord, not PSObject.Copy(). Over an IDictionary row that returns the
+                # SAME store, so every projection of this host wrote its address into one object, they
+                # all ended up carrying the LAST address, and the de-duplication below collapsed them
+                # into a single target - one NIC of a multi-homed DC silently never probed, with an
+                # LDAP result still reported for the host. It also left the CALLER's inventory row
+                # rewritten to an address discovery never assigned to it.
+                $projected = Copy-mdiWritableRecord -Record $dc
                 $projected.IP = $address
                 $projected
             }
@@ -13260,6 +13266,45 @@ function New-mdiBarChart {
     }
     [void] $rows.Add('</div>')
     $rows.ToArray() -join ''
+}
+
+function Copy-mdiWritableRecord {
+    <#
+        A copy of a record whose fields can be REWRITTEN without touching the record it came from.
+
+        PSObject.Copy() over an IDictionary returns the SAME underlying store - ReferenceEquals is
+        true - so a "copy" that is then written to still mutates the original. Copy-mdiDetails
+        below states the same finding for a server's Details, and Merge-mdiServerByFqdn clones for
+        the same reason; this helper exists because a THIRD site had the identical trap and it was
+        the one deciding which network paths get probed.
+
+        Measured in Resolve-mdiLdapTarget on one multi-homed host carrying two usable addresses,
+        the only variable being the shape of the row:
+
+            PSCustomObject / Hashtable    2 targets    both NICs probed
+            OrderedDictionary / Generic   1 target     one NIC NEVER PROBED
+
+        Each projection wrote its address into the one shared store, so every projection ended up
+        carrying the LAST address and the de-duplication that follows collapsed them into a single
+        target. The host still reported an LDAP result, so nothing disclosed that half of its
+        paths went untested - and the caller's own inventory row was left rewritten.
+
+        The copy is SHALLOW, deliberately, and matches Copy-mdiDetails: callers of this helper
+        replace whole fields on the copy, they do not write into a nested blob.
+
+        An IDictionary is cloned into an [ordered] hashtable rather than its own concrete type, so
+        a Generic.Dictionary and an [ordered] literal both come back with a store of their own and
+        with the entries in the order they were read.
+    #>
+    param ([Parameter(Mandatory = $false)] [AllowNull()] [object] $Record)
+
+    if ($null -eq $Record) { return $null }
+    if ($Record -is [Collections.IDictionary]) {
+        $clone = [ordered]@{}
+        foreach ($key in @($Record.Keys)) { $clone[$key] = $Record[$key] }
+        return $clone
+    }
+    $Record.PSObject.Copy()
 }
 
 function Copy-mdiDetails {
