@@ -1,4 +1,4 @@
-<#
+﻿<#
     .NOTES
         NON-ENGLISH WINDOWS AND NON-ENGLISH LOCALES
 
@@ -17920,7 +17920,28 @@ function Get-mdiRequiredPortsHtml {
         return '<table><tr><td>Network port validation was skipped or produced no results</td></tr></table>'
     }
 
-    $servers = @($records | Select-Object -ExpandProperty Server -Unique | Sort-Object)
+    # An unreadable server name keys as a STATED MARKER, mirroring the probe-id axis below, and BOTH
+    # the column list and the cell predicate are reduced through the SAME key so the two cannot
+    # disagree. Read raw with "Select-Object -ExpandProperty Server -Unique", this axis LOST HOSTS.
+    # Measured on the shipped function with host A clean and host B holding REQUIRED LdapTcp 389
+    # measured as REFUSED:
+    #
+    #   FQDN $null on both hosts   0 columns and 0 cells - the entire row vanished
+    #   FQDN $null on one host     1 column,  the cell reads OK - the refusal simply disappeared
+    #   FQDN '' or whitespace       1 column,  the two hosts merged and reported "1/2 open"
+    #   two distinct hashtables    1 column,  the cell reads OK, because -Unique collapsed them
+    #                                        and "$_.Server -eq $srv" then compared by REFERENCE
+    #
+    # so five of six unreadable shapes lost a host that had a REQUIRED port measured as refused,
+    # and three of them showed a green OK in its place - an operator told a blocked required port
+    # is open. "Select-Object -Unique" DROPS a null from the pipeline, which is the same
+    # measurement already recorded for the id axis, so a marker rather than $null is what keeps
+    # the host in the table at all.
+    $unidentifiedServer = '(unidentified server)'
+    $servers = @($records | ForEach-Object {
+            $recordServer = [string] $_.Server
+            if ([string]::IsNullOrWhiteSpace($recordServer)) { $unidentifiedServer } else { $recordServer }
+        } | Select-Object -Unique | Sort-Object)
     $lines = New-Object -TypeName System.Collections.ArrayList
 
     # --- Per sensor / per port summary -------------------------------------------------------------------------
@@ -17991,7 +18012,15 @@ function Get-mdiRequiredPortsHtml {
         }
 
         $cells = foreach ($srv in $servers) {
-            $srvRecords = @($probeRecords | Where-Object { $_.Server -eq $srv })
+            # Reduced through the SAME key as the column list above, and compared by VALUE.
+            # "$_.Server -eq $srv" compared the raw property, so a record whose Server is not a
+            # string was matched by REFERENCE and matched nothing - taking a REQUIRED port
+            # measured as refused out of the table with it. Two reads of one identity are two
+            # chances to disagree, which is the whole reason the id axis reduces both sides too.
+            $srvRecords = @($probeRecords | Where-Object {
+                    $recordServer = [string] $_.Server
+                    if ([string]::IsNullOrWhiteSpace($recordServer)) { $srv -eq $unidentifiedServer } else { $recordServer -eq $srv }
+                })
             $applicable = @($srvRecords | Where-Object { $_.Applicable -eq $true })
             # A probe that could not RUN is separated from one that ran and failed. This table was the
             # last place that did not make the distinction: the KPI, the NNR matrix and the actionable
