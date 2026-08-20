@@ -11063,7 +11063,29 @@ function Get-mdiAdvancedAuditing {
             # policy that passed.
             if ($withGuid.Count -gt 0 -and $notPerUser.Count -eq 0) { $noSystemPolicyInExport = $true }
             $candidates = if ($notPerUser.Count -gt 0) { $notPerUser } else { $withGuid }
-            $byTarget = @($candidates | Group-Object -Property 'Policy Target' |
+            # A Policy Target that is absent, empty or blank is not a target anybody READ - it is a
+            # column that was never written. It carries none of the per-user markers above, so it
+            # survives $notPerUser and becomes a candidate, and the sort below ranks candidates purely
+            # on how many distinct subcategories they carry. An export whose unread block is the
+            # larger one therefore ELECTS it as "the system policy", and the filter below then
+            # replaces $rows with that block alone - so completeness (11144), the unreadable-setting
+            # scan (11171), the duplicate collapse (11206) and the final Compare-Object (11208) read
+            # the unread rows and NOTHING ELSE, while the readable rows carrying the true policy are
+            # discarded. Measured on an export whose readable 'System' target audited all eight
+            # required subcategories correctly: adding a second block with an EMPTY Policy Target
+            # reported isAdvancedAuditingOk False and said "reading the system policy ()". By the
+            # standard of 11164 that is the most expensive wrong answer this check can give - it
+            # drives auditpol.exe /set against a production domain controller from a policy that was
+            # never read. A multi-target export is exactly where this arises: 'Policy Target' is
+            # localized text (10978), and a cross-forest or trimmed export can leave it unwritten.
+            #
+            # Only a NAMED target may be elected. As with the user-shaped filter above, the
+            # restriction is never allowed to filter everything away: if NO target is readable there
+            # is no better-read target to prefer, $byTarget is empty, the election does not engage,
+            # and the rows are left exactly as they were - the same treatment 11045 already gives an
+            # export carrying no Policy Target column at all.
+            $namedCandidates = @($candidates | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_.'Policy Target') })
+            $byTarget = @($namedCandidates | Group-Object -Property 'Policy Target' |
                     Sort-Object -Property @{ Expression = { @($_.Group.'Subcategory GUID' | Select-Object -Unique).Count } ; Descending = $true },
                         @{ Expression = { [string] $_.Name } })
             if (@($withGuid | Group-Object -Property 'Policy Target').Count -gt 1 -and $byTarget.Count -gt 0) {
@@ -15874,7 +15896,23 @@ function Get-mdiReportStatistics {
     # unique key and judged alone, which is the conservative choice.
     $nnrKeySeparator = [string][char]31
     $nnrTargets = @($nnrRecords | Group-Object -Property {
-            $keys = @($_.Server, $_.Target, $_.TargetIP)
+            # Each half of the identity is READ before it is compared. The blank-key guard below tests
+            # the RENDERING - [string] $_ - which is false for every unreadable value that is not a
+            # string, because a hashtable renders "System.Collections.Hashtable" and a nested array
+            # renders "System.Object[]", both CONSTANT. So the guard did not fire, and two hosts that
+            # shared nothing but a rendering were keyed identically and merged: one host's success
+            # covered another host's failure. Measured end to end on the shipped function with an
+            # estate whose identities are two distinct hashtables, this KPI published
+            #
+            #   "1 of 1" resolvable    - for an estate containing a host nothing could resolve
+            #
+            # against a fixed reading of "1 of 6". A value that was never read must not be allowed to
+            # certify a host, least of all the headline number. Reduced through the reader the rest of
+            # the script already uses, an unreadable value comes back empty, trips the guard that is
+            # already here, and the record is judged alone - the conservative direction, and never a
+            # false green. Readable identities are unaffected: measured, every readable case is
+            # unmoved.
+            $keys = @(@($_.Server, $_.Target, $_.TargetIP) | ForEach-Object { ConvertTo-mdiReadableDomainName -Value $_ })
             if (@($keys | Where-Object { [string]::IsNullOrWhiteSpace([string] $_) }).Count -gt 0) {
                 [guid]::NewGuid().ToString()
             } else {
@@ -16227,7 +16265,13 @@ function Get-mdiBlockingPortFailure {
     # unreadable family must not split one target, whereas an unreadable target identity must.
     $groupKeySeparator = [string][char]31
     foreach ($group in @($atLeastOne | Group-Object -Property {
-                $keys = @($_.Server, $_.Target, $_.TargetIP)
+                # Read before compared, for the reason set out at the statistics site: the blank-key
+                # guard below tests the RENDERING, which is false for every unreadable non-string, so
+                # two hosts whose identities merely render alike were merged and one host's success
+                # covered another's failure. This is the verdict that raises the blocking finding, so
+                # it must reach the same conclusion as the KPI from the same records - the two views
+                # of one fact disagreeing is exactly the failure this file keeps being fixed for.
+                $keys = @(@($_.Server, $_.Target, $_.TargetIP) | ForEach-Object { ConvertTo-mdiReadableDomainName -Value $_ })
                 if (@($keys | Where-Object { [string]::IsNullOrWhiteSpace([string] $_) }).Count -gt 0) {
                     [guid]::NewGuid().ToString()
                 } else {
@@ -18517,7 +18561,28 @@ function Get-mdiSensorV3Html {
     $lines = New-Object -TypeName System.Collections.ArrayList
 
     [void] $lines.Add('<div class="table-scroll"><table>')
-    $serverHeaders = ($servers | ForEach-Object { '<th>{0}</th>' -f (ConvertTo-mdiHtmlEncoded $_.FQDN) }) -join ''
+    # An unreadable FQDN is STATED, not left blank. This table iterates the server OBJECTS for its
+    # cells, so unlike the ports matrix no host is dropped and no measurement is lost - but the
+    # column came out with no heading at all, and this table carries the per-host v3.x verdict: a
+    # failed MANDATORY prerequisite (red), the current sensor state, and the in-place migration
+    # advice. Measured on the shipped function, one host passing and one failing a REQUIRED check:
+    #
+    #   readable FQDNs (control)   [dc1.mdilab.local | dcfab01.fabrikam.local]  Pass ~ Fail  Yes ~ No
+    #   FQDN $null on both hosts   [<BLANK> | <BLANK>]                          Pass ~ Fail  Yes ~ No
+    #   FQDN $null on failing host [dc1.mdilab.local | <BLANK>]                 Pass ~ Fail  Yes ~ No
+    #   FQDN '' or whitespace      [<BLANK> | <BLANK>]                          Pass ~ Fail  Yes ~ No
+    #
+    # so a red mandatory failure and a "not eligible for migration" verdict were published against a
+    # host the operator cannot identify, and two unnamed hosts produced two blank headings carrying
+    # DIFFERENT verdicts with nothing to tell them apart. A blank heading reads as a rendering glitch
+    # and is scrolled past - already ruled a defect here twice, for the orphan probe name and for the
+    # ports matrix server axis. The reduction is deliberately the SAME one the ports axis received,
+    # so the two surfaces cannot drift.
+    $serverHeaders = ($servers | ForEach-Object {
+            $serverFqdn = [string] $_.FQDN
+            if ([string]::IsNullOrWhiteSpace($serverFqdn)) { $serverFqdn = '(unidentified server)' }
+            '<th>{0}</th>' -f (ConvertTo-mdiHtmlEncoded $serverFqdn)
+        }) -join ''
     [void] $lines.Add('<tr><th style="text-align:left">Prerequisite</th><th>Type</th>{0}</tr>' -f $serverHeaders)
 
     foreach ($checkName in $checkNames) {
