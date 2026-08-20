@@ -1,4 +1,4 @@
-﻿<#
+<#
     .NOTES
         NON-ENGLISH WINDOWS AND NON-ENGLISH LOCALES
 
@@ -3362,7 +3362,41 @@ function Get-mdiProbeTargetKey {
 
     if ($null -eq $Target) { return '' }
 
-    $named = [string] (ConvertTo-mdiCanonicalComputerName -Value $Target.Name -Domain ([string] $Target.Domain))
+    # The DOMAIN half is routed through ConvertTo-mdiReadableDomainName, not cast with [string].
+    #
+    # [string] tests the RENDERING, not the value, and this half of the key exists only to QUALIFY a
+    # dotless name - ConvertTo-mdiCanonicalComputerName appends whatever it is handed, verbatim, to
+    # any name carrying no dot. So every non-string rendered non-blank and became a DNS SUFFIX, on
+    # the one ruler that decides which HOST a row is. Measured on the shipped function, a short name
+    # dc01 - which is what discovery emits when dNSHostName is empty and Name is used instead:
+    #
+    #   Domain value            key produced
+    #   $null / '' / '   '      'dc01'                                    left bare, correct
+    #   @('fabrikam.local')     'dc01.fabrikam.local'                     unwrapped, correct
+    #   12345                   'dc01.12345'                   <-- a suffix nobody read
+    #   $true                   'dc01.true'                    <-- a suffix nobody read
+    #   @{}                     'dc01.system.collections.hashtable'       <-- a suffix nobody read
+    #   [PSCustomObject]        'dc01.@{dnsroot=fabrikam.local}'          <-- a suffix nobody read
+    #   @('a','b')              'dc01.a b'                     <-- not even a DNS name
+    #
+    # This function DISAGREED WITH ITSELF about the same field. The unnameable half below keys the
+    # domain with Get-mdiProbeDomainKey, which routes through ConvertTo-mdiReadableDomainName and
+    # correctly returned the EMPTY key for every one of those values - so one value was read as
+    # unread by one branch and as a resolved DNS suffix by the other, three lines apart.
+    #
+    # A fully qualified name is this codebase's evidence that a host's domain was learned, so a
+    # value nobody read came back wearing the shape of a measurement - the family every defect in
+    # this project has belonged to. UnreadableDomainIsNotADnsSuffix.Tests.ps1 already pins exactly
+    # this on Get-mdiServerIdentityKey, where it was fixed the same way; Get-mdiProbeDomainKey's
+    # own header records the same fix. These rulers were left behind.
+    #
+    # The [string] cast that remains is on the READABLE value, and is still required: the -Domain
+    # parameter is typed [string] and PowerShell cannot bind an Object[] to it, which raised a
+    # TERMINATING parameter-transformation error inside the Group-Object script blocks that compute
+    # this key - a cost the offending row did not pay alone.
+    $readableDomain = ConvertTo-mdiReadableDomainName -Value $Target.Domain
+    if ($null -eq $readableDomain) { $readableDomain = '' }
+    $named = [string] (ConvertTo-mdiCanonicalComputerName -Value $Target.Name -Domain ([string] $readableDomain))
     if (-not [string]::IsNullOrWhiteSpace($named)) { return $named }
 
     # Read through the SHAPE-AGNOSTIC accessors rather than $Target.IP, so that a row carrying no IP
@@ -3971,7 +4005,18 @@ function Get-mdiDomainControllerHostKey {
     if ($null -eq $Row) { return '' }
     if ([string]::IsNullOrWhiteSpace([string] $Row.Name)) { return '' }
 
-    $key = ConvertTo-mdiCanonicalComputerName -Value $Row.Name -Domain ([string] $Row.Domain)
+    # Routed through ConvertTo-mdiReadableDomainName for the reason Get-mdiProbeTargetKey now states
+    # at length: the domain half of this key only ever QUALIFIES a dotless name, and a bare [string]
+    # cast tests the rendering, so a value nobody read became a DNS suffix and the key came back
+    # wearing the shape of a resolved FQDN. Measured on the shipped function, one physical
+    # controller discovered twice - once with its domain recorded plainly and once by a producer
+    # whose Domain field nobody could read - Get-mdiDomainControllerHostCount, which is this
+    # function's only consumer and the count the operator is SHOWN, reported 2 controllers where
+    # there was 1. The over-count is the second of the two failures this function's own header
+    # says it was written to fix.
+    $readableDomain = ConvertTo-mdiReadableDomainName -Value $Row.Domain
+    if ($null -eq $readableDomain) { $readableDomain = '' }
+    $key = ConvertTo-mdiCanonicalComputerName -Value $Row.Name -Domain ([string] $readableDomain)
     if ([string]::IsNullOrWhiteSpace([string] $key)) { return '' }
     return ([string] $key).ToLowerInvariant()
 }
@@ -4011,14 +4056,32 @@ function Get-mdiAddresslessDomainController {
     # is short, because the rows it feeds - the statistics, the issue list and the verdict - lose
     # every genuinely unreachable controller along with the unreadable one.
     @($Inventory | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_.Name) } |
+    # THE RULER, not a fourth copy of it. Get-mdiDomainControllerHostKey's own header calls itself
+    # "the single ruler for which MACHINE is this inventory row" and names this function as already
+    # keying rows the same way - and the two expressions then drifted apart the moment the domain
+    # half was hardened. Three copies of one rule is how the copies drift, which is the reason
+    # Get-mdiUnexaminedDomain exists as one function rather than three inline comparisons.
+    #
+    # It matters here more than anywhere: this function's output is a LIST OF NAMES PRINTED TO THE
+    # OPERATOR as domain controllers to go and repair. Measured on the shipped function, three
+    # addressless controllers whose Domain nobody could read:
+    #
+    #   dc01.system.collections.hashtable
+    #   dc02.a b
+    #   dc03.@{dnsroot=fabrikam.local}
+    #
+    # None of those is a name any directory returned, one of them is not a DNS name at all, and
+    # all three are presented as fully qualified - the evidence this codebase uses that a host's
+    # domain was learned. The operator is sent to fix name resolution for hosts whose domain the
+    # tool never read.
         Group-Object -Property {
-            ConvertTo-mdiCanonicalComputerName -Value $_.Name -Domain ([string] $_.Domain)
+            Get-mdiDomainControllerHostKey -Row $_
         } | Where-Object {
             @($_.Group | ForEach-Object { @($_.Addresses) + @($_.IP) } | Where-Object {
                     Test-mdiUsableComputerAddress -Value $_
                 }).Count -eq 0
         } | ForEach-Object {
-            ConvertTo-mdiCanonicalComputerName -Value $_.Group[0].Name -Domain ([string] $_.Group[0].Domain)
+            Get-mdiDomainControllerHostKey -Row $_.Group[0]
         } | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) } | Select-Object -Unique)
 }
 
@@ -17206,11 +17269,24 @@ function Get-mdiOverviewHtml {
                 # unread, so Value and Total are 0 and New-mdiBarChart draws the bar neutral instead of
                 # publishing a success rate for a method that has no name to act on.
                 $unnamedNnrMethod = ([string] $grp.Name -eq $unidentifiedNnrMethod)
-                $measured = if ($unnamedNnrMethod) {
-                    @()
-                } else {
-                    @($grp.Group | Where-Object { Test-mdiProbeWasMeasured -Record $_ })
-                }
+                # Wrapped in @() around the WHOLE if, not merely inside its branches. An if used as
+                # an EXPRESSION sends the chosen branch down the pipeline, and a pipeline UNROLLS a
+                # one-element array. With exactly one measured probe in the group - far and away the
+                # commonest shape here, since most estates run one NNR method per target - $measured
+                # came back as the RECORD itself, a PSCustomObject, whose .Count is $null rather
+                # than 1. Total was then $null and Unread was "1 - $null" = 1, so a probe that HAD
+                # been measured was published as "1 not read" and the bar was toned neutral.
+                # Measured on the shipped function: one NNR record with Applicable $true and
+                # Success $false - a probe that ran and failed - rendered
+                #   <div class="bar-fill na"> ... 0/1 (0%) <span class="muted">1 not read</span>
+                # instead of a red measured failure, on the one chart this report tells the operator
+                # to open for the name resolution health alert. That is this project's defect family
+                # inverted - a value that WAS read coming back looking as though it never was.
+                $measured = @(if ($unnamedNnrMethod) {
+                        @()
+                    } else {
+                        @($grp.Group | Where-Object { Test-mdiProbeWasMeasured -Record $_ })
+                    })
                 [PSCustomObject]@{
                     Label  = ([string] $grp.Name) -replace '^NNR - ', ''
                     Value  = @($measured | Where-Object { $_.Success }).Count
