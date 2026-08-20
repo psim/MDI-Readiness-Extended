@@ -1,4 +1,4 @@
-﻿<#
+<#
     .NOTES
         NON-ENGLISH WINDOWS AND NON-ENGLISH LOCALES
 
@@ -4176,6 +4176,58 @@ function ConvertTo-mdiReadableDomainName {
     [string] $candidate
 }
 
+function Select-mdiDistinctDomainName {
+    <#
+        ONE DOMAIN, NAMED ONCE - and named the same way whichever transport enumerated it.
+
+        A forest domain list reaches this script from two transports over the SAME directory,
+        and they disagreed about how many domains the forest has. Measured on the shipped
+        functions with a directory naming one domain twice:
+
+            Domains = mdilab.local, emea.mdilab.local, mdilab.local
+                ADWS  N=3  Complete=True   - no collapse at all
+                LDAP  N=2                  - Select-Object -Unique
+
+        Forest size is not cosmetic. Get-mdiDomainControllerInventory types -Domain as
+        [string[]] and iterates it, so a domain named twice is ENUMERATED twice and the estate
+        doubles; Test-mdiForestEnumerationIncomplete is read independently by the score, the
+        findings table and the READY verdict, and none of them dedups.
+
+        Select-Object -Unique is ORDINAL, so it is not the fix on its own: it keeps
+        CONTOSO.COM, contoso.com and contoso.com. as three domains. The comparison here is the
+        one Get-mdiUnexaminedDomain already settled on for exactly this reason - case-
+        insensitive, trailing dot ignored, "which is what DNS itself does".
+
+        The FIRST spelling seen is what is emitted, unmodified. The operator should read what
+        the directory actually said; this decides only what counts as the same domain.
+
+        Unreadable entries are not domains and are not passed through: $null, an empty or
+        whitespace string, and anything whose text is blank once trimmed all drop out here, the
+        way the LDAP walker's IsNullOrWhiteSpace filter did before it.
+
+        Constructed with ::new() and NOT with New-Object, deliberately. This runs inside the
+        LDAP forest walker, which builds its DirectoryEntry and DirectorySearcher through
+        New-Object - so the test harnesses for that walker replace New-Object wholesale and
+        THROW on any type they were not expecting. Measured: with New-Object here,
+        LdapForestNameUsesConfigurationNc went 6/6 to 1/5, the walker returning $null and
+        never writing UnnamedCount, because the set construction threw inside the walker's own
+        try. ::new() is not interceptable that way, and the set is a local detail that no test
+        should have to know about.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object[]] $Name = @()
+    )
+
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    @(foreach ($candidate in $Name) {
+            $text = [string] $candidate
+            if ([string]::IsNullOrWhiteSpace($text)) { continue }
+            $key = $text.Trim().TrimEnd('.')
+            if ([string]::IsNullOrWhiteSpace($key)) { continue }
+            if ($seen.Add($key)) { $candidate }
+        })
+}
+
 function Get-mdiForestDomainFromLdap {
     param (
         [Parameter(Mandatory = $false)] [string] $Domain = $null,
@@ -4242,7 +4294,12 @@ function Get-mdiForestDomainFromLdap {
                 } else { $null }
                 if ($null -eq $dnsRoot) { $unnamed++; continue }
                 $dnsRoot
-            }) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+            })
+        # Through the shared rule, not Select-Object -Unique. That comparison is ORDINAL, so it
+        # kept CONTOSO.COM and contoso.com. as separate domains here while the ADWS branch did
+        # not collapse anything at all - two transports over one directory reporting two
+        # different forest sizes. The blank filter this replaces is inside the helper.
+        $domains = @(Select-mdiDistinctDomainName -Name $domains)
 
         if ($null -ne $UnnamedCount) { $UnnamedCount.Value = $unnamed }
         if ($unnamed -gt 0) {
@@ -4318,6 +4375,11 @@ function Get-mdiForestDomain {
                 if ($null -eq $domainName) { $adwsUnnamed++; continue }
                 $domainName.Trim()
             })
+        # The SAME rule the LDAP walker applies, for the reason its own comment gives about
+        # ConvertTo-mdiReadableDomainName: a transport that accepts what the other rejects
+        # reintroduces the failure. This branch had no collapse at all, so a directory naming
+        # one domain twice returned it twice with Complete=$true over it.
+        $adwsDomains = @(Select-mdiDistinctDomainName -Name $adwsDomains)
         if ($adwsDomains.Count -gt 0) {
             $adwsName = ([string] $adForest.Name).Trim().TrimEnd('.')
             $adwsRoot = ([string] $adForest.RootDomain).Trim().TrimEnd('.')
