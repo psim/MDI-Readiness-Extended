@@ -18603,8 +18603,37 @@ function Get-mdiRequiredPortsHtml {
             'This says nothing about whether those paths are slow.</p>')
     }
 
-    $probedFrom = @($Server | ForEach-Object { $_.Details.RequiredPortsDetails.ProbedFrom } | Where-Object { $_ } | Select-Object -Unique)
-    [void] $lines.Add('<p><small>Probed from: {0}</small></p>' -f (ConvertTo-mdiHtmlEncoded ($probedFrom -join '; ')))
+    # Provenance is a measurement like any other. This line is where an operator learns which
+    # DIRECTION the required-port probes actually ran in, and the two directions do not mean the
+    # same thing: "Sensor server (outbound)" is the path MDI requires, while the inbound fallback
+    # measures the reverse path and is reported elsewhere as not tested in the required direction.
+    #
+    # It was read with a bare Where-Object { $_ } and emitted unconditionally. That does not agree
+    # with the PRODUCER of this value: Merge-mdiServer resolves ProbedFrom with an
+    # IsNullOrWhiteSpace filter and returns $null when neither direction carried a readable value,
+    # so an unreadable ProbedFrom is precisely what shipped code emits when nothing was measured.
+    # Measured on this function: whitespace survived as a listed source, a value that was not a
+    # string at all rendered as "System.Collections.Hashtable", and - the harmful one - with SOME
+    # hosts unreadable the line printed the sources that happened to survive, presenting a PARTIAL
+    # read as the complete set of probe sources. The latency section ten lines above already holds
+    # itself to this standard when every successful probe carried no readable time.
+    $provenanceHosts = @($Server | Where-Object { $null -ne $_.Details.RequiredPortsDetails })
+    $provenanceRead = @($provenanceHosts | ForEach-Object { $_.Details.RequiredPortsDetails.ProbedFrom })
+    # -is [string] as well as IsNullOrWhiteSpace: every writer of ProbedFrom in this script sets a
+    # string, so anything else arrived without being measured and must not be named as a source.
+    $provenanceReadable = @($provenanceRead | Where-Object { $_ -is [string] -and -not [string]::IsNullOrWhiteSpace($_) })
+    $provenanceUnread = @($provenanceRead).Count - @($provenanceReadable).Count
+    $probedFrom = @($provenanceReadable | Select-Object -Unique)
+    if ($probedFrom.Count -eq 0) {
+        [void] $lines.Add('<p><small>Probed from: not recorded - no probe source was readable.</small></p>')
+    }
+    elseif ($provenanceUnread -gt 0) {
+        [void] $lines.Add(('<p><small>Probed from: {0} (incomplete - {1} host(s) carried no readable probe source).</small></p>' -f
+                (ConvertTo-mdiHtmlEncoded ($probedFrom -join '; ')), $provenanceUnread))
+    }
+    else {
+        [void] $lines.Add('<p><small>Probed from: {0}</small></p>' -f (ConvertTo-mdiHtmlEncoded ($probedFrom -join '; ')))
+    }
 
     $lines.ToArray() -join [environment]::NewLine
 }
