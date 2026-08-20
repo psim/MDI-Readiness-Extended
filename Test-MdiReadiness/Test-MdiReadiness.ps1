@@ -7209,13 +7209,38 @@ function New-mdiRemediationScript {
         # the emptiness guard below and was then discarded when the literal list was written - emitting
         # a section whose source array was empty and whose count claimed otherwise. Filtering on the
         # same rule $litList uses keeps the count and the emitted array the same fact.
+        # Each address is read through ConvertTo-mdiReadableDomainName rather than rendered with a
+        # [string] cast. The cast is a test of the RENDERING: a nested collection
+        # @('10.10.1.50','10.10.1.60') renders to the single string '10.10.1.50 10.10.1.60' and a
+        # hashtable to 'System.Collections.Hashtable'. Neither is whitespace, so both survived the
+        # IsNullOrWhiteSpace filter below and were written into $sensorAddresses - the -RemoteAddress
+        # scope of an inbound rule opened on a domain controller for TCP 135, UDP 137 and TCP 3389.
+        # Measured on this function with one sensor whose Addresses carried a nested pair:
+        #
+        #   @('10.10.1.50')                      -> $sensorAddresses = @('10.10.1.50')
+        #   @(@('10.10.1.50','10.10.1.60'))      -> $sensorAddresses = @('10.10.1.50 10.10.1.60')
+        #   @(@{ ip = '10.10.1.50' })            -> $sensorAddresses = @('System.Collections.Hashtable')
+        #
+        # In the second case TWO VALID sensor addresses are fused into one string that is neither of
+        # them: the rule matches no traffic, every sensor's NNR probes stay blocked, and the operator
+        # is told the fix was applied. The guard the generated script carries for this exact risk
+        # tests IsNullOrWhiteSpace too, so a bogus non-blank address passes that as well - the one
+        # check written to stop an unscoped rule does not fire. An address nobody could read is
+        # therefore no address, which routes the sensor into $sensorNoAddressList and the warning
+        # that already exists for it.
         $sensorWithAddress = New-Object -TypeName System.Collections.ArrayList
         $sensorNoAddressList = New-Object -TypeName System.Collections.ArrayList
         $sensorIpList = New-Object -TypeName System.Collections.ArrayList
         foreach ($sensorHost in $sensorHosts) {
-            $hostAddresses = @($sensorHost.Addresses | Where-Object { $_ })
-            if ($hostAddresses.Count -eq 0) { $hostAddresses = @([string] $sensorHost.IP) }
-            $hostAddresses = @($hostAddresses | Where-Object { -not [string]::IsNullOrWhiteSpace([string] $_) })
+            $hostAddresses = New-Object -TypeName System.Collections.ArrayList
+            foreach ($rawAddress in @($sensorHost.Addresses)) {
+                $readableAddress = ConvertTo-mdiReadableDomainName -Value $rawAddress
+                if (-not [string]::IsNullOrWhiteSpace($readableAddress)) { [void] $hostAddresses.Add($readableAddress) }
+            }
+            if ($hostAddresses.Count -eq 0) {
+                $readableIp = ConvertTo-mdiReadableDomainName -Value $sensorHost.IP
+                if (-not [string]::IsNullOrWhiteSpace($readableIp)) { [void] $hostAddresses.Add($readableIp) }
+            }
             if ($hostAddresses.Count -gt 0) {
                 [void] $sensorWithAddress.Add($sensorHost)
                 foreach ($hostAddress in $hostAddresses) { [void] $sensorIpList.Add([string] $hostAddress) }
@@ -7243,9 +7268,28 @@ function New-mdiRemediationScript {
         # and the script generated FROM that report is silent about X. A rule can only be created ON a
         # named computer, so an unnameable target genuinely cannot receive one; the warning is what
         # keeps the two halves of the decision saying the same thing.
-        $blockedTargets = @($blockedNnr | ForEach-Object { [string] $_.Target } |
+        # Read through ConvertTo-mdiReadableDomainName, not rendered with a [string] cast. The cast
+        # tests the RENDERING, and every non-string renders to something non-blank: a hashtable to
+        # 'System.Collections.Hashtable', a two-element list @('dca','dcb') to the single string
+        # 'dca dcb'. Neither is whitespace, so both passed the filter below AND the unnameable count
+        # beside it, and were emitted as the computer a firewall rule is created ON. Measured on this
+        # function with three primary NNR methods all measured REFUSED against one target:
+        #
+        #   'dcblocked.mdilab.local'          -> 3 rules on dcblocked.mdilab.local, 0 warnings
+        #   $null                             -> 0 rules, unnameable warning, section skipped
+        #   @{ dnsHostName = 'dcblocked' }    -> 3 rules on 'System.Collections.Hashtable', 0 warnings
+        #   @('dca.mdilab.local','dcb...')    -> 3 rules on 'dca.mdilab.local dcb.mdilab.local', 0 warnings
+        #
+        # The last is the worst: two domain controllers that could not be resolved collapse into ONE
+        # name belonging to no machine, so the script fails against a host that does not exist and
+        # the two targets that really were blocked receive no rule at all - while the report it was
+        # generated from names them as unresolvable. The blank case was already guarded; an
+        # unreadable value is the same fact arriving in a shape that renders, and is charged to the
+        # same warning rather than dropped.
+        $blockedTargets = @($blockedNnr | ForEach-Object { ConvertTo-mdiReadableDomainName -Value $_.Target } |
                 Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique | Sort-Object)
-        $blockedNnrUnnameable = @($blockedNnr | Where-Object { [string]::IsNullOrWhiteSpace([string] $_.Target) }).Count
+        $blockedNnrUnnameable = @($blockedNnr | Where-Object {
+                [string]::IsNullOrWhiteSpace([string] (ConvertTo-mdiReadableDomainName -Value $_.Target)) }).Count
         if ($blockedNnrUnnameable -gt 0) {
             Write-mdiWarning ('{0} blocked Network Name Resolution result(s) carry no readable target, so no inbound firewall rule could be generated for them. Their name resolution will still fail; re-run Test-MdiReadiness.ps1 to obtain the target names.' -f $blockedNnrUnnameable)
         }
@@ -13683,6 +13727,29 @@ function Merge-mdiSensorV3ReadyDetails {
     $v2Version = if (-not [string]::IsNullOrWhiteSpace([string] $scalarWinner.SensorV2Version)) { $scalarWinner.SensorV2Version }
     else { $scalarLoser.SensorV2Version }
 
+    # The same rule as the version above, and for a sharper reason. The rank that picks $scalarWinner
+    # is authority over the VERDICT, and it deliberately puts a role that could NOT be read above one
+    # that read everything - the producer's tri-state ranks 'N/A' at 1 and a measured pass at 0. So
+    # the scalar winner is routinely the BLIND role, and its account of the sensor state is its own
+    # admission that it never looked: 'Not determined (the server could not be queried)'. That is not
+    # two passes disagreeing about the machine, it is one pass that failed to collect a fact the
+    # other pass did collect, and the merged host is where the collected one belongs.
+    #
+    # Measured on the shipped function before this guard: a host holding two roles, one reporting
+    # 'v2.x sensor running' from an answered query and one reporting 'Not determined (the server
+    # could not be queried)', merged to the second - in both merge orders, and for both of the
+    # producer's not-determined branches. The report then told the operator the sensor state of that
+    # machine was unknown on a machine where it had been read.
+    #
+    # Falls back only when the loser's state IS readable, so a merge of two blind roles still reports
+    # the blind string rather than going blank, and no unread value is ever promoted over a read one.
+    $winnerSensorStateWasRead = (-not [string]::IsNullOrWhiteSpace([string] $scalarWinner.SensorState)) -and
+        ([string] $scalarWinner.SensorState -notmatch $script:mdiPortNotTestedPattern)
+    $loserSensorStateWasRead = (-not [string]::IsNullOrWhiteSpace([string] $scalarLoser.SensorState)) -and
+        ([string] $scalarLoser.SensorState -notmatch $script:mdiPortNotTestedPattern)
+    $sensorState = if ($winnerSensorStateWasRead -or (-not $loserSensorStateWasRead)) { $scalarWinner.SensorState }
+    else { $scalarLoser.SensorState }
+
     if ($mergedChecks.Count -gt 0) {
         # The producer's own rules, kept literally in step with Get-mdiSensorV3Readiness - and both
         # sides go through Test-mdiRequirementIsMandatory, because an inline `-eq 'Required'` here
@@ -13733,7 +13800,7 @@ function Merge-mdiSensorV3ReadyDetails {
     }
 
     [PSCustomObject]@{
-        SensorState        = $scalarWinner.SensorState
+        SensorState        = $sensorState
         SensorV2Version    = $v2Version
         # Pessimistic: eligible for the in-place migration only if BOTH passes said so. Anything else
         # - a disagreement, or a value neither role expressed as a real boolean - is not the positive
@@ -13912,7 +13979,46 @@ function Get-mdiServerIdentityKey {
     if ($null -eq $Server) { return '' }
     $readableDomain = ConvertTo-mdiReadableDomainName -Value $Server.Domain
     if ($null -eq $readableDomain) { $readableDomain = '' }
-    $key = ConvertTo-mdiCanonicalComputerName -Value ([string] $Server.FQDN) -Domain $readableDomain
+    # The NAME half is routed through ConvertTo-mdiReadableDomainName too, for the reason this
+    # function's DOCUMENTED COUNTERPART states about its own name half - Get-mdiProbeRecordTargetKey,
+    # the NUMERATOR of the ratio this key is the DENOMINATOR of: "[string] tests the RENDERING, not
+    # the value". It read `-Value ([string] $Server.FQDN)` while the numerator read the same field
+    # through the readable ruler, so the two halves of ONE ratio were counted by TWO rules - which is
+    # the exact failure that function's header records as already having been made once here.
+    #
+    # Two separate losses, measured on the shipped functions.
+    #
+    # 1. A MACHINE LEAVES A CROSS-FOREST ESTATE. Every unreadable value renders to a string
+    #    CONTAINING DOTS - 'System.Collections.Hashtable' - and ConvertTo-mdiCanonicalComputerName
+    #    appends the domain only to a name with NO dot. So for exactly the rows nobody could read,
+    #    the forest separation this key exists for was switched off. This function's own header
+    #    states the stake: "mdilab.local and fabrikam.local may each legitimately hold a dc01, and
+    #    they are different machines at different addresses." Measured through Merge-mdiServerByFqdn
+    #    on four rows, one unreadable FQDN in EACH forest:
+    #
+    #        FQDN = @{}     4 rows in -> 3 rows out   the fabrikam.local machine VANISHED
+    #        FQDN = $true   4 rows in -> 4 rows out   (rendered 'True', no dot, so it was qualified)
+    #
+    #    The vanished row was never probed, never counted and never reported unreachable, which
+    #    Get-mdiDomainControllerInventory calls "the most damaging outcome this tool has, because the
+    #    report still reads as a complete scan of the estate".
+    #
+    # 2. A NAME NOBODY READ BECAME A FULLY QUALIFIED HOST. The shapes that DID carry no dot were
+    #    qualified with the domain and entered the estate as real hosts - 'true.mdilab.local',
+    #    '12345.mdilab.local', '@{name=dc01}.fabrikam.local', 'dc01 dc02.mdilab.local'. All four were
+    #    counted in PortCandidateHostCount while the numerator dropped all four, so the sampling
+    #    disclosure compared a denominator holding fabricated hosts against a numerator that refuses
+    #    them, and offered -MaxLdapTargetsPerDomain as the remedy for a host that cannot exist.
+    #
+    # Keying '' is what both consumers already handle correctly and neither had to change:
+    # Merge-mdiServerByFqdn keeps a blank-keyed row SEPARATE rather than merging it (so no machine is
+    # lost), and the statistics drop it with the IsNullOrWhiteSpace filter it already applies (so the
+    # two halves of the ratio agree). Nothing that used to be read stops being read: a string is
+    # accepted unchanged and a one-element collection is unwrapped, so @('dc01.mdilab.local') keys
+    # exactly as it did before.
+    $readableName = ConvertTo-mdiReadableDomainName -Value $Server.FQDN
+    if ($null -eq $readableName) { return '' }
+    $key = ConvertTo-mdiCanonicalComputerName -Value $readableName -Domain $readableDomain
     if ([string]::IsNullOrWhiteSpace([string] $key)) { return '' }
     return $key.ToLowerInvariant()
 
