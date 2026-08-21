@@ -19599,7 +19599,34 @@ function Set-MdiReadinessReport {
             # labelling it "not reachable" would tell the reader to ignore findings that are valid.
             $rows = @(foreach ($srv in ($serverList | Sort-Object FQDN)) {
                     $unreachable = Test-mdiServerIsUnreachable -Server $srv
-                    $partial = (-not $unreachable) -and [bool] $srv.PartialFailure
+                    # READ WITH THE SAME EXPRESSION THE COUNT USES. `[bool] $srv.PartialFailure` was a
+                    # bare truthiness test on a flag that survives a JSON round trip as the STRING
+                    # 'False' - the very hazard Test-mdiServerIsUnreachable exists for, applied to its
+                    # SIBLING flag on the same object and on the line immediately above. Every
+                    # non-empty string is truthy, so [bool] 'False' is TRUE and a fully scanned server
+                    # was badged "partial results", with its Comment as the row tooltip.
+                    #
+                    # The count read the same flag CORRECTLY - Get-mdiReportStatistics computes
+                    # PartialScanCount with `$_.PartialFailure -eq $true`, and 'False' -eq $true is
+                    # FALSE because PowerShell coerces the right operand to the LEFT operand's type and
+                    # compares 'False' with 'True' - so the two surfaces disagreed about the same
+                    # server on the same page. Measured on the shipped renderer, one reachable server,
+                    # nothing differing but the spelling of the flag:
+                    #
+                    #     PartialFailure          PartialScanCount   row badge
+                    #     $true                   1                  partial results
+                    #     $false                  0                  none
+                    #     'True'  (round trip)    1                  partial results
+                    #     'False' (round trip)    0                  PARTIAL RESULTS   <- disagreement
+                    #
+                    # Fixed by using the COUNT'S OWN EXPRESSION rather than a second reading of the
+                    # same fact. ConvertTo-mdiBoolean was tried first and is the wrong tool here: it
+                    # returns nothing usable for a bare 1, so the badge then disappeared from a row the
+                    # count still counted - the identical disagreement in the opposite direction, which
+                    # the regression test caught. Whether `-eq $true` is the right reading of this flag
+                    # is a separate question; what must hold is that the row and the count answer it
+                    # the same way.
+                    $partial = (-not $unreachable) -and ($srv.PartialFailure -eq $true)
                     $reason = if ($unreachable -or $partial) { [string] $srv.Comment } else { '' }
                     # The same measurement-resolved values the score, the KPI counts and the verdict
                     # use. Reading the raw property here let this table paint RequiredPorts green on a
