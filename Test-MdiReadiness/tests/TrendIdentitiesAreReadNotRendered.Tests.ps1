@@ -53,6 +53,15 @@
 #   * An unreadable FQDN still makes two runs of one estate incomparable (2 names vs 1). That is
 #     honest - if a server's name could not be read the tool does not know it measured the same
 #     estate. The fabrication was the defect, not the refusal.
+#
+# SUPERSEDED IN PART, 21 AUG: Pietro ruled that a run whose estate identity could not be READ must
+# not be declared comparable with a baseline naming a real estate - measured, mdilab.local against an
+# unreadable identity returned comparable=True, so a delta was drawn across two estates. That case
+# now REFUSES. The original finding of this file is untouched and is what the refusal is worded to
+# respect: an unreadable value must never be printed as a name, so the reason says the identity could
+# not be read rather than claiming a different domain. A BLANK identity - '' or whitespace, which is
+# how a pre-field history is modelled here and in EstateIdentityInTrend - still falls through,
+# because nothing recorded is not the same as something unreadable.
 
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -143,7 +152,8 @@ try {
     ($case.Entry.ServerNames -contains 'DCFAB01.FABRIKAM.LOCAL') "got $(@($case.Entry.ServerNames) -join ' | ')"
 
     ''
-    '[the defect, part 2] an unreadable estate identity must fall through, not refuse'
+    '[the defect, part 2] an unreadable estate identity must never be NAMED - and, since Pietro''s'
+    '                     21 Aug ruling, must not be treated as a wildcard either'
     function New-Run {
         param($Domain = 'fabrikam.local', $Forest = 'fabrikam.local', $Version = '1.2.0', $Servers = @('dcfab01.fabrikam.local', 'memfab01.fabrikam.local'))
         [PSCustomObject]@{
@@ -152,11 +162,37 @@ try {
             ChecksPassed = 3; ChecksTotal = 4; ChecksUnread = 0
         }
     }
+    # WHAT CHANGED, AND WHAT DID NOT. This block used to assert that an unreadable estate identity
+    # FELL THROUGH and the runs stayed comparable. The harm this file was written for was never the
+    # fall-through itself - it was the sentence "the baseline is from a different domain
+    # (System.Collections.Hashtable then fabrikam.local)", which named a .NET type as a domain and,
+    # by its own comment, advises the operator that the baseline "belongs to somebody else's estate
+    # and should be removed from this folder".
+    #
+    # Pietro ruled on 21 Aug that a run whose estate identity could not be read must NOT be declared
+    # comparable with a baseline from a different estate - measured mdilab.local vs UNREADABLE
+    # returning comparable=True. So the comparison is now refused. The fabrication is still
+    # forbidden, and that is what the second assertion in each pair pins: the refusal must say the
+    # identity could not be READ, and must not print its rendering as a name.
+    #
+    # The both-sides-unreadable and legacy-blank cases are unchanged and are pinned elsewhere in this
+    # file and in EstateIdentityInTrend: a blank string still falls through, because "nothing was
+    # recorded" is not the same as "something was recorded and cannot be read".
     foreach ($k in @('hashtable', 'two-element array', 'boolean', 'number', 'PSCustomObject')) {
         $r = Test-mdiTrendPointsComparable -Previous (New-Run -Domain $shapes[$k]) -Current (New-Run)
-        Assert-That "an unreadable Domain ($k) falls through instead of refusing" ($r.IsComparable -eq $true) "reason: $($r.Reason)"
+        Assert-That "an unreadable Domain ($k) refuses the comparison" ($r.IsComparable -eq $false) "reason: $($r.Reason)"
+        Assert-That "  ...and says it could not be READ, naming no rendering ($k)" `
+        (([string] $r.Reason) -match 'could not be read' -and ([string] $r.Reason) -notmatch 'System\.|@\{|True|12345') "reason: $($r.Reason)"
         $rf = Test-mdiTrendPointsComparable -Previous (New-Run -Forest $shapes[$k]) -Current (New-Run)
-        Assert-That "an unreadable Forest ($k) falls through instead of refusing" ($rf.IsComparable -eq $true) "reason: $($rf.Reason)"
+        Assert-That "an unreadable Forest ($k) refuses the comparison" ($rf.IsComparable -eq $false) "reason: $($rf.Reason)"
+        Assert-That "  ...and says it could not be READ, naming no rendering ($k)" `
+        (([string] $rf.Reason) -match 'could not be read' -and ([string] $rf.Reason) -notmatch 'System\.|@\{|True|12345') "reason: $($rf.Reason)"
+    }
+    # The legacy shape stays comparable: a blank identity is "not recorded", which is what a history
+    # written before these fields existed carries, and refusing it would break every stored baseline.
+    foreach ($blank in @('', '   ')) {
+        $rb = Test-mdiTrendPointsComparable -Previous (New-Run -Domain $blank -Forest $blank) -Current (New-Run)
+        Assert-That "a blank estate identity ('$blank') still falls through" ($rb.IsComparable -eq $true) "reason: $($rb.Reason)"
     }
     # THE VERSION AXIS IS DELIBERATELY ASYMMETRIC WITH THE ESTATE AXIS, and this block pins the
     # difference so nobody "tidies" the two into one rule.

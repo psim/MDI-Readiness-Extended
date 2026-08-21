@@ -179,13 +179,38 @@ Assert-True 'and exactly one host was probed' `
 Assert-True 'so a fully probed estate claims NO sample' (-not (Test-DisclosureFires -Stats $statsOne))
 
 Write-Host "`nTHE OPPOSITE MISTAKE: genuinely different machines must not be merged"
+# The estate is supplied explicitly here, and that is not incidental. The numerator is now drawn
+# FROM the candidate population - a probe record only counts as a host that was visited if the host
+# is one the run could have visited - so three targets that exist in no estate now count as zero,
+# which is the point of that change and is pinned directly below. What THIS assertion is for is
+# narrower and unchanged: that one short name living in three domains is three machines and not one.
+# Putting the three in the estate keeps it measuring exactly that.
 $statsDistinct = Get-Stats -ProbeTargets @(
     'dc1.mdilab.local'
     'dc1.fabrikam.local'
     'dc1.emea.mdilab.local'
+) -Estate @(
+    @{ F = 'dc1.mdilab.local'; D = 'mdilab.local' }
+    @{ F = 'dc1.fabrikam.local'; D = 'fabrikam.local' }
+    @{ F = 'dc1.emea.mdilab.local'; D = 'emea.mdilab.local' }
 )
 Assert-True 'one short name in three domains is three probed hosts' `
 ([int] $statsDistinct.PortDistinctTargetCount -eq 3) ("got $($statsDistinct.PortDistinctTargetCount)")
+
+Write-Host "`nA host that is not in the candidate population was never a domain controller we probed"
+# The residual left behind when the numerator was filtered on Scope alone. A record whose Scope is
+# PRESENT BUT UNREADABLE is not equal to 'NetworkDevice', so it satisfied that exclusion and entered
+# a domain-controller ratio on the strength of a value nobody could read - inflating the numerator
+# and, with enough such rows, suppressing the sampling disclosure entirely. Drawing the numerator
+# from the denominator's own population settles every unreadable spelling at once.
+$statsOffEstate = Get-Stats -ProbeTargets @('wks001.mdilab.local', 'srv042.mdilab.local') `
+    -Estate @(@{ F = 'dcfab01.fabrikam.local'; D = 'fabrikam.local' })
+Assert-True 'two probed hosts that are not candidates count as none' `
+([int] $statsOffEstate.PortDistinctTargetCount -eq 0) ("got $($statsOffEstate.PortDistinctTargetCount)")
+Assert-True '  ...and the one real candidate is still in scope' `
+([int] $statsOffEstate.PortCandidateHostCount -eq 1) ("got $($statsOffEstate.PortCandidateHostCount)")
+Assert-True '  ...so the numerator can never exceed the denominator' `
+([int] $statsOffEstate.PortDistinctTargetCount -le [int] $statsOffEstate.PortCandidateHostCount)
 
 Write-Host "`nA target nobody could read is not a host that was probed"
 foreach ($case in @(

@@ -8935,6 +8935,12 @@ function Test-mdiTrendPointsComparable {
     $sameDomain = & $sameEstatePart $Previous.Domain $Current.Domain
     $sameForest = & $sameEstatePart $Previous.Forest $Current.Forest
     $sameEstate = ($sameDomain -and $sameForest)
+    # Kept so the REASON can distinguish "a different estate" from "an estate nobody could name".
+    # Refusing is right for both, but saying "the baseline is from a different domain" about a value
+    # that could not be read is a fabrication, and the sentence it feeds tells the operator the
+    # baseline "belongs to somebody else's estate and should be removed from this folder".
+    $domainUnreadable = (& $unreadableName $Previous.Domain) -or (& $unreadableName $Current.Domain)
+    $forestUnreadable = (& $unreadableName $Previous.Forest) -or (& $unreadableName $Current.Forest)
 
     # Sorted at compare time rather than trusting the writer to have sorted. The writer does sort, but a
     # history file written by an earlier version, edited by hand, or merged from elsewhere carries the
@@ -8975,7 +8981,16 @@ function Test-mdiTrendPointsComparable {
             # Named explicitly. "Not comparable" without a reason invites the reader to assume a
             # transient glitch and ignore it, when the actual cause is that the baseline belongs to
             # somebody else's estate and should be removed from this folder.
-            if (-not $sameDomain) {
+            if ($domainUnreadable -or $forestUnreadable) {
+                # NEVER the "different estate" sentence for this case. A value nobody could read is
+                # not evidence of a different estate, and printing its rendering as a domain name -
+                # "a different domain (System.Collections.Hashtable then fabrikam.local)" - told the
+                # operator to delete a baseline on the strength of a .NET type name. The comparison
+                # is still refused, because an identity that could not be read cannot confirm the
+                # estate; what changes is that the sentence says which of those two things happened.
+                $part = if ($domainUnreadable) { 'domain' } else { 'forest' }
+                'the {0} recorded in one of the runs could not be read, so the two cannot be confirmed to be the same estate' -f $part
+            } elseif (-not $sameDomain) {
                 'the baseline is from a different domain ({0} then {1})' -f (& $estateName $Previous.Domain), (& $estateName $Current.Domain)
             } else {
                 'the baseline is from a different forest ({0} then {1})' -f (& $estateName $Previous.Forest), (& $estateName $Current.Forest)
@@ -16028,7 +16043,25 @@ function Test-mdiForestRecordIncomplete {
     )
     $discovery = ConvertTo-mdiRecordObject -Value $Record
     if ($null -eq $discovery) { return $false }
-    if (($discovery -is [string]) -or ($discovery -is [ValueType])) { return $false }
+    # A VALUE THAT WAS RECORDED AND CANNOT BE READ IS NOT THE SAME AS NO VALUE. Pietro ruled on
+    # 21 Aug that the second must be charged; the first must still not be. Both used to return
+    # complete, which is how 'Unknown', 0, 1, 12345 and $true came to certify a forest enumeration
+    # that nothing in the report claimed had finished.
+    #
+    #   $null / absent      NOTHING WAS SAID. Unchanged - "a report written before the property
+    #                       existed carries no Complete at all, and charging it would invent a gap on
+    #                       every historical baseline".
+    #   '' or whitespace    Also nothing said. A blank is how this codebase records "not known", and
+    #                       charging it would hit the same historical baselines.
+    #   any other scalar    SOMETHING WAS RECORDED AND IT CANNOT BE READ. A forest discovery field
+    #                       carrying 'Unknown', a number or a boolean does not say the enumeration
+    #                       finished, and treating it as though it did is the false green this guard
+    #                       exists to prevent - in Get-mdiForestDomain's words, "a -Forest run that
+    #                       quietly examined one domain out of five and then reported READY".
+    #   a record            Unchanged: only a Complete that is PRESENT and does not normalise to
+    #                       $true counts, and a record with no Complete is absence, not incompleteness.
+    if ($discovery -is [string]) { return -not [string]::IsNullOrWhiteSpace($discovery) }
+    if ($discovery -is [ValueType]) { return $true }
     if ($null -eq $discovery.PSObject.Properties['Complete']) { return $false }
     (ConvertTo-mdiBoolean $discovery.Complete) -ne $true
 }

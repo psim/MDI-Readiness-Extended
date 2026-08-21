@@ -42,6 +42,24 @@ is added, so an existing `-BaselinePath` history and any `-AsJson` consumer keep
 
 ### Fixed
 
+- The sampling disclosure could be suppressed by hosts that were never in scope. The count of
+  "hosts actually probed" was filtered on `Scope` while the count of "hosts that could have been
+  probed" was the domain controllers, so a probe record whose `Scope` was present but unreadable - a
+  hashtable, a number, a boolean - is not equal to `NetworkDevice`, satisfied the filter, and entered
+  a domain-controller ratio on the strength of a value nobody could read. Two named workstations were
+  enough to turn "2 of 4 probed" into "4 of 4" and silence the disclosure entirely. The numerator is
+  now drawn from the denominator's own population, so it can no longer exceed it.
+- A trend delta was drawn between two different estates when one of them could not be named. An
+  unreadable `Domain` or `Forest` normalised to blank and blank was treated as "matches anything", so
+  a run whose estate identity could not be read was declared comparable with a baseline from a
+  different forest. Such a run is now refused - and the refusal says the identity could not be read,
+  rather than claiming a different domain and printing the unreadable value's rendering as its name.
+  A blank identity still falls through, because a history written before these fields existed records
+  exactly that and every stored baseline must keep working.
+- A forest enumeration nobody could confirm was certified as complete. `ForestDiscovery` arriving as
+  `Unknown`, a number, a boolean or a list of unreadable entries answered "complete" because it was
+  not a record, which is the false green this guard exists to prevent. A value that was recorded and
+  cannot be read is now charged incomplete; absence - no field, a null, or a blank - still is not.
 - A CSV exported from the report while a filter was typed omitted the rows the filter had hidden and
   said nothing about it, so an export that matched one healthy server was indistinguishable from a
   report of a healthy estate - the reading the on-screen `n of m row(s) shown` counter exists to

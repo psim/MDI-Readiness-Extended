@@ -186,34 +186,49 @@ foreach ($s in $shapes) {
 }
 
 # ---------------------------------------------------------------------------------------------------
-# A ForestDiscovery THAT IS NOT A RECORD AT ALL. Complete is present in none of these, so absence
-# rules: not incomplete, and above all NOTHING MAY THROW - one unreadable field must not cost the
-# whole report.
+# A ForestDiscovery THAT IS NOT A RECORD AT ALL. Complete is present in none of these, and above all
+# NOTHING MAY THROW - one unreadable field must not cost the whole report.
+#
+# THE TWO GROUPS ARE THE POINT, and they were one group until Pietro ruled on 21 Aug. "Nothing was
+# recorded" and "something was recorded and it cannot be read" both used to answer COMPLETE, so a
+# ForestDiscovery of 'Unknown', 0, 1, 12345 or $true certified a forest enumeration that nothing in
+# the report ever claimed had finished - the false green this guard exists to prevent.
+#
+# What has NOT changed is the case the guard was written for: absence. A report written before the
+# property existed, a null field, or a blank string still answers complete, because charging those
+# would invent a gap on every historical baseline.
 # ---------------------------------------------------------------------------------------------------
-$raws = [ordered]@{
-    'null'              = $null
-    'empty string'      = ''
-    'whitespace'        = '   '
+$saysNothing = [ordered]@{
+    'null'         = $null
+    'empty string' = ''
+    'whitespace'   = '   '
+    'empty array'  = @()
+}
+$recordedButUnreadable = [ordered]@{
     'Unknown'           = 'Unknown'
     'zero'              = 0
     'one'               = 1
     'number 12345'      = 12345
     'boolean true'      = $true
-    'empty array'       = @()
     'two-element array' = @('a', 'b')
 }
 foreach ($s in 'Hashtable', 'Generic.Dictionary', 'PSCustomObject') {
-    foreach ($k in $raws.Keys) {
-        $r = New-Report $s $true -UseRaw -RawDiscovery $raws[$k]
-        $threw = $false
-        $inc = $null
-        try {
-            $inc = [bool] (Test-mdiForestEnumerationIncomplete -ReportData $r)
-            [void] (Test-mdiReadinessResult -ReportData $r)
-        } catch { $threw = $true }
-        Assert-That ("a {0} report with ForestDiscovery = {1} does not throw" -f $s, $k) (-not $threw)
-        Assert-That ("a {0} report with ForestDiscovery = {1} is not charged incomplete" -f $s, $k) `
-        ((-not $threw) -and ($inc -eq $false)) ("incomplete={0}" -f $inc)
+    foreach ($group in @(
+            @{ Raws = $saysNothing; Charged = $false; Label = 'says nothing, so it is not charged incomplete' },
+            @{ Raws = $recordedButUnreadable; Charged = $true; Label = 'was recorded and cannot be read, so it IS charged incomplete' }
+        )) {
+        foreach ($k in $group.Raws.Keys) {
+            $r = New-Report $s $true -UseRaw -RawDiscovery $group.Raws[$k]
+            $threw = $false
+            $inc = $null
+            try {
+                $inc = [bool] (Test-mdiForestEnumerationIncomplete -ReportData $r)
+                [void] (Test-mdiReadinessResult -ReportData $r)
+            } catch { $threw = $true }
+            Assert-That ("a {0} report with ForestDiscovery = {1} does not throw" -f $s, $k) (-not $threw)
+            Assert-That ("a {0} report with ForestDiscovery = {1} {2}" -f $s, $k, $group.Label) `
+            ((-not $threw) -and ($inc -eq $group.Charged)) ("incomplete={0}" -f $inc)
+        }
     }
 }
 
