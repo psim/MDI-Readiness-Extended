@@ -267,15 +267,33 @@ Assert-True 'the remediation script generator does not throw on an unreadable NN
 Assert-True 'the generated remediation script was written' ((-not $remThrew) -and (Test-Path $remPath))
 Remove-Item $remPath -Force -ErrorAction SilentlyContinue
 
-# CONTROL: the cast at that call site is load-bearing. Get-mdiTargetLabel types both parameters as
-# [string] and REFUSES a collection, so removing the coercion reinstates the terminating error - the
-# same failure mode proven fatal for the two functions above. This pins the helper contract the fix
-# depends on; the call-site coercion itself was verified by probe MDI-AB\live\xforest-24, which is
-# recorded here rather than claimed as a regression test, because a fixture that reaches that line
-# with an array-shaped Target could not be built and an assertion that passes either way is worthless.
-$labelRejects = $false
-try { $null = Get-mdiTargetLabel -Target @('dcfab01.fabrikam.local') -TargetIP '10.10.1.50' } catch { $labelRejects = $true }
-Assert-True 'CONTROL: Get-mdiTargetLabel rejects a collection, so the coercion is load-bearing' $labelRejects
+# CONTROL: the helper contract this fix depends on.
+#
+# Get-mdiTargetLabel USED to type both parameters as [string], which made it REFUSE a collection -
+# the terminating error proven fatal for the two functions above, and what this control originally
+# pinned. Both parameters are now [object] and the value is READ BEFORE IT IS RENDERED, because a
+# [string] parameter renders at BIND TIME, before any guard in the body can see the value: a
+# hashtable bound as 'System.Collections.Hashtable' and a two-element list as its elements joined by
+# a space. Neither is whitespace, so both were printed to the operator as a host NAME that nothing
+# ever read - an unread value coming back looking like a measurement.
+#
+# So the contract to pin is no longer "it throws at the bind". It is the pair of facts the fix rests
+# on: the call can no longer fail to bind, AND an unreadable target is never printed as a host name -
+# the label falls back to the address alone. A one-element collection is not unreadable, it holds
+# exactly one name, so it must still render that name.
+#
+# Measured on the shipped function (MDI-AB\live\w197): '...local' and @('...local') both render
+# 'dcfab01.fabrikam.local (10.10.1.50)', while @('a','b'), @{}, 12345, '' and $null all render
+# '10.10.1.50'.
+$labelThrew = $false
+try { $null = Get-mdiTargetLabel -Target @('dcfab01.fabrikam.local') -TargetIP '10.10.1.50' } catch { $labelThrew = $true }
+Assert-True 'CONTROL: Get-mdiTargetLabel reads a collection instead of refusing it at the bind' (-not $labelThrew)
+Assert-True 'a one-element collection still names the host it holds' (
+    (Get-mdiTargetLabel -Target @('dcfab01.fabrikam.local') -TargetIP '10.10.1.50') -like '*dcfab01.fabrikam.local*')
+Assert-True 'CONTROL: a two-element list is unreadable, so the label falls back to the address alone' (
+    (Get-mdiTargetLabel -Target @('dcfab01.fabrikam.local', 'dc01.mdilab.local') -TargetIP '10.10.1.50') -eq '10.10.1.50')
+Assert-True 'CONTROL: nor is a hashtable printed as a name, which a [string] parameter rendered as its type name' (
+    (Get-mdiTargetLabel -Target @{} -TargetIP '10.10.1.50') -eq '10.10.1.50')
 Assert-True 'and the coerced form is accepted' (
     (Get-mdiTargetLabel -Target ([string] @('dcfab01.fabrikam.local')) -TargetIP ([string] @('10.10.1.50'))) -like '*dcfab01.fabrikam.local*')
 

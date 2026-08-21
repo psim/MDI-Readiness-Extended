@@ -3225,7 +3225,7 @@ function Get-mdiRequiredPorts {
             # The direction is stated in the finding itself, not only in ProbedFrom, because these
             # strings are what the operator reads in the Issues table and pastes into a change request.
             FailedRequired   = @(foreach ($failure in $mandatoryFailures) {
-                    $targetLabel = Get-mdiTargetLabel -Target ([string] $failure.Target) -TargetIP ([string] $failure.TargetIP)
+                    $targetLabel = Get-mdiTargetLabel -Target $failure.Target -TargetIP $failure.TargetIP
                     $line = [string] $failure.Protocol + '/' + [string] $failure.Port + ' to ' + $targetLabel + ': ' + [string] $failure.Detail
                     if ($usedFallback) { 'Not tested in the required direction - measured inbound from this computer instead: ' + $line } else { $line }
                 })
@@ -6577,12 +6577,46 @@ function Get-mdiTargetLabel {
         fabricated "name (different address)" pair.
     #>
     param (
-        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [string] $Target,
-        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [string] $TargetIP
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [object] $Target,
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [object] $TargetIP
     )
 
-    $name = ([string] $Target).Trim()
-    $address = ([string] $TargetIP).Trim()
+    # [object], and READ before rendered. These were typed [string], so the render happened at
+    # PARAMETER BIND TIME - before any guard in this body could see the value - and a cast is a test
+    # of the RENDERING, not of the value. A hashtable bound as 'System.Collections.Hashtable' and a
+    # two-element list as its elements joined by a space. Neither is whitespace, so both survived the
+    # emptiness guards below and were returned as the operator-facing IDENTITY OF A MACHINE.
+    #
+    # Measured end to end on the shipped functions, one sensor with one readable target
+    # dc9.mdilab.local and one unreadable one, the SAME run producing both of these:
+    #
+    #   the warning   "N blocked Network Name Resolution result(s) carry no readable target, so no
+    #                  inbound firewall rule could be generated for them"
+    #   the finding   "[High] mem03.mdilab.local: Name resolution could not be tested for
+    #                  System.Collections.Hashtable System.Collections.Hashtable
+    #                  System.Collections.Hashtable (10.10.1.50 10.10.1.50 10.10.1.50)"
+    #
+    # So the run told the operator a host called System.Collections.Hashtable could not be resolved,
+    # on the same page as a warning saying those targets have no readable name - and with a
+    # list-shaped Target the three methods FUSED into one name belonging to no machine:
+    # 'dca.mdilab.local dcb.mdilab.local dca.mdilab.local dcb...'. An engineer is sent to fix a host
+    # that does not exist while the two that really failed are never named.
+    #
+    # Fixed HERE rather than at the eleven call sites, for the reason ConvertTo-mdiText already
+    # states in this file: one choke point cannot drift, whereas a cast that has to be remembered at
+    # every call site is a rule, and this one had already been remembered at exactly one of them
+    # (Get-mdiRequiredPorts, which wraps its Target in ConvertTo-mdiReadableDomainName and is the
+    # only site that was right). Every caller may keep its own [string] cast harmlessly: casting a
+    # value this function has already reduced is identity.
+    #
+    # An unreadable value becomes the EMPTY STRING, which is what this function's existing guards
+    # already handle - it falls through to the address, and a target with neither returns '' for the
+    # caller to word as "an unnamed target". That is true, and the address is the only identifying
+    # thing about such a record that anybody actually read.
+    $readableTarget = ConvertTo-mdiReadableDomainName -Value $Target
+    $readableTargetIP = ConvertTo-mdiReadableDomainName -Value $TargetIP
+    $name = ([string] $readableTarget).Trim()
+    $address = ([string] $readableTargetIP).Trim()
     $canonicalName = ConvertTo-mdiCanonicalIPAddress -Value $name
     $canonicalAddress = ConvertTo-mdiCanonicalIPAddress -Value $address
     if ($null -ne $canonicalName) { $name = $canonicalName }
@@ -6607,15 +6641,23 @@ function Get-mdiUnmeasuredProbeText {
     #>
     param (
         [Parameter(Mandatory = $true)] [string] $Prefix,
-        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [string] $Target,
-        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [string] $TargetIP,
-        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [string] $Detail
+        # [object], for the reason Get-mdiTargetLabel's body now states at length: typed [string]
+        # these rendered at BIND TIME, so an unreadable target reached the operator as the name of
+        # the host that failed. Handed on unrendered, they are reduced by that one shared reader.
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [object] $Target,
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [object] $TargetIP,
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [object] $Detail
     )
 
     $label = Get-mdiTargetLabel -Target $Target -TargetIP $TargetIP
     if ([string]::IsNullOrEmpty($label)) { $label = 'an unnamed target' }
     $text = '{0} {1}' -f $Prefix, $label
-    $reason = ([string] $Detail).Trim()
+    # The REASON is read the same way. It is free text rather than a name, so it is not a domain
+    # name read - but an unreadable Detail rendered to a type name produced ": System.Collections
+    # .Hashtable" appended to the row, which reads as the cause of the failure. An unreadable reason
+    # is no reason, and the sentence is then correctly emitted without one.
+    $readableDetail = if ($Detail -is [string]) { $Detail } else { ConvertTo-mdiReadableDomainName -Value $Detail }
+    $reason = ([string] $readableDetail).Trim()
     # The reason is appended only when there is one. An empty Detail must not produce a trailing
     # colon, which reads as a truncated message rather than as an absent one.
     if (-not [string]::IsNullOrEmpty($reason)) { $text = '{0}: {1}' -f $text, $reason }
@@ -6639,7 +6681,7 @@ function Get-mdiNnrIssueText {
     # is far worse than one row reading "an unnamed target", and an unnamed target is itself a fact
     # worth stating rather than a reason to abort.
     param (
-        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [string] $Target,
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [object] $Target,
         # The ADDRESS the failure was measured against, when the target has more than one. A
         # multi-homed host is discovered once per address and probed per address, so one NIC can
         # answer every NNR method while another answers none - and the unqualified wording then made
@@ -6654,11 +6696,15 @@ function Get-mdiNnrIssueText {
         # operator works from said the host could not be resolved at all - and gave them no way to
         # find the broken NIC. Optional, because a single-homed target has nothing to qualify and the
         # shorter sentence is the right one there.
-        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [string] $TargetIP
+        [Parameter(Mandatory = $false)] [AllowEmptyString()] [AllowNull()] [object] $TargetIP
     )
 
-    $name = ([string] $Target).Trim()
-    $address = ([string] $TargetIP).Trim()
+    # [object] and reduced through the shared reader, for the reason Get-mdiTargetLabel's body now
+    # states: typed [string] these rendered at BIND TIME, so this row - the one that may justify a
+    # firewall change on a production domain controller - named 'System.Collections.Hashtable' as
+    # the host nobody could resolve.
+    $name = ([string] (ConvertTo-mdiReadableDomainName -Value $Target)).Trim()
+    $address = ([string] (ConvertTo-mdiReadableDomainName -Value $TargetIP)).Trim()
     if ([string]::IsNullOrEmpty($name)) {
         if (-not [string]::IsNullOrEmpty($address)) { return 'No NNR method could resolve an unnamed target at ' + $address }
         return 'No NNR method could resolve an unnamed target'
@@ -6681,7 +6727,7 @@ function Get-mdiPortIssueText {
     #>
     param ([Parameter(Mandatory = $true)] [object] $Record)
 
-    $targetLabel = Get-mdiTargetLabel -Target ([string] $Record.Target) -TargetIP ([string] $Record.TargetIP)
+    $targetLabel = Get-mdiTargetLabel -Target $Record.Target -TargetIP $Record.TargetIP
     'A required network probe was measured as blocked: {0}/{1} to {2}: {3}' -f
     [string] $Record.Protocol, [string] $Record.Port, $targetLabel, [string] $Record.Detail
 }
@@ -7450,7 +7496,7 @@ function New-mdiRemediationScript {
                 # one such record among three threw and took EVERY blocked-NNR label with it, so the
                 # generated firewall rules lost their targets rather than gaining a bad one. Same
                 # class as Get-mdiServerIdentityKey and Get-mdiAddresslessDomainController.
-                Get-mdiTargetLabel -Target ([string] $_.Target) -TargetIP ([string] $_.TargetIP)
+                Get-mdiTargetLabel -Target $_.Target -TargetIP $_.TargetIP
             } | Select-Object -Unique | Sort-Object)
     }
 
@@ -17019,7 +17065,7 @@ function Get-mdiIssueList {
                     })
             } else {
                 [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Name resolution'
-                        Issue = Get-mdiNnrIssueText -Target ([string] $target)
+                        Issue = Get-mdiNnrIssueText -Target $target
                     })
             }
         }
@@ -17068,12 +17114,12 @@ function Get-mdiIssueList {
                         # target network" and "the remote probe timed out" need different responses.
                         [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Not measured'
                                 Issue = Get-mdiUnmeasuredProbeText -Prefix 'Name resolution could not be tested for' `
-                                    -Target ([string] $rec.Target) -TargetIP ([string] $rec.TargetIP) -Detail ([string] $rec.Detail)
+                                    -Target $rec.Target -TargetIP $rec.TargetIP -Detail ([string] $rec.Detail)
                             })
                     }
                     'NnrMeasured' {
                         [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Name resolution'
-                                Issue = Get-mdiNnrIssueText -Target ([string] $rec.Target) -TargetIP ([string] $rec.TargetIP)
+                                Issue = Get-mdiNnrIssueText -Target $rec.Target -TargetIP $rec.TargetIP
                             })
                     }
                     default {
@@ -17097,7 +17143,7 @@ function Get-mdiIssueList {
                 [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Not measured'
                         Issue = ('A required network probe could not be measured: {0}/{1} to {2}: {3}' -f
                             [string] $rec.Protocol, [string] $rec.Port,
-                            (Get-mdiTargetLabel -Target ([string] $rec.Target) -TargetIP ([string] $rec.TargetIP)),
+                            (Get-mdiTargetLabel -Target $rec.Target -TargetIP $rec.TargetIP),
                             [string] $rec.Detail)
                     })
             }
@@ -17110,7 +17156,7 @@ function Get-mdiIssueList {
                 [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Not verified'
                         Issue = ('A network probe carries a requirement this run could not read, so whether it had to pass was never established: {0}/{1} to {2}: {3}' -f
                             [string] $rec.Protocol, [string] $rec.Port,
-                            (Get-mdiTargetLabel -Target ([string] $rec.Target) -TargetIP ([string] $rec.TargetIP)),
+                            (Get-mdiTargetLabel -Target $rec.Target -TargetIP $rec.TargetIP),
                             [string] $rec.Detail)
                     })
             }
@@ -18543,7 +18589,7 @@ function Get-mdiRequiredPortsHtml {
                     $strongest = @($rowRequirement | Sort-Object -Property @{ Expression = { Get-mdiRequirementRank -Requirement $_ } } -Descending)[0]
                     $class = if ((Get-mdiRequirementRank -Requirement $strongest) -eq 3) { 'red' } else { 'amber' }
                     $tooltip = (@(foreach ($f in $failed) {
-                                (Get-mdiTargetLabel -Target ([string] $f.Target) -TargetIP ([string] $f.TargetIP)) +
+                                (Get-mdiTargetLabel -Target $f.Target -TargetIP $f.TargetIP) +
                                     ': ' + [string] $f.Detail
                             })) -join ' | '
                     '<td class="{0}" title="{1}">{2}/{3} open</td>' -f $class, (ConvertTo-mdiHtmlEncoded $tooltip), $ok.Count, $measurable.Count
@@ -18807,7 +18853,7 @@ function Get-mdiRequiredPortsHtml {
             # "not required", which is the more dangerous of the two readings to guess at.
             $requirementText = if ([string]::IsNullOrWhiteSpace([string] $failure.Requirement)) { 'Not stated' }
             else { [string] $failure.Requirement }
-            $targetLabel = Get-mdiTargetLabel -Target ([string] $failure.Target) -TargetIP ([string] $failure.TargetIP)
+            $targetLabel = Get-mdiTargetLabel -Target $failure.Target -TargetIP $failure.TargetIP
             [void] $lines.Add(('<tr><td style="text-align:left">{0}</td><td style="text-align:left">{1}</td><td style="text-align:left">{2}</td><td>{3}</td><td class="{4}">{5}</td><td style="text-align:left">{6}</td><td style="text-align:left">{7}</td></tr>' -f
                     (ConvertTo-mdiHtmlEncoded $failure.Server), (ConvertTo-mdiHtmlEncoded $failure.Name),
                     (ConvertTo-mdiHtmlEncoded $requirementText), (ConvertTo-mdiHtmlEncoded $failure.Protocol),
@@ -18830,7 +18876,7 @@ function Get-mdiRequiredPortsHtml {
             # port from an unmeasured optional one.
             $requirementText = if ([string]::IsNullOrWhiteSpace([string] $row.Requirement)) { 'Not stated' }
             else { [string] $row.Requirement }
-            $targetLabel = Get-mdiTargetLabel -Target ([string] $row.Target) -TargetIP ([string] $row.TargetIP)
+            $targetLabel = Get-mdiTargetLabel -Target $row.Target -TargetIP $row.TargetIP
             [void] $lines.Add(('<tr><td style="text-align:left">{0}</td><td style="text-align:left">{1}</td><td style="text-align:left">{2}</td><td>{3}</td><td class="muted-cell">{4}</td><td style="text-align:left">{5}</td><td style="text-align:left">{6}</td></tr>' -f
                     (ConvertTo-mdiHtmlEncoded $row.Server), (ConvertTo-mdiHtmlEncoded $row.Name),
                     (ConvertTo-mdiHtmlEncoded $requirementText), (ConvertTo-mdiHtmlEncoded $row.Protocol),
