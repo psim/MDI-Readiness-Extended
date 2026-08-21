@@ -42,6 +42,18 @@ is added, so an existing `-BaselinePath` history and any `-AsJson` consumer keep
 
 ### Fixed
 
+- A schema VERSION was allowed to overrule a schema READING. `Get-mdiObjectAuditing` decides whether
+  the delegated Managed Service Account audit entry applies by looking for the
+  `ms-DS-Delegated-Managed-Service-Account` class, and keeps that answer as a tri-state: present,
+  absent, or could-not-be-asked. The schema version is documented as a fallback for the case where
+  the schema itself could not be read, but the branch was spelled `-ne $true`, which is satisfied by
+  "absent" exactly as much as by "unknown". A directory that answered that the class is NOT present
+  therefore had that reading discarded and replaced with "present" whenever the forest reported
+  schema 90 or 91, so the dMSA entry stayed in the expected set and the domain was charged with
+  failing an auditing requirement for an object class it does not have - a red no administrator can
+  clear. A cross-forest bind is where that pair arises: the forest schema version is broadly readable
+  over a trust while the bind to the class object returns a plain false. The version is now consulted
+  only when there is no reading, exactly as the following branch already did.
 - The sampling disclosure could be suppressed by hosts that were never in scope. The count of
   "hosts actually probed" was filtered on `Scope` while the count of "hosts that could have been
   probed" was the domain controllers, so a probe record whose `Scope` was present but unreadable - a

@@ -11788,7 +11788,22 @@ function Get-mdiObjectAuditing {
     # The schema version is kept as a fallback for the case where the schema itself could not be read,
     # so behaviour never becomes worse than it was. A KNOWN version answers the question in both
     # directions; only a version that is unknown too leaves it genuinely unanswered.
-    if ($dmsaPresent -ne $true -and $DomainSchemaVersion -ge 90) { $dmsaPresent = $true }
+    #
+    # FALLBACK, not override - and the first branch used to spell it `$dmsaPresent -ne $true`, which
+    # is satisfied by $false exactly as much as by $null. So a directory that WAS asked, and answered
+    # that the class is not present, had that reading discarded and replaced with $true as soon as the
+    # forest reported schema 90 or 91. The elseif below already asked the question the right way
+    # round, which is what made the first one a slip rather than a decision. Measured on the shipped
+    # lines: dmsaPresent=$false with version 90 or 91 resolved to "class present", while the same
+    # $false at version 0 or 88 correctly stayed absent.
+    #
+    # The cost is the harm named two comments up: with $dmsaPresent forced $true the dMSA ACE is NOT
+    # dropped from $expectedAuditing below, so a domain that genuinely lacks the class is charged with
+    # failing an auditing requirement it cannot satisfy - a false red no administrator can clear.
+    # A cross-forest bind is what produces the pair: rootDSE and the forest schema version are broadly
+    # readable over a trust while ::Exists() on the class object returns a plain $false - not an
+    # exception - when the bind is refused or the object has not replicated to the contacted DC.
+    if ($null -eq $dmsaPresent -and $DomainSchemaVersion -ge 90) { $dmsaPresent = $true }
     elseif ($null -eq $dmsaPresent -and $DomainSchemaVersion -gt 0) { $dmsaPresent = $false }
     if ($null -eq $dmsaPresent) {
         # Neither source could answer whether the requirement applies, so no SACL assertion is made at
