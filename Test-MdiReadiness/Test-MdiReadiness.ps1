@@ -15597,14 +15597,35 @@ function Get-mdiDomainCheckDefinition {
     # neither still yields $null - the pre-existing "no information either way" case.
     $resolveMeasured = {
         param($Companion, $Result)
-        if ($null -ne $Companion) { return [bool] $Companion }
+        # PARSED, NOT CAST. [bool] 'False' is TRUE - ConvertTo-mdiBoolean's own header names this
+        # exact trap - and Measured makes a full JSON round trip, so a flag saying the check could
+        # NOT be read came back through this cast asserting that it WAS. The cast runs before the
+        # consumer's comparison, so the `$check.Measured -eq $false` branch in
+        # Get-mdiDomainCheckState - the UNREAD state - could never fire for a round-tripped flag.
+        # Measured on one domain, object auditing, nothing differing but the spelling of the flag:
+        #
+        #     flag value                 state      score          verdict    table cell
+        #     $true                      measured   3/3 unread 0   READY      Not applicable
+        #     $false                     UNREAD     2/2 unread 1   NOT READY  Not tested
+        #     'False' (JSON round trip)  MEASURED   3/3 unread 0   READY      NOT APPLICABLE
+        #
+        # `-eq $true` rather than a bare ConvertTo-mdiBoolean swap, and the difference was measured
+        # before choosing it. That function returns $null for a value it does not recognise, and
+        # $null is not $false: a bare swap fixes 'False' and simultaneously turns '' and 0 from
+        # UNREAD into measured, breaking rows that are correct today. The strict comparison keeps
+        # every unrecognised spelling unread, which is the conservative direction this file argues
+        # for everywhere else - a value nobody could read is "not looked at", never a measurement.
+        if ($null -ne $Companion) { return (ConvertTo-mdiBoolean -Value $Companion) -eq $true }
         # Normalised for the same reason Test-mdiDomainCheckNotAsserted normalises: this presence test
         # walks PSObject.Properties, which over an IDictionary enumerates the dictionary's own .NET
         # members and never its entries, so a dictionary-shaped result carrying Measured = $true
         # resolved to $null - "no information either way" - and the renderer then had nothing to
         # distinguish a check that did not run from an informational N/A.
         $Result = ConvertTo-mdiRecordObject -Value $Result
-        if ($null -ne $Result -and $null -ne $Result.PSObject.Properties['Measured']) { return [bool] $Result.Measured }
+        # Read the same way as the companion above, for the same reason: the fallback shape is the
+        # one that came out of a JSON round trip, so it is the MORE likely of the two to carry the
+        # string 'False' rather than a real boolean.
+        if ($null -ne $Result -and $null -ne $Result.PSObject.Properties['Measured']) { return (ConvertTo-mdiBoolean -Value $Result.Measured) -eq $true }
         return $null
     }
 
@@ -19604,7 +19625,7 @@ function Set-MdiReadinessReport {
     param (
         [Parameter(Mandatory = $true)] [string] $Domain,
         [Parameter(Mandatory = $true)] [string] $Path,
-        [Parameter(Mandatory = $true)] [object[]] $ReportData,
+        [Parameter(Mandatory = $true)] [object] $ReportData,
         [Parameter(Mandatory = $false)] [object] $Remediation = $null,
         [Parameter(Mandatory = $false)] [string] $BaselinePath = $null,
         [Parameter(Mandatory = $false)] [AllowNull()] [object] $Statistics = $null,
@@ -19895,7 +19916,13 @@ function Set-MdiReadinessReport {
                 if ([string] $value -ne 'N/A') { return $value }
                 # A row from an older report carries no flag; treat it as measured, which is what the
                 # report meant when it was written.
-                $measured = if ($null -eq $MeasuredFlag) { $true } else { [bool] $MeasuredFlag }
+                # Parsed, not cast, for the reason recorded at $resolveMeasured: [bool] 'False' is
+                # TRUE, so a round-tripped flag made this cell assert "Not applicable" - a definite
+                # claim that the role is absent from the domain - about a SACL nobody could read,
+                # while the verdict and the issue list said it was unverified. An ABSENT flag is
+                # still treated as measured: that is what an older report meant when it was written,
+                # and it is a different question from a flag that is present and unreadable.
+                $measured = if ($null -eq $MeasuredFlag) { $true } else { (ConvertTo-mdiBoolean -Value $MeasuredFlag) -eq $true }
                 if ($measured) { 'Not applicable' } else { 'Not tested' }
             }
             [PSCustomObject][ordered]@{
@@ -20652,7 +20679,7 @@ function Test-mdiDomainCheckPassed {
 
 function Test-mdiReadinessResult {
     param (
-        [Parameter(Mandatory = $true)] [object[]] $ReportData
+        [Parameter(Mandatory = $true)] [object] $ReportData
     )
 
     # Each collection is wrapped separately: when a domain has exactly one server the property is a bare

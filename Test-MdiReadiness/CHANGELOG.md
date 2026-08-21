@@ -17,19 +17,26 @@ traced back to the build that produced it.
 
 ## [1.2.0] - 2026-08-21
 
+Correctness release, on one theme: a value the script could not read must never come back looking
+like a measurement, and two surfaces reading the same fact must not disagree about it.
+
 A `Requirement` this script cannot read is no longer treated as one it read and found optional. It
 now has a third state of its own, and it keeps a run out of READY.
 
 The verdict therefore changes for the estates where it applies: a run that was reported READY over a
-refused or never-probed port whose obligation could not be read is now reported NOT READY. No
-existing report field changes meaning and one field is added, so an existing `-BaselinePath` history
-and any `-AsJson` consumer keep working.
+refused or never-probed port whose obligation could not be read no longer reaches READY. Measured on
+an otherwise healthy estate whose only fault is one such probe, the console prints `READINESS N/A`
+and the report's `Readiness` field reads `N/A` rather than `true` - the state is unread, not
+measured-and-failed, and the verdict says so. No existing report field changes meaning and one field
+is added, so an existing `-BaselinePath` history and any `-AsJson` consumer keep working.
 
 ### Added
 
-- `PortsRequirementUnread` in the statistics and the `-AsJson` output: applicable probes whose
+- `PortsRequirementUnread` in the statistics that drive the report: applicable probes whose
   `Requirement` could not be read and that were not measured open. Counted separately from
-  `PortsRequiredFail` and `PortsRequiredUntested`, so neither of those changes meaning.
+  `PortsRequiredFail` and `PortsRequiredUntested`, so neither of those changes meaning. The count is
+  a statistic and not a key of the `-AsJson` document; there the same state shows as `ChecksUnread`
+  rising and `Readiness` reading `N/A`.
 - A `Not verified` finding naming each such probe with its protocol, port and target address, worded
   so it is not mistaken for a probe that failed to run.
 
@@ -43,6 +50,17 @@ and any `-AsJson` consumer keep working.
   travelling that path.
 - The per-server ports state and the issue list follow the same rule as the verdict, so the Overview
   can no longer report a server's ports in order while the verdict withholds READY over them.
+- A domain check the scanner could not read was scored as a measurement and named as a pass. The
+  `Measured` companion flag was read with a bare `[bool]` cast in three places, and `[bool] 'False'`
+  is `$true`, so a flag that had been through a JSON round trip asserted the opposite of what it
+  said: the check left the unread count, the verdict flipped from NOT READY to READY, and the domain
+  auditing table claimed `Not applicable` - a definite statement that the role is absent from the
+  domain - about a SACL nobody could read. An unreadable flag now counts as unread, which also means
+  a bare `1`, the string `Unknown` and a hashtable are no longer treated as measurements.
+- A row was badged `partial results` for a server that was fully scanned. The DC table read the
+  `PartialFailure` flag with a bare `[bool]` cast while `PartialScanCount` read the same flag with
+  `-eq $true`, so after a JSON round trip the badge and the count disagreed about the same server on
+  the same page. Both now read it through the count's own expression.
 
 ### Unchanged, deliberately
 
