@@ -5410,6 +5410,20 @@ function Get-mdiSensorV3Readiness {
     # directly with v3.x, on the strength of a read that never happened.
     $hasV2Sensor = $null -ne $v2Service
     $v2ServiceState = if ($v2Service) { [string] $v2Service.State } else { $null }
+    # Through Test-mdiServiceTokenKnown, exactly as the Sense check above does, and for the same
+    # reason: SensorState below was decided by a bare `$v2ServiceState -ne 'Running'`, and every way
+    # of NOT having read the token satisfies it. Measured on the shipped function against a domain
+    # controller readable in every other respect - so neither "Not determined" branch could mask it -
+    # all four unread shapes ('Unknown', the property absent, empty, whitespace) published the
+    # definite sentence "v2.x sensor installed but not running", with UnknownChecks EMPTY so nothing
+    # else on the page disclosed the gap. That string is not internal: it is rendered into the HTML
+    # report and emitted to -AsJson as the run's single statement about the v2.x sensor.
+    #
+    # For the 'Unknown' token the same run then contradicted itself - Get-mdiSensorHealth, reading
+    # the SAME AATPSensor service, returned 'Not tested - the service control manager did not report
+    # the AATPSensor service state ... on this server, so the sensor state could not be determined'.
+    # One service, one server, one run, two opposite claims.
+    $v2StateKnown = Test-mdiServiceTokenKnown -Token $v2ServiceState
     $v2Version = if ($SensorVersion -and [string] $SensorVersion -ne 'N/A') { [string] $SensorVersion } else { $null }
 
     # 'N/A' when the version is present but unparseable, not $false.
@@ -5530,6 +5544,7 @@ function Get-mdiSensorV3Readiness {
     elseif (-not $v2Readable) { 'Not determined (the installed services could not be read on this server)' }
     elseif (-not $hasV2Sensor -and $isOnboarded -eq $true -and $isSenseRunning -eq $true -and $blockers.Count -eq 0) { 'No v2.x sensor (activate v3.x)' }
     elseif (-not $hasV2Sensor -and $blockers.Count -gt 0) { 'No sensor installed and not eligible for v3.x (use v2.x)' }
+    elseif ($hasV2Sensor -and -not $v2StateKnown) { 'Not determined (a v2.x sensor is installed but the service control manager did not report its state)' }
     elseif ($hasV2Sensor -and $v2ServiceState -ne 'Running') { 'v2.x sensor installed but not running' }
     elseif ($hasV2Sensor) { 'v2.x sensor running' }
     else { 'No Defender for Identity sensor detected' }
@@ -5666,11 +5681,19 @@ function Get-mdiSensorHealth {
     # are real, determinate states in which the sensor is genuinely not running, so they remain
     # measured failures. Only the token that means "no answer" is routed to the unmeasured path, which
     # is the same path this function already uses when WMI or the service list cannot be read.
+    #
+    # Through Test-mdiServiceTokenKnown rather than a bare -eq 'Unknown'. "No answer" has two shapes,
+    # not one: the SCM's literal 'Unknown', and WMI answering without carrying the property at all -
+    # which is why that function's own docblock names both. Testing only the first left the second on
+    # the measured path, and it was measured: a service object present with no State rendered to '',
+    # skipped this block entirely, and produced isSensorHealthOk = $false with the malformed issue
+    # "The AATPSensor service is  (start mode: Auto)" - a High finding, a red row and a place in the
+    # readiness score, from a property nobody read. One rule with two call sites is how they drift.
     $undetermined = New-Object -TypeName System.Collections.ArrayList
-    if ($sensor -and $sensorState -eq 'Unknown') { [void] $undetermined.Add('the AATPSensor service state') }
-    if ($sensor -and $sensorStartMode -eq 'Unknown') { [void] $undetermined.Add('the AATPSensor service start mode') }
-    if ($updater -and $updaterState -eq 'Unknown') { [void] $undetermined.Add('the AATPSensorUpdater service state') }
-    if ($updater -and $updaterStartMode -eq 'Unknown') { [void] $undetermined.Add('the AATPSensorUpdater service start mode') }
+    if ($sensor -and -not (Test-mdiServiceTokenKnown -Token $sensorState)) { [void] $undetermined.Add('the AATPSensor service state') }
+    if ($sensor -and -not (Test-mdiServiceTokenKnown -Token $sensorStartMode)) { [void] $undetermined.Add('the AATPSensor service start mode') }
+    if ($updater -and -not (Test-mdiServiceTokenKnown -Token $updaterState)) { [void] $undetermined.Add('the AATPSensorUpdater service state') }
+    if ($updater -and -not (Test-mdiServiceTokenKnown -Token $updaterStartMode)) { [void] $undetermined.Add('the AATPSensorUpdater service start mode') }
     if ($undetermined.Count -gt 0) {
         return [PSCustomObject]@{
             isSensorHealthOk = 'N/A'
@@ -5680,7 +5703,7 @@ function Get-mdiSensorHealth {
                 SensorStartMode  = $sensorStartMode
                 UpdaterService   = $updaterState
                 UpdaterStartMode = $updaterStartMode
-                Detail           = 'Not tested - the service control manager reported {0} as Unknown on this server, so the sensor state could not be determined' -f ($undetermined.ToArray() -join ' and ')
+                Detail           = 'Not tested - the service control manager did not report {0} on this server, so the sensor state could not be determined' -f ($undetermined.ToArray() -join ' and ')
             }
         }
     }
@@ -8874,8 +8897,36 @@ function Test-mdiTrendPointsComparable {
     # before these fields existed must fall through to the fingerprint checks rather than be declared
     # incomparable on a property they never had. That keeps every existing baseline working.
     $estateName = { param($p) ([string] (ConvertTo-mdiReadableDomainName -Value $p)).Trim().TrimEnd('.') }
+    # A VALUE NOBODY COULD READ IS NOT THE SAME THING AS NO VALUE, and treating them alike is the
+    # defect. Both arrive here as a blank name, and blank was a wildcard:
+    #
+    #     mdilab.local vs fabrikam.local   comparable=False   correct
+    #     mdilab.local vs UNREADABLE       comparable=TRUE    <<< a delta drawn across two estates
+    #
+    # The split is on the SHAPE of what was recorded, not on how it renders:
+    #
+    #   absent, or a blank string   NOTHING WAS SAID. A history written before these fields existed
+    #                               records exactly this, and so does a run that simply had no forest
+    #                               to name. It must keep falling through to the fingerprint checks -
+    #                               declaring every historical baseline incomparable over a property
+    #                               it never had is a far larger harm than the one being fixed.
+    #   a non-string that yields    A VALUE WAS RECORDED AND IT CANNOT BE READ - a hashtable, an
+    #   no readable name            array, a number, a boolean, a PSCustomObject. That is not "any
+    #                               estate", it is no estate, and it cannot confirm the identity this
+    #                               function exists to confirm. Refused.
+    #   a readable name             Compared, as before.
+    #
+    # Deliberately NOT keyed on property presence: this file models a legacy entry as Domain '' and
+    # Forest '' rather than as a missing property, so presence would answer the wrong question.
+    $unreadableName = {
+        param($Value)
+        if ($null -eq $Value) { return $false }
+        if ($Value -is [string]) { return $false }
+        [string]::IsNullOrWhiteSpace((& $estateName $Value))
+    }
     $sameEstatePart = {
         param($a, $b)
+        if ((& $unreadableName $a) -or (& $unreadableName $b)) { return $false }
         $x = & $estateName $a
         $y = & $estateName $b
         ([string]::IsNullOrWhiteSpace($x) -or [string]::IsNullOrWhiteSpace($y) -or
@@ -16473,9 +16524,6 @@ function Get-mdiReportStatistics {
     # records do not reliably carry Scope: requiring Scope -eq 'DomainController' collapses this
     # numerator to ZERO on real estates, measured as SampledEstateStillSaysItWasSampled going to
     # 14 pass / 7 fail with "four distinct hosts were probed got 0".
-    $portDistinctTarget = @($portRecords | Where-Object { -not (Test-mdiProbeIsPrimaryNnr -Record $_) -and $_.Scope -ne 'NetworkDevice' } |
-            ForEach-Object { Get-mdiProbeRecordTargetKey -Record $_ } |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     # Drawn from the reachable domain controllers, which is the population the LDAP target list is
     # selected from. An unreachable DC is already reported as unreachable and must not also be counted
     # as a host the ports probe declined to visit, and a discovery placeholder is not a host at all.
@@ -16483,6 +16531,32 @@ function Get-mdiReportStatistics {
     # cannot drift apart again - they did, and the placeholder clause was missing from both.
     $portCandidateHost = @(@($ReportData.DomainControllers) | Where-Object { Test-mdiServerIsProbeCandidate -Server $_ } |
             ForEach-Object { Get-mdiServerIdentityKey -Server $_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+
+    # AND THEN INTERSECTED WITH IT. Filtering on Scope alone left a residual that was known and
+    # written down rather than fixed: a record whose Scope is PRESENT BUT UNREADABLE - a hashtable, a
+    # number, a boolean, 'Unknown' - is not equal to 'NetworkDevice', so it satisfied the exclusion
+    # above and entered a DOMAIN-CONTROLLER ratio on the strength of a value nobody could read.
+    #
+    # A numerator can only be honest about the denominator's population if it is drawn FROM it. The
+    # two key functions exist as a matched pair for exactly this - Get-mdiProbeRecordTargetKey's own
+    # header calls itself "the counterpart of Get-mdiServerIdentityKey" and records that these two
+    # counts are the halves of one ratio - so the intersection is what the pair was built to make
+    # possible, and it settles every unreadable spelling at once instead of enumerating them.
+    #
+    # It also restores an invariant the card silently broke: the numerator can no longer EXCEED the
+    # denominator. Two named workstations previously produced "4 of 4" on an estate whose four
+    # domain controllers had been probed twice, which is how the sampling disclosure came to be
+    # suppressed.
+    #
+    # Scope is still consulted first, deliberately. A domain controller is probed under BOTH scopes
+    # when it is also an NNR target (the fallback scope list is @('NetworkDevice','DomainController')
+    # for a DC), so its NNR rows would otherwise pass the intersection and count as a ports visit.
+    # Requiring Scope -eq 'DomainController' instead of excluding the device population remains wrong
+    # for the reason measured above: port records do not reliably carry Scope at all.
+    $portDistinctTarget = @($portRecords | Where-Object { -not (Test-mdiProbeIsPrimaryNnr -Record $_) -and $_.Scope -ne 'NetworkDevice' } |
+            ForEach-Object { Get-mdiProbeRecordTargetKey -Record $_ } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique |
+            Where-Object { $portCandidateHost -contains $_ })
 
     $v3Servers = @($reachable | Where-Object { $_.Details.SensorV3ReadyDetails })
     # A reachable server that produced NO v3 detail at all was absent from BOTH sides of the ratio and
