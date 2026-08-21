@@ -948,10 +948,49 @@ function Invoke-mdiRemoteCommand {
                     ComputerName = $ComputerName
                 }
                 $fileContents = Get-CimInstance @fileInstanceParams -ErrorAction Stop
-                $fileLengthBytes = $fileContents.FileData[0..3]
+                # The length prefix is DECLARED by the payload. It is not evidence of what actually
+                # arrived, and it was never compared against that. The slice bound was computed
+                # straight from it, and `4..N` with N below 4 is a DESCENDING range in PowerShell -
+                # 4,3,2,1,0,-1 - where a negative index counts from the END of the array. Measured on
+                # the shipped function with FileData = 0,0,0,15 + 'HELLO WORLD' (15 bytes in all):
+                #
+                #     prefix=0 -> [H    D]   prefix=1 -> [H   ]   prefix=2 -> [H  ]
+                #     prefix=3 -> [H ]       prefix=4 -> [H]
+                #
+                # each of which declares NO content and yet returned the reversed length prefix -
+                # written to a temp file, read back and handed to the caller as the output of the
+                # remote command, with nothing thrown and nothing null for any caller to notice.
+                # An UNDERSTATED prefix was worse because it looks legitimate: prefix=8 returned
+                # 'HELL' and prefix=10 'HELLO ' - real bytes, silently short. This transport
+                # carries the port-probe results, the auditpol backup and the power scheme, and it is
+                # the fallback used precisely on servers whose C$ is disabled, so a short read is a
+                # WRONG measurement rather than a missing one.
+                #
+                # The prefix counts the WHOLE FileData, not the content after it - only that
+                # convention round-trips (prefix=15 returns 'HELLO WORLD' exactly; prefix=11 returns
+                # 'HELLO W'), so the slice itself was right whenever the prefix agreed with reality.
+                # Requiring that agreement is the entire fix: a payload whose own header contradicts
+                # its size was not read, and an unread file is $null here, exactly as it already is
+                # when the CIM class is unavailable.
+                $fileData = @($fileContents.FileData)
+                if ($fileData.Count -lt 4) {
+                    throw 'the CIM file payload is too short to carry a length prefix'
+                }
+                $fileLengthBytes = [byte[]] $fileData[0..3]
                 [array]::Reverse($fileLengthBytes)
                 $fileLength = [BitConverter]::ToUInt32($fileLengthBytes, 0)
-                $fileBytes = $fileContents.FileData[4..($fileLength - 1)]
+                # EXACT agreement, not merely "it fits". A first attempt at this guard accepted any
+                # length that was <= what arrived, which still let an UNDERSTATED prefix truncate:
+                # prefix=8 of a 15-byte payload passed the guard and returned 'HELL'. The prefix counts
+                # the WHOLE FileData, so the only length consistent with the bytes in hand is the
+                # number of bytes in hand.
+                if ($fileLength -ne $fileData.Count) {
+                    throw ('the CIM file payload declares {0} byte(s) but carries {1}' -f $fileLength, $fileData.Count)
+                }
+                # A declared length of exactly 4 is the prefix and nothing else: a command that ran
+                # and produced no output. That is a real, readable answer and must stay empty rather
+                # than becoming a descending slice.
+                $fileBytes = if ($fileLength -eq 4) { [byte[]] @() } else { $fileData[4..($fileLength - 1)] }
                 $localTempFile = [IO.Path]::GetTempFileName()
                 try {
                     # WriteAllBytes rather than "Set-Content -Encoding Byte". The parameter value Byte
@@ -18140,14 +18179,63 @@ function Get-mdiClockSpread {
         }
     }
 
+    # THE SUBTRACTION IS DONE ON [decimal], AND NARROWED TO [long] ONLY WHEN THE RESULT FITS.
+    #
+    # This read `[long] ($highest.SkewSeconds - $lowest.SkewSeconds)`, and the two operands are both
+    # [long] because the reader above accepted them with [long]::TryParse. Subtracting two Int64
+    # values can leave the Int64 range: PowerShell then widens the result to [double], and the
+    # [long] cast of that double THROWS. So this function accepted a value at one line and could not
+    # arithmetic on it four lines later - one function disagreeing with itself about what is usable.
+    #
+    # Measured on the shipped function, the extended lab's estate with dcfab01 across the
+    # fabrikam.local trust carrying a skew of [int64]::MaxValue:
+    #
+    #     the reader at TryParse accepts it              -> True
+    #     Get-mdiClockSpread                             -> THREW  "Cannot convert value
+    #                                                       9.22337203685478E+18 to type System.Int64
+    #                                                       - arithmetic operation resulted in an
+    #                                                       overflow"
+    #     Get-mdiTimeSyncHtml                            -> THREW  (the same exception, escaping)
+    #
+    # The second line is the damage. This is the ONLY estate-wide check in the script, so it runs
+    # while the report is being ASSEMBLED rather than inside one server's row, and it has four
+    # callers - the statistics, the overview, the time synchronization card and
+    # Test-mdiReadinessResult. An exception here costs the WHOLE report, which is precisely what
+    # Get-mdiTimeSyncHtml's own comment about this same field says must not happen: re-narrowing a
+    # skew "would throw while BUILDING the report - losing the whole HTML file rather than one cell".
+    #
+    # SCOPE, stated no more strongly than it was measured: a LIVE single run cannot reach this.
+    # Get-mdiTimeSync builds SkewSeconds from a DateTime difference and the DateTime range caps a
+    # live skew at 315537897600 seconds, twelve orders of magnitude below the Int64 limit. It is
+    # reachable by a report READ BACK, merged or edited outside one run - the field survives the JSON
+    # round trip by design, and is re-parsed here with TryParse for exactly that reason. That is the
+    # same scope the -Maximum/-Minimum tolerance defect above was fixed under.
+    #
+    # RETURNING 'N/A' WOULD BE THE WRONG FIX AND IS DELIBERATELY NOT DONE. Both clocks WERE read and
+    # they disagree by more than any tolerance can permit, so this is a measured FAILURE, not an
+    # unmeasured one. Get-mdiReportStatistics charges the estate row only on a definite $false, so
+    # answering 'N/A' would delete the worst clock disagreement the tool can find.
+    #
+    # [decimal] is wide enough that no pair of Int64 skews can leave it - the widest possible spread
+    # is about 1.8e19 against a decimal ceiling of 7.9e28 - so the comparison below cannot throw. The
+    # narrowing keeps the stock output type unchanged: every spread a real run produces fits in
+    # [long] and is emitted as one exactly as before.
     $lowest = @($measured | Sort-Object SkewSeconds)[0]
     $highest = @($measured | Sort-Object SkewSeconds)[-1]
-    $spread = [long] ($highest.SkewSeconds - $lowest.SkewSeconds)
+    $spreadValue = [decimal] $highest.SkewSeconds - [decimal] $lowest.SkewSeconds
+    $spread = if ($spreadValue -ge [decimal] [long]::MinValue -and $spreadValue -le [decimal] [long]::MaxValue) {
+        [long] $spreadValue
+    } else {
+        $spreadValue
+    }
     [PSCustomObject]@{
         Measured       = $measured.Count
         SpreadSeconds  = $spread
         MaxSkewMinutes = $tolerance
-        IsWithin       = ($spread -le ([long] $tolerance * 60))
+        # Compared on $spreadValue, which is ALWAYS the [decimal], rather than on the narrowed
+        # $spread. The narrowed value is for the report; the verdict must not depend on whether the
+        # narrowing happened to be possible.
+        IsWithin       = ($spreadValue -le ([decimal] $tolerance * 60))
         Earliest       = $lowest.FQDN
         Latest         = $highest.FQDN
     }
