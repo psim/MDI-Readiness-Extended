@@ -16116,7 +16116,36 @@ function Get-mdiReportStatistics {
     # open 8/8, No required port blocked" with nothing saying so. That is the same illusion the NNR
     # card was corrected for: a green ratio over a fraction of the estate, on the surface an operator
     # reads first after an alert about blocked traffic.
-    $portDistinctTarget = @($portRecords | Where-Object { -not (Test-mdiProbeIsPrimaryNnr -Record $_) } |
+    #
+    # THE TWO HALVES MUST COUNT THE SAME POPULATION. The denominator below is domain controllers
+    # only. This numerator excluded PRIMARY NNR rows, and primary is not the same question as
+    # "is this a domain controller": Test-mdiProbeIsPrimaryNnr answers on the GROUP being 'NNR', and
+    # its own header records that NnrReverseDns is "deliberately NOT one of them: it shares the
+    # NetworkDevice scope but is recommended". So a recommended reverse-DNS row - Scope
+    # 'NetworkDevice', Group $null by catalogue definition - survived and put a host that is not a
+    # domain controller into a domain-controller ratio.
+    #
+    # The trigger is the script's own documented usage, -NnrTargetComputer 'WKS001', 'SRV042': a
+    # workstation and a member server, recorded under their own names by the NetworkDevice branch of
+    # the probe dispatcher, and reaching this counter through the one flat list Get-mdiPortResultRecord
+    # builds from Details.RequiredPortsDetails.Results. Measured, two of four domain controllers
+    # actually probed in every row:
+    #
+    #     baseline, no named hosts                    scope 4  probed 2  discloses
+    #     + WKS001                                    scope 4  probed 3  reads "3 of 4"
+    #     + WKS001 and SRV042                         scope 4  probed 4  SAYS NOTHING
+    #     control: the same two as PRIMARY NNR rows    scope 4  probed 2  unmoved
+    #
+    # Two named workstations erased the fact that half the estate was never probed. The product
+    # already treats these hosts as special on the NNR card - NnrCandidateCount is set to the distinct
+    # target count when -NnrTargetComputer is supplied, precisely so no sampling claim is made about a
+    # list the operator chose - and this card had no such protection.
+    #
+    # The DEVICE population is excluded rather than the domain-controller one demanded, because port
+    # records do not reliably carry Scope: requiring Scope -eq 'DomainController' collapses this
+    # numerator to ZERO on real estates, measured as SampledEstateStillSaysItWasSampled going to
+    # 14 pass / 7 fail with "four distinct hosts were probed got 0".
+    $portDistinctTarget = @($portRecords | Where-Object { -not (Test-mdiProbeIsPrimaryNnr -Record $_) -and $_.Scope -ne 'NetworkDevice' } |
             ForEach-Object { Get-mdiProbeRecordTargetKey -Record $_ } |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     # Drawn from the reachable domain controllers, which is the population the LDAP target list is
