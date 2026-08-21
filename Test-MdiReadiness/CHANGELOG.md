@@ -42,6 +42,13 @@ is added, so an existing `-BaselinePath` history and any `-AsJson` consumer keep
 
 ### Fixed
 
+- A CSV exported from the report while a filter was typed omitted the rows the filter had hidden and
+  said nothing about it, so an export that matched one healthy server was indistinguishable from a
+  report of a healthy estate - the reading the on-screen `n of m row(s) shown` counter exists to
+  prevent, on the copy that leaves the machine as evidence. The export still follows the screen; it
+  now begins with one line naming the filter text and repeating that counter. An unfiltered export is
+  unchanged, and classic view - which clears every filter and exports the whole report - carries no
+  such line.
 - A required port measured REFUSED, and a required port never probed at all, both left the run READY
   when `Requirement` arrived as null, an empty string, the boolean `true`, a number, a hashtable or a
   padded spelling. `Requirement` makes a full JSON round trip, where `"Requirement":true` becomes the
@@ -57,6 +64,23 @@ is added, so an existing `-BaselinePath` history and any `-AsJson` consumer keep
   auditing table claimed `Not applicable` - a definite statement that the role is absent from the
   domain - about a SACL nobody could read. An unreadable flag now counts as unread, which also means
   a bare `1`, the string `Unknown` and a hashtable are no longer treated as measurements.
+- A baseline history the script could not parse was overwritten, destroying every run recorded in it.
+  A file that cannot be DECODED was already preserved, but one that decodes as valid UTF-8 and fails
+  at `ConvertFrom-Json` - a history truncated by a full disk, or half-written by a run that was
+  killed - took the other branch and was replaced with the current run alone, behind a warning that
+  read as routine (`183 -> 659 bytes` measured). Such a file is now moved aside to
+  `mdi-baseline-<domain>.json.damaged-<timestamp>`, the warning says where it went, and a new history
+  is started so the trend resumes on the same run instead of being blocked until the file is repaired
+  by hand. If it cannot be moved aside it is not overwritten either.
+- The domain-scope resolver accepted anything that RENDERED as a domain name. Both directory readers
+  cast the answer to a string before the usability rule saw it, so a hashtable was accepted as
+  `System.Collections.Hashtable` and `1.5` as `1.5` - both match the DNS name pattern, carry a dot
+  and are not IP addresses. The resolved name becomes the run's `$Domain`, which names the JSON
+  report, the HTML report and the **baseline file**, and is the host part of every later `LDAP://`
+  bind, so a run that resolved to a rendered type name compared its trend against a different file.
+  The readers now hand back the directory's answer unrendered and a non-string is refused, which
+  falls through to the next reader and finally to keeping the operator's own spelling. No live run is
+  known to produce these shapes; this is hardening of a value with an outsized blast radius.
 - A row was badged `partial results` for a server that was fully scanned. The DC table read the
   `PartialFailure` flag with a bare `[bool]` cast while `PartialScanCount` read the same flag with
   `-eq $true`, so after a JSON round trip the badge and the count disagreed about the same server on

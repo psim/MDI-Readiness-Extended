@@ -89,10 +89,9 @@ try {
     Assert-That 'the script still renders dates somewhere' ($expressions.Count -ge 4) "(found $($expressions.Count))"
 
     # The expected date is DERIVED, never hard-coded. An expression that reads the live clock
-    # ([datetime]::Now / [datetimeoffset]::Now) cannot be bound to $instant, so its correct output is
-    # today's date, not $instant's. Hard-coding the author's date made this test pass only on the day
-    # it was written and fail from the next midnight onwards.
-    $boundDay = $instant.ToString('yyyy-MM-dd', [cultureinfo]::InvariantCulture)
+    # ([datetime]::Now / [datetimeoffset]::Now / Get-Date) cannot be bound to $instant, so its correct
+    # output is today's date, not $instant's. Hard-coding the author's date made this test pass only
+    # on the day it was written and fail from the next midnight onwards.
 
     foreach ($c in $hostile) {
         Use-Culture $c
@@ -106,17 +105,31 @@ try {
             # Straddle the evaluation so a midnight tick mid-run cannot flake the assertion. Read the
             # clock the same way the expression does, and in the ambient (hostile) culture - so a
             # culture leak still cannot be papered over by the expectation.
-            $isLiveClock = $e -match '::(Now|UtcNow)'
+            #
+            # Get-Date counts as a live clock too. It was added to this list after a new stamp site -
+            # the .damaged-<stamp> suffix on a baseline history that cannot be parsed - used
+            # (Get-Date).ToString(...) and was measured against $instant's day, which it can never
+            # equal: the assertion failed on a correctly-formatted, invariant stamp.
+            $isLiveClock = ($e -match '::(Now|UtcNow)') -or ($e -match 'Get-Date')
             $isUtc = $e -match '::UtcNow'
             $before = if ($isUtc) { [datetime]::UtcNow } else { [datetime]::Now }
             $rendered = [string] (Invoke-Expression $e)
             $after = if ($isUtc) { [datetime]::UtcNow } else { [datetime]::Now }
 
-            $allowedDays = if ($isLiveClock) {
-                @($before.ToString('yyyy-MM-dd', [cultureinfo]::InvariantCulture),
-                  $after.ToString('yyyy-MM-dd', [cultureinfo]::InvariantCulture)) | Select-Object -Unique
+            # Both spellings of a day are allowed, because the script writes both: 'yyyy-MM-dd' in
+            # the human-readable stamps and the compact 'yyyyMMdd' in the filename suffix. Listing
+            # only the dashed form made a correct compact stamp look like a culture leak. A real leak
+            # is still caught either way - under th-TH the compact form renders 25690821, which
+            # matches neither spelling of today.
+            $dayForms = {
+                param($d)
+                @($d.ToString('yyyy-MM-dd', [cultureinfo]::InvariantCulture),
+                  $d.ToString('yyyyMMdd', [cultureinfo]::InvariantCulture))
             }
-            else { @($boundDay) }
+            $allowedDays = if ($isLiveClock) {
+                @((& $dayForms $before) + (& $dayForms $after)) | Select-Object -Unique
+            }
+            else { @(& $dayForms $instant) }
 
             # Gregorian year, ':' as the time separator, '-' as the date separator. Any culture that
             # leaked in changes at least one of the three: th-TH renders the year as 2569, fi-FI

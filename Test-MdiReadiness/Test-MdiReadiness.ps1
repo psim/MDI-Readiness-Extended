@@ -8458,6 +8458,67 @@ function Get-mdiBaselineHistory {
                         Current = $entry
                     }
                 }
+                # A file that DECODED but did not PARSE is preserved too - by being moved aside rather
+                # than by refusing the trend. The branch above states the reason and it is not
+                # specific to code pages: the rewrite below "would replace a merely-unreadable file
+                # with one containing this run alone", and the history is the operator's only record
+                # of where the estate has been. A history truncated by a full disk, or half-written
+                # by a run that was killed, decodes as perfectly good UTF-8 and fails at
+                # ConvertFrom-Json instead, so it arrived HERE and was overwritten. The lock taken
+                # above exists precisely because runs collide, which makes a half-written file the
+                # ORDINARY damage rather than the exotic one.
+                #
+                # Measured on v1.1.8, real files, bytes compared before and after:
+                #
+                #     invalid UTF-8 (cp1252)    11 ->  11 bytes   left untouched   (documented)
+                #     valid UTF-8, TRUNCATED   183 -> 659 bytes   DESTROYED        <<< every previous
+                #                                                 run gone, behind a warning that
+                #                                                 reads as routine
+                #
+                # Moving it aside rather than returning early is the deliberate difference from the
+                # decoder branch: nothing is lost, so the trend can RESUME on this run instead of
+                # being blocked until someone repairs the file by hand.
+                #
+                # The suffix goes AFTER the .json extension so the preserved copy cannot be picked up
+                # as a history file by anything looking for mdi-baseline-*.json. A zero-length file
+                # is not copied: there is nothing to lose and a folder full of empty .damaged files
+                # is its own kind of noise.
+                $preserved = $null
+                $preserveError = $null
+                $damagedLength = 0
+                try { $damagedLength = (Get-Item -LiteralPath $file).Length } catch { $damagedLength = 0 }
+                if ($damagedLength -gt 0) {
+                    $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss', [cultureinfo]::InvariantCulture)
+                    $candidate = '{0}.damaged-{1}' -f $file, $stamp
+                    $suffix = 1
+                    while (Test-Path -LiteralPath $candidate) {
+                        $candidate = '{0}.damaged-{1}-{2}' -f $file, $stamp, $suffix
+                        $suffix++
+                    }
+                    try {
+                        [IO.File]::Move($file, $candidate)
+                        $preserved = $candidate
+                    } catch {
+                        $preserveError = ($_.Exception.Message -replace '[\r\n]+', ' ')
+                    }
+                }
+                if ($null -ne $preserveError) {
+                    # The move failed, so the only copy of the history is still the file itself and
+                    # the rewrite below would destroy it. Refusing the trend is the same trade the
+                    # decoder branch makes, for the same reason: an unreadable file that still exists
+                    # can be recovered by hand, one that has been overwritten cannot.
+                    Write-mdiWarning ('The baseline history at {0} could not be read and could not be moved aside ({1}), so it was left untouched rather than being overwritten and losing the runs already in it.' -f $file, $preserveError)
+                    return [PSCustomObject]@{
+                        Path    = $file
+                        History = @()
+                        Current = $entry
+                    }
+                }
+                if ($null -ne $preserved) {
+                    Write-mdiWarning ('The baseline history at {0} could not be read, so it was moved aside to {1} rather than overwritten - the runs already recorded are preserved there.' -f $file, $preserved)
+                }
+                # Still raised, and deliberately: a new history IS what is being started, and two
+                # committed tests assert this exact wording for a malformed file.
                 Write-mdiWarning ('Starting a new baseline history at {0}.' -f $file)
                 $history = @()
             }
@@ -19533,6 +19594,24 @@ function Get-mdiReportScript {
       var scope = isClassic ? document : document.querySelector(".panel.active");
       if (!scope) { return; }
       var out = [];
+      // THE FILE HAS TO SAY WHAT THE SCREEN SAYS. In modern view a filter hides rows and the export
+      // deliberately follows the screen (see the skip below), but the exported file used to leave
+      // with no trace of the filter at all: a filter matching one healthy server produced a CSV that
+      // looks exactly like a report with one healthy server in it - the same failure the on-screen
+      // "n of m row(s) shown" counter exists to prevent, except the file is the copy that gets
+      // emailed as evidence and the counter stays behind on the screen.
+      // Classic view needs no note: it clears every filter and exports the whole report.
+      if (!isClassic) {
+        [].slice.call(scope.querySelectorAll(".filter input")).forEach(function (box) {
+          if (!box.value) { return; }
+          var counter = box.parentNode.querySelector(".filter-count");
+          var shown = (counter && counter.textContent) ? counter.textContent : "rows hidden";
+          var note = 'Filtered: ' + shown + ' for "' + box.value +
+            '" - rows hidden by the filter are NOT included in this file';
+          out.push('"' + note.replace(/"/g, '""') + '"');
+        });
+        if (out.length) { out.push(""); }
+      }
       [].slice.call(scope.querySelectorAll("table")).forEach(function (table, index) {
         if (index) { out.push(""); }
         [].slice.call(table.rows).forEach(function (row) {
@@ -21146,7 +21225,28 @@ function Resolve-mdiDomainScopeDnsName {
 
     $isUsable = {
         param($Candidate)
-        $resolved = ConvertTo-mdiDomainScopeName -DomainName ([string] $Candidate)
+        # THE ANSWER MUST BE A NAME, NOT SOMETHING THAT RENDERS AS ONE. This test used to run on
+        # ([string] $Candidate) with both readers casting before they returned, so the rule below was
+        # applied to a RENDERING and never to the directory's actual answer. A format string has no
+        # opinion about what it was handed and .NET prints a type name when it has nothing better, so
+        # a hashtable arrived as 'System.Collections.Hashtable' and 1.5 as '1.5' - both of which are
+        # letters or digits with dots, match the DNS pattern, are not IP addresses, and carry a dot,
+        # so both were ACCEPTED as the domain's DNS name.
+        #
+        # That is not a mislabelling. The accepted value is assigned back into the run-wide $Domain,
+        # which names the JSON report, the HTML report and the BASELINE FILE, and is the host part of
+        # every later LDAP:// bind - so a run that resolved to a rendered type name wrote and read a
+        # different baseline file and compared its trend against nothing.
+        #
+        # Fixing only the dotless case would NOT have covered this: 12345 was already refused by the
+        # "a dotless answer must equal the request" rule below, and neither of the two shapes above
+        # is dotless.
+        #
+        # Refusing costs nothing new. An unusable answer falls through to the next reader, and if
+        # none answers usably the operator's own spelling is kept - which is exactly what already
+        # happens whenever the directory cannot be asked at all.
+        if ($Candidate -isnot [string]) { return $false }
+        $resolved = ConvertTo-mdiDomainScopeName -DomainName $Candidate
         (-not [string]::IsNullOrWhiteSpace($resolved)) -and
         ($resolved -match '^[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?)*$') -and
         ($null -eq (ConvertTo-mdiCanonicalIPAddress -Value $resolved)) -and
@@ -21156,14 +21256,18 @@ function Resolve-mdiDomainScopeDnsName {
     # Both readers are tried in turn, and an UNUSABLE answer falls through to the next one rather
     # than ending the search: a directory that answers with a blank, an address or a number has told
     # us nothing, which is the same position as not having been asked.
+    #
+    # The readers hand back the directory's answer UNRENDERED. They used to cast it to [string]
+    # themselves, which destroyed the only evidence $isUsable needed to tell a name from an object
+    # that merely prints like one.
     $readers = @(
         @{ Name = 'Active Directory Web Services'
-            Read = { ([string] (Get-ADDomain -Server $requested -ErrorAction Stop).DNSRoot) }
+            Read = { (Get-ADDomain -Server $requested -ErrorAction Stop).DNSRoot }
         }
         @{ Name = 'the domain locator'
             Read = {
                 $context = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext('Domain', $requested)
-                ([string] ([System.DirectoryServices.ActiveDirectory.Domain]::GetDomain($context)).Name)
+                ([System.DirectoryServices.ActiveDirectory.Domain]::GetDomain($context)).Name
             }
         }
     )
