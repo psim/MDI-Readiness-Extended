@@ -42,6 +42,18 @@ is added, so an existing `-BaselinePath` history and any `-AsJson` consumer keep
 
 ### Fixed
 
+- A process termination whose outcome was never read was reported as a completed termination. When a
+  remote command outruns its timeout the process is terminated with `Win32_Process.Terminate`, which
+  reports failure through a return value rather than by throwing. The status was read as
+  `if ($null -ne $terminateStatus) { [int] $terminateStatus.ReturnValue } else { 0 }`, and 0 is the
+  one value that means success - so a call that returned nothing at all, an object carrying no
+  `ReturnValue`, or a null `ReturnValue`, all told the operator "did not finish within Ns and was
+  terminated" while the process was still running. The orphaned process keeps probing ports and
+  holding its temp file open, so the cleanup cannot remove the file either, and the operator has been
+  given no reason to look. Access denied is the ordinary case for the non-admin caller this script
+  supports, and a terminate across a forest trust is where an incomplete answer arrives instead of a
+  clean status. An absent status is now a failure that names its own cause, matching how the sibling
+  `Create` call in the same function already resolved the identical question.
 - A schema VERSION was allowed to overrule a schema READING. `Get-mdiObjectAuditing` decides whether
   the delegated Managed Service Account audit entry applies by looking for the
   `ms-DS-Delegated-Managed-Service-Account` class, and keeps that answer as a tri-state: present,

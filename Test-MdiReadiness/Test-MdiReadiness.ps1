@@ -882,8 +882,23 @@ function Invoke-mdiRemoteCommand {
                 $killError = $null
                 try {
                     $terminateStatus = $stillRunning.Terminate()
-                    $terminateReturn = if ($null -ne $terminateStatus) { [int] $terminateStatus.ReturnValue } else { 0 }
-                    if ($terminateReturn -ne 0) {
+                    # 0 is success, anything else is not, 'it threw' is not success either - and neither is
+                    # AN OUTCOME THAT WAS NEVER READ. The else branch here used to yield 0, the one value that
+                    # means success, so a Terminate() that returned nothing - or returned an object carrying no
+                    # ReturnValue, since [int] $null is 0 by the same route - told the operator "did not finish
+                    # within Ns and was terminated" while the process was still running. That is the exact
+                    # completed-action claim the comment above records having removed, arriving by a different
+                    # door. Measured on the shipped lines: $null, a missing ReturnValue and a $null ReturnValue
+                    # all produced 0 and all three were reported as a completed termination.
+                    #
+                    # Resolved the way the SIBLING at the Create call already resolves the identical question:
+                    # an absent result is $null and $null is a failure, never a status. One rule, both hands.
+                    $terminateReturn = if ($null -eq $terminateStatus -or
+                        $null -eq $terminateStatus.PSObject.Properties['ReturnValue'] -or
+                        $null -eq $terminateStatus.ReturnValue) { $null } else { [int] $terminateStatus.ReturnValue }
+                    if ($null -eq $terminateReturn) {
+                        $killError = 'Win32_Process.Terminate did not report a status, so whether the process ended was never read'
+                    } elseif ($terminateReturn -ne 0) {
                         $killError = 'Win32_Process.Terminate returned {0}' -f $terminateReturn
                     }
                 } catch {
