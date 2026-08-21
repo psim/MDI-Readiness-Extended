@@ -8408,8 +8408,8 @@ function Get-mdiBaselineHistory {
         # operator most wanted to see the improvement.
         CheckNames    = @($Statistics.CheckTotals.Keys |
                 Where-Object { $_ -ne $script:mdiIncompleteScanCheckName } | Sort-Object)
-        ServerNames   = @($Statistics.Servers | ForEach-Object { [string] $_.FQDN } |
-                Where-Object { $_ } | Sort-Object)
+        ServerNames   = @($Statistics.Servers | ForEach-Object { ConvertTo-mdiReadableDomainName -Value $_.FQDN } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object)
         ChecksPassed  = [int] $Statistics.ChecksPassed
         ChecksTotal   = [int] $Statistics.ChecksTotal
         ChecksUnread  = [int] $Statistics.ChecksUnread
@@ -8849,8 +8849,9 @@ function Test-mdiTrendPointsComparable {
     # improvement in the customer's estate. Every fix in this project that corrected a false green
     # moved a check from passing to failing, so the version guard is what stops those corrections from
     # being read as a regression the customer caused.
-    $previousVersion = ([string] $Previous.ScriptVersion).Trim()
-    $currentVersion = ([string] $Current.ScriptVersion).Trim()
+    $versionText = { param($v) $(if ($null -eq $v -or $v -is [string] -or $v -is [valuetype]) { ([string] $v).Trim() } else { '' }) }
+    $previousVersion = & $versionText $Previous.ScriptVersion
+    $currentVersion = & $versionText $Current.ScriptVersion
     # Only compared when BOTH sides recorded one: a history written before the field existed must fall
     # through to the fingerprint checks rather than be declared incomparable on a missing value.
     # Trimmed and compared case-insensitively - ' 1.1.0 ' and '1.1.0' are the same build, and treating
@@ -8872,7 +8873,7 @@ function Test-mdiTrendPointsComparable {
     # Guarded on BOTH sides recording a value, exactly like the version check above: histories written
     # before these fields existed must fall through to the fingerprint checks rather than be declared
     # incomparable on a property they never had. That keeps every existing baseline working.
-    $estateName = { param($p) ([string] $p).Trim().TrimEnd('.') }
+    $estateName = { param($p) ([string] (ConvertTo-mdiReadableDomainName -Value $p)).Trim().TrimEnd('.') }
     $sameEstatePart = {
         param($a, $b)
         $x = & $estateName $a
@@ -17991,6 +17992,85 @@ function Get-mdiStartModeClass {
     'red'
 }
 
+function Get-mdiServiceStateClass {
+    <#
+        The colour a SERVICE STATE cell gets. The sibling of Get-mdiStartModeClass, extracted for the
+        same reason and after the same defect - the one that function's header describes as "a green
+        cell is an assertion that the value is fine".
+
+        This rule was written inline, three times, as
+            if ([string] $x -eq 'Running') { 'green' } elseif ([string] $x -eq 'Not installed') { 'grey' } else { 'red' }
+        A bare [string] cast tests the RENDERING, so a state NOBODY READ matched neither branch and
+        fell to the else: RED, which on this page means a measured failure. Measured on the shipped
+        renderer with Installed reading TRUE and the state replaced one shape at a time - the class,
+        and the text rendered in the same cell:
+
+            ''      red  (empty)      $null   red  (empty)      '   '  red  (whitespace)
+            'N/A'   red  N/A          @{}     red  System.Collections.Hashtable
+            $true   red  True         12345   red  12345        @(..)  red  Running Stopped
+
+        All eight carry the SAME class as a genuinely Stopped service, so a reader cannot tell a
+        service that FAILED from one nobody READ - and three of them print a rendered .NET object to
+        the operator as a service state. With the server's own SensorHealth tri-state set to 'N/A',
+        meaning not measured, the cell was STILL red: the page asserted a measured failure on a row
+        whose own tri-state said the check was never taken.
+
+        This is not contrived. Get-mdiSensorHealth builds the value as
+            $sensorState = if ($sensor) { [string] $sensor.State } else { 'Not installed' }
+        so a service object present but carrying no State renders to '' - and '' is not the service
+        control manager's 'Unknown' token, so it BYPASSES the undetermined path that function builds
+        so carefully and arrives here looking like an ordinary answer.
+
+        The adjacent column already got this right, which is what makes it a contradiction rather
+        than merely a gap: Get-mdiStartModeClass returns grey for a blank value, so on ONE ROW,
+        describing ONE service, the start mode cell called an unread value grey while the state cell
+        beside it called the same unread value red.
+
+        'muted-cell' rather than grey, deliberately. Grey on this page means "not applicable - there
+        is no service", which is a different claim from "we could not read it"; muted-cell is the
+        class the unknown-install row already uses for exactly this meaning, so the two agree.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $State
+    )
+
+    # The TYPE is tested before the comparison, not after. Casting first is what let a hashtable
+    # reach the comparison as a non-blank string in the first place.
+    #
+    # 'N/A' is handled here for the same reason the SIBLING handles it - Get-mdiStartModeClass maps
+    # 'n/a' to a non-failure explicitly. It is this codebase's universal "not measured" token:
+    # ConvertTo-mdiBoolean already classifies it as no-usable-value, and a report read back from
+    # JSON or written by an older version really can carry it in this field. Leaving it out was an
+    # incomplete fix that still painted a value nobody read as a measured failure, and it would have
+    # left the two adjacent columns disagreeing all over again.
+    $value = if ($State -is [string]) { $State.Trim() } else { '' }
+    # [string] at the comparison as well as at the assignment, for the reason the sibling states:
+    # the rule forbidding a bare 'N/A' test is SYNTACTIC on purpose - it cannot see that $value was
+    # already stringified above, and the one time it would be allowed to make that judgement is the
+    # time a bool slips through and [bool]'N/A' quietly returns true.
+    if ([string]::IsNullOrWhiteSpace($value) -or [string] $value -eq 'N/A') { return 'muted-cell' }
+    if ($value -eq 'Running') { return 'green' }
+    if ($value -eq 'Not installed') { return 'grey' }
+    'red'
+}
+
+function Get-mdiServiceStateText {
+    <#
+        What a service state cell SAYS, paired with Get-mdiServiceStateClass so the words and the
+        colour cannot disagree. A state nobody read reads 'Not tested' - the same wording the
+        unknown-install row uses - instead of an empty cell or a rendered .NET type name.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] $State
+    )
+
+    $value = if ($State -is [string]) { $State.Trim() } else { '' }
+    if ([string]::IsNullOrWhiteSpace($value) -or [string] $value -eq 'N/A') { return 'Not tested' }
+    $value
+}
+
 function Get-mdiSensorHealthHtml {
     param (
         [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $Server
@@ -18034,12 +18114,12 @@ function Get-mdiSensorHealthHtml {
             # server with neither service is the benign SensorHealth 'N/A' below). Rendering it as the grey
             # "No / not onboarded yet" row hid a failure the verdict and the issue list both raise, so the
             # broken case is shown red here to match them.
-            $updaterClass = if ([string] $health.UpdaterService -eq 'Running') { 'green' } elseif ([string] $health.UpdaterService -eq 'Not installed') { 'grey' } else { 'red' }
+            $updaterClass = Get-mdiServiceStateClass -State $health.UpdaterService
             [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="red">No</td><td class="grey">{1}</td><td class="grey">{2}</td><td class="{3}">{4}</td><td class="{5}">{6}</td><td class="mono">{7}</td><td class="left red">{8}</td></tr>' -f
                     (ConvertTo-mdiHtmlEncoded ([string] $srv.FQDN)),
-                    (ConvertTo-mdiHtmlEncoded ([string] $health.SensorService)),
+                    (ConvertTo-mdiHtmlEncoded (Get-mdiServiceStateText -State $health.SensorService)),
                     (ConvertTo-mdiHtmlEncoded ([string] $health.SensorStartMode)),
-                    $updaterClass, (ConvertTo-mdiHtmlEncoded ([string] $health.UpdaterService)),
+                    $updaterClass, (ConvertTo-mdiHtmlEncoded (Get-mdiServiceStateText -State $health.UpdaterService)),
                     (Get-mdiStartModeClass -StartMode $health.UpdaterStartMode), (ConvertTo-mdiHtmlEncoded ([string] $health.UpdaterStartMode)),
                     (ConvertTo-mdiHtmlEncoded ([string] $srv.SensorVersion)),
                     (ConvertTo-mdiHtmlEncoded ([string] $health.Detail))))
@@ -18053,17 +18133,17 @@ function Get-mdiSensorHealthHtml {
             continue
         }
 
-        $sensorClass = if ([string] $health.SensorService -eq 'Running') { 'green' } elseif ([string] $health.SensorService -eq 'Not installed') { 'grey' } else { 'red' }
-        $updaterClass = if ([string] $health.UpdaterService -eq 'Running') { 'green' } elseif ([string] $health.UpdaterService -eq 'Not installed') { 'grey' } else { 'red' }
+        $sensorClass = Get-mdiServiceStateClass -State $health.SensorService
+        $updaterClass = Get-mdiServiceStateClass -State $health.UpdaterService
         $startClass = Get-mdiStartModeClass -StartMode $health.SensorStartMode
         $updaterStartClass = Get-mdiStartModeClass -StartMode $health.UpdaterStartMode
         $detailClass = if ($srv.SensorHealth -eq $false) { 'red' } else { 'green' }
 
         [void] $lines.Add(('<tr><td class="mono">{0}</td><td class="green">Yes</td><td class="{1}">{2}</td><td class="{3}">{4}</td><td class="{5}">{6}</td><td class="{7}">{8}</td><td class="mono">{9}</td><td class="left {10}">{11}</td></tr>' -f
                 (ConvertTo-mdiHtmlEncoded ([string] $srv.FQDN)),
-                $sensorClass, (ConvertTo-mdiHtmlEncoded ([string] $health.SensorService)),
+                $sensorClass, (ConvertTo-mdiHtmlEncoded (Get-mdiServiceStateText -State $health.SensorService)),
                 $startClass, (ConvertTo-mdiHtmlEncoded ([string] $health.SensorStartMode)),
-                $updaterClass, (ConvertTo-mdiHtmlEncoded ([string] $health.UpdaterService)),
+                $updaterClass, (ConvertTo-mdiHtmlEncoded (Get-mdiServiceStateText -State $health.UpdaterService)),
                 $updaterStartClass, (ConvertTo-mdiHtmlEncoded ([string] $health.UpdaterStartMode)),
                 (ConvertTo-mdiHtmlEncoded ([string] $srv.SensorVersion)),
                 $detailClass, (ConvertTo-mdiHtmlEncoded ([string] $health.Detail))))
