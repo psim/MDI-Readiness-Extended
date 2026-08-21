@@ -15588,8 +15588,68 @@ function Test-mdiForestEnumerationIncomplete {
     param (
         [Parameter(Mandatory = $false)] [AllowNull()] [object] $ReportData
     )
-    $discovery = Get-mdiForestDiscoveryRecord -ReportData $ReportData
+    if ($null -eq $ReportData) { return $false }
+    $raw = $ReportData.ForestDiscovery
+    # ABSENCE is not incompleteness, and a null-valued field is not either. Both keep the answer they
+    # have always had, so no historical baseline gains an invented gap.
+    if ($null -eq $raw) { return $false }
+
+    # A COLLECTION IS ASKED ENTRY BY ENTRY.
+    #
+    # Main builds ONE ForestDiscovery record (21222-21226) even under -MultiForest, so a report that
+    # really covers a cross-forest estate carries one record PER FOREST - which is a list. Handed
+    # straight to ConvertTo-mdiRecordObject, a list of TWO stays an Object[], carries no 'Complete'
+    # property, and took the absence return below: certified complete. A list of ONE was caught only
+    # because PowerShell unwraps it on the way in, so the guard worked for the estate that does not
+    # need it and went silent on the one that does. Measured, four healthy-looking shapes:
+    #
+    #     LIST of 1 record, Complete=$false   incomplete=True    charged
+    #     LIST of 2 records, one incomplete   incomplete=FALSE   certified complete
+    #
+    # Any entry that is incomplete makes the run incomplete. That is the only reading that cannot
+    # certify a forest nobody enumerated, and it is the same rule the single-record path applies.
+    # A PRESENT BUT EMPTY collection is incomplete: the field exists and nothing in it said the
+    # enumeration finished.
+    if ($raw -isnot [string] -and $raw -isnot [Collections.IDictionary] -and $raw -is [Collections.IEnumerable]) {
+        $entries = @($raw)
+        if ($entries.Count -eq 0) { return $true }
+        foreach ($entry in $entries) {
+            if (Test-mdiForestRecordIncomplete -Record $entry) { return $true }
+        }
+        return $false
+    }
+
+    Test-mdiForestRecordIncomplete -Record $raw
+}
+
+function Test-mdiForestRecordIncomplete {
+    <#
+        Whether ONE forest discovery record states that it did not finish. Split out of
+        Test-mdiForestEnumerationIncomplete so a report carrying one record per forest can be asked
+        the identical question about each of them, rather than about the collection.
+
+        A VALUE THAT IS NOT A RECORD KEEPS THE ANSWER IT HAS ALWAYS HAD, WHICH IS COMPLETE.
+        An earlier draft of this split charged every non-record - '', '   ', 'Unknown', 0, 1, 12345,
+        $true, @('a','b') - as incomplete, and that is a SEPARATE behaviour change from the collection
+        defect this function exists for. It regressed 24 assertions of
+        ForestDiscoveryIsReadWhateverTheReportShape.Tests.ps1, which pins the opposite on all three
+        report shapes and states the reason: "ABSENCE IS NOT INCOMPLETENESS. A report written before
+        the property existed carries no Complete at all, and charging it would invent a gap on every
+        historical baseline." Measured, frozen copies, one variable - HEAD PASS=101 FAIL=0, that draft
+        PASS=77 FAIL=24, every failure an unreadable scalar on Hashtable, PSCustomObject and
+        Generic.Dictionary alike. Whether an unreadable ForestDiscovery should be charged is a real
+        question, but it is Pietro's to decide and it is not this defect.
+
+        So only the RECORD question is asked here: a record whose Complete is present and does not
+        normalise to $true did not finish. Everything else - no Complete, not a record at all -
+        answers complete exactly as the shipped function does.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Record
+    )
+    $discovery = ConvertTo-mdiRecordObject -Value $Record
     if ($null -eq $discovery) { return $false }
+    if (($discovery -is [string]) -or ($discovery -is [ValueType])) { return $false }
     if ($null -eq $discovery.PSObject.Properties['Complete']) { return $false }
     (ConvertTo-mdiBoolean $discovery.Complete) -ne $true
 }
