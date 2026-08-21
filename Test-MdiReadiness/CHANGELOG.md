@@ -15,6 +15,35 @@ The version is defined once, in the `$settings` block of the script, and appears
 footer, in the `-AsJson` output and in each baseline history entry, so any report or trend can be
 traced back to the build that produced it.
 
+## [1.1.8] - 2026-08-21
+
+Correctness release. Twenty-six defects fixed, each with a mutation-tested regression test.
+
+No parameter, report section or JSON field changed, so an existing `-BaselinePath` history and any
+`-AsJson` consumer keep working.
+
+### Fixed
+
+- Estates that were never examined were certified as covered: a forest the report never enumerated,
+  a discovery record held once per forest that hid an unfinished enumeration, an estate nobody could
+  name, and a target certified by a different target's success.
+- An estate that was only partly sampled reported itself as fully sampled, and a named workstation
+  counted as a domain controller erased the sampling disclosure altogether.
+- The inventory miscounted machines: one domain named twice enlarged the forest and the estate, a
+  domain controller carrying a usable address vanished from it, a multi-homed projection rewrote the
+  record it was built from, and a host discovered in a third role could re-merge its own evidence.
+- Values nobody could read were published as measurements - probe sources, probe latencies, a probe
+  that had in fact been measured, and unmeasured checks left sitting in the failed column.
+- A per-user audit policy target nobody could read was elected as the machine's system audit policy.
+- An unreadable domain became a DNS suffix and split one machine into two, and unreadable domains
+  and NetBIOS suffixes took name-resolution probe slots from a second forest that had them coming.
+- One unreadable value could destroy a whole output: a single port could wreck the entire
+  remediation script, a baseline the script could not read was one simplification away from being
+  overwritten by it, a dictionary shape the accessors had just proved they could read made them
+  throw, and a required port measured as refused was lost with an unreadable server name.
+- A clock tolerance taken from one row certified an estate that fails the requirement, and identical
+  text that names nobody was reported as a verified grant.
+
 ## [1.1.7] - 2026-08-19
 
 Correctness release. Nineteen defects fixed, each with a mutation-tested regression test.
