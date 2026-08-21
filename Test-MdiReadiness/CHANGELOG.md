@@ -15,6 +15,43 @@ The version is defined once, in the `$settings` block of the script, and appears
 footer, in the `-AsJson` output and in each baseline history entry, so any report or trend can be
 traced back to the build that produced it.
 
+## [1.2.0] - 2026-08-21
+
+A `Requirement` this script cannot read is no longer treated as one it read and found optional. It
+now has a third state of its own, and it keeps a run out of READY.
+
+The verdict therefore changes for the estates where it applies: a run that was reported READY over a
+refused or never-probed port whose obligation could not be read is now reported NOT READY. No
+existing report field changes meaning and one field is added, so an existing `-BaselinePath` history
+and any `-AsJson` consumer keep working.
+
+### Added
+
+- `PortsRequirementUnread` in the statistics and the `-AsJson` output: applicable probes whose
+  `Requirement` could not be read and that were not measured open. Counted separately from
+  `PortsRequiredFail` and `PortsRequiredUntested`, so neither of those changes meaning.
+- A `Not verified` finding naming each such probe with its protocol, port and target address, worded
+  so it is not mistaken for a probe that failed to run.
+
+### Fixed
+
+- A required port measured REFUSED, and a required port never probed at all, both left the run READY
+  when `Requirement` arrived as null, an empty string, the boolean `true`, a number, a hashtable or a
+  padded spelling. `Requirement` makes a full JSON round trip, where `"Requirement":true` becomes the
+  boolean `true`, and `-MultiForest` promotes LDAPS 636 and LDAPS to Global Catalog 3269 into the
+  required set - so in a cross-forest estate the records that decide readiness are exactly the ones
+  travelling that path.
+- The per-server ports state and the issue list follow the same rule as the verdict, so the Overview
+  can no longer report a server's ports in order while the verdict withholds READY over them.
+
+### Unchanged, deliberately
+
+- The requirement rank scale. An unreadable value still ranks 0 and is still not mandatory - it is
+  never promoted into an obligation, only refused the right to be treated, in silence, as one that
+  was read. Nothing is trimmed. `Optional` and `Recommended` behave exactly as before.
+- A port measured OPEN with an unreadable `Requirement` is still READY, and an unreadable value is
+  never counted as a required failure and never painted as a blocked port.
+
 ## [1.1.8] - 2026-08-21
 
 Correctness release. Twenty-six defects fixed, each with a mutation-tested regression test.

@@ -547,7 +547,7 @@ $settings = @{
     # Single source of truth for the version. It is surfaced in the HTML report footer, in the -AsJson
     # output and in the baseline history, so a report or a trend can always be traced back to the build
     # that produced it. A release workflow checks this value against the git tag.
-    ScriptVersion                   = '1.1.8'
+    ScriptVersion                   = '1.2.0'
 
     AdvancedAuditPolicyDCs          = @'
 Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Setting Value
@@ -13649,6 +13649,50 @@ function Test-mdiRequirementIsMandatory {
     (Get-mdiRequirementRank -Requirement $Requirement) -eq 3
 }
 
+function Test-mdiRequirementIsUnreadable {
+    <#
+        Whether a probe's Requirement is a value this script COULD NOT READ - as distinct from one it
+        read and found non-mandatory.
+
+        Get-mdiRequirementRank deliberately ranks anything unrecognised at 0, and
+        Test-mdiRequirementIsMandatory is (rank -eq 3), so an obligation nobody could read has been
+        indistinguishable from a measured 'Optional'. The rank rule itself is correct and must not
+        change - promoting an unreadable value to mandatory is the exact inversion that function
+        exists to prevent, and three regression tests pin it - but a two-state scale cannot express
+        "the obligation itself is unknown", so that judgement was silently made in favour of READY.
+
+        Measured on the shipped v1.1.8, a known-READY two-forest estate with ONE record added: LDAPS
+        636, the port -MultiForest promotes to Required, nothing differing but this spelling:
+
+            Requirement                        refused port            never-probed port
+            'Required'                         blocking=1 READY=False  unmeasReq=1 READY=False
+            'All'                              blocking=1 READY=False  unmeasReq=1 READY=False
+            'Optional'                         blocking=0 READY=True   unmeasReq=0 READY=True
+            $null '' $true 12345 hashtable     blocking=0 READY=True   unmeasReq=0 READY=True
+
+        The last row is the defect: a REQUIRED port refused or never probed, and the run certified
+        READY, on nothing but the spelling of Requirement. Requirement makes a full JSON round trip -
+        the plan is serialised to the sensor and parsed back with ConvertFrom-Json - so
+        "Requirement":true arriving as the BOOLEAN $true is not hypothetical, and -MultiForest is
+        what puts the deciding LDAPS records on that path.
+
+        READABLE is the closed set the port definition table writes: Required, All, AtLeastOne,
+        Recommended and Optional. Everything else is unreadable. Compared case-insensitively, which
+        is what the switch in Get-mdiRequirementRank already does, so the two functions cannot
+        disagree about which spellings are recognised.
+
+        THIS DOES NOT TRIM AND DOES NOT RE-RANK. ' Required ' is unreadable here and still ranks 0
+        and is still not mandatory, exactly as RequirementRankIsAnOrderedScale requires. The value is
+        never promoted into an obligation; it is only refused the right to be treated, in silence, as
+        one that was read.
+    #>
+    param (
+        [Parameter(Mandatory = $false)] [AllowNull()] [object] $Requirement
+    )
+
+    ([string] $Requirement) -notin @('Required', 'All', 'AtLeastOne', 'Recommended', 'Optional')
+}
+
 function Get-mdiPortRecordRank {
     <#
         How much evidence a probe record carries, so two roles' copies of the same probe can be merged
@@ -14692,6 +14736,11 @@ function Get-mdiEffectivePortState {
     # probes were actually measured.
     $unmeasuredRequired = @(Get-mdiUnmeasuredRequiredProbe -Record $records)
     if ($unmeasuredRequired.Count -gt 0) { return 'Unread' }
+    # An obligation nobody could read leaves this server's ports in the same state as a mandatory
+    # probe that never ran: not a failure, not a pass. Shared with the verdict and the issue list so
+    # the per-server score cannot report ports in order while the verdict withholds READY over them.
+    $unreadableRequirement = @(Get-mdiUnreadableRequirementProbe -Record $records)
+    if ($unreadableRequirement.Count -gt 0) { return 'Unread' }
 
     $null
 }
@@ -15110,6 +15159,38 @@ function Get-mdiUnmeasuredRequiredProbe {
     @($Record | Where-Object {
             (Test-mdiRequirementIsMandatory -Requirement $_.Requirement) -and $_.Applicable -ne $false -and
             -not (Test-mdiProbeWasMeasured -Record $_)
+        })
+}
+
+function Get-mdiUnreadableRequirementProbe {
+    <#
+        Applicable probes whose OBLIGATION could not be read, and which were not measured open.
+
+        The companion to Get-mdiUnmeasuredRequiredProbe directly above: that one is "a required probe
+        nobody measured", this one is "a probe nobody could tell was required". Both mean the same
+        thing for the verdict - the run has not earned READY - and neither is a measured failure, so
+        neither may be painted red or counted as a required failure.
+
+        A probe measured OPEN is deliberately excluded. An open port satisfies every obligation on the
+        scale, so whether the obligation was readable cannot change the answer for that record, and
+        charging it would be a false red on a path that was proven fine.
+
+        What remains is a probe measured SHUT, or never measured at all, carrying a requirement nobody
+        could read. Certifying that estate READY - which is what shipped - announces a result about an
+        obligation this script never established.
+
+        Success is compared to $true only through the shared measured predicate, so a Success that is
+        itself unreadable leaves the record in this population rather than excluding it: a value
+        nobody could read is not proof the port was open.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)] [AllowNull()] [AllowEmptyCollection()] $Record
+    )
+
+    @($Record | Where-Object {
+            (Test-mdiRequirementIsUnreadable -Requirement $_.Requirement) -and $_.Applicable -ne $false -and
+            -not ((Test-mdiProbeWasMeasured -Record $_) -and $_.Success -eq $true)
         })
 }
 
@@ -16243,6 +16324,11 @@ function Get-mdiReportStatistics {
         # card describes exactly the population the verdict and the issue list charge - including
         # Requirement = 'All' probes, which an inline "-eq 'Required'" silently drops.
         PortsRequiredUntested = @(Get-mdiUnmeasuredRequiredProbe -Record $portRecords).Count
+        # Probes whose OBLIGATION could not be read, counted separately from the two populations above
+        # so no existing number changes meaning. They are not required failures - nothing was measured
+        # shut on a proven obligation - and not required-untested, because some of them WERE measured.
+        # They are the third state, and the verdict withholds READY over exactly this count.
+        PortsRequirementUnread = @(Get-mdiUnreadableRequirementProbe -Record $portRecords).Count
         NnrTargetCount    = $nnrTargets.Count
         NnrResolvable     = $nnrResolvable.Count
         NnrUntested       = $nnrUntested.Count
@@ -16933,6 +17019,19 @@ function Get-mdiIssueList {
                             [string] $rec.Detail)
                     })
             }
+            foreach ($rec in @(Get-mdiUnreadableRequirementProbe -Record $portResults)) {
+                # The obligation, not the measurement, is what could not be read here - so this is a
+                # separate row from the one above rather than more text on it. An operator told "could
+                # not be measured" about a port that WAS measured, and measured shut, would go looking
+                # for a probe that ran perfectly well. The ADDRESS is named for the same reason the
+                # unmeasured rows name it: a multi-homed target otherwise produces identical rows.
+                [void] $issues.Add([PSCustomObject]@{ Severity = 'High'; Server = [string] $srv.FQDN; Area = 'Not verified'
+                        Issue = ('A network probe carries a requirement this run could not read, so whether it had to pass was never established: {0}/{1} to {2}: {3}' -f
+                            [string] $rec.Protocol, [string] $rec.Port,
+                            (Get-mdiTargetLabel -Target ([string] $rec.Target) -TargetIP ([string] $rec.TargetIP)),
+                            [string] $rec.Detail)
+                    })
+            }
         }
         # A sensor that is installed but stopped reports no data while still looking deployed in the portal
         foreach ($sensorIssue in @($srv.Details.SensorHealthDetails.Issues | Where-Object { $_ })) {
@@ -17234,6 +17333,13 @@ function Get-mdiOverviewHtml {
                 if ($stats.PortsTotal -eq 0) { 'Not evaluated' }
                 elseif ($stats.PortsRequiredFail -gt 0) { '{0} required port(s) blocked{1}' -f $stats.PortsRequiredFail, $portSample }
                 elseif ($stats.PortsRequiredUntested -gt 0) { '{0} required probe(s) could not be tested{1}' -f $stats.PortsRequiredUntested, $portSample }
+                # A probe whose OBLIGATION could not be read must not fall through to the "optional or
+                # recommended" branch below. That branch asserts a class, and the whole point of this
+                # state is that the class is unknown: a REQUIRED port measured shut was described to
+                # the operator as an optional one, which is the misclassification this state exists to
+                # end. Placed above PortsBlocked because the w155 shape - measured shut, requirement
+                # unreadable - satisfies both, and the honest sentence is this one.
+                elseif ($stats.PortsRequirementUnread -gt 0) { '{0} probe(s) carry a requirement that could not be read, so whether they had to pass is unknown{1}' -f $stats.PortsRequirementUnread, $portSample }
                 # A non-required probe that was measured shut is worth an amber card, but only if the
                 # card SAYS so. It used to tone warn while still reading "No required port blocked",
                 # which is an amber warning whose own text tells the reader nothing is wrong - and on
@@ -17270,7 +17376,7 @@ function Get-mdiOverviewHtml {
                 elseif ($stats.PartialScanCount -gt 0) { 'No required port blocked among those probed, but testing stopped part way on {0} server(s), so their ports were never probed{1}' -f $stats.PartialScanCount, $portSample }
                 elseif ($portSample) { 'No required port blocked among those probed{0}' -f $portSample }
                 else { 'No required port blocked' })
-            Tone = $(if ($stats.PortsTotal -eq 0) { 'na' } elseif ($stats.PortsRequiredFail -gt 0) { 'bad' } elseif ($stats.PortsUntested -gt 0) { 'warn' } elseif ($stats.PortsBlocked -gt 0) { 'warn' } elseif ($stats.PortsRequiredTested -eq 0) { 'na' } elseif ($stats.PartialScanCount -gt 0) { 'warn' } else { 'ok' })
+            Tone = $(if ($stats.PortsTotal -eq 0) { 'na' } elseif ($stats.PortsRequiredFail -gt 0) { 'bad' } elseif ($stats.PortsRequirementUnread -gt 0) { 'warn' } elseif ($stats.PortsUntested -gt 0) { 'warn' } elseif ($stats.PortsBlocked -gt 0) { 'warn' } elseif ($stats.PortsRequiredTested -eq 0) { 'na' } elseif ($stats.PartialScanCount -gt 0) { 'warn' } else { 'ok' })
         }
         @{ Label = 'NNR resolvable targets'; Value = ('{0}/{1}' -f $stats.NnrResolvable, $stats.NnrTargetCount)
             # Three outcomes. A target nobody managed to probe is a gap to re-measure, not a firewall to
@@ -20736,11 +20842,19 @@ function Test-mdiReadinessResult {
     $blockingPorts = @($blockingAll | Where-Object { [string] $_.BlockingKind -ne 'NnrUntested' })
     $untestedNnr = @($blockingAll | Where-Object { [string] $_.BlockingKind -eq 'NnrUntested' })
     $untestedRequiredPorts = @(Get-mdiUnmeasuredRequiredProbe -Record $portRecords)
+    # A probe whose OBLIGATION could not be read is the same judgement one level up: nothing was
+    # observed shut and nothing may be painted red, but the run has not established that a refused or
+    # unprobed port was permitted to be that way. Routed with the untested probes rather than the
+    # blocked ones for exactly that reason - it is a gap to re-measure, not a measurement.
+    $unreadableRequirementPorts = @(Get-mdiUnreadableRequirementProbe -Record $portRecords)
     if ($blockingPorts.Count -gt 0) {
         Write-mdiWarning ('{0} required network probe(s) are blocked by measurement, so the run is not ready regardless of the per-server ports summary.' -f $blockingPorts.Count)
     }
     if (($untestedRequiredPorts.Count + $untestedNnr.Count) -gt 0) {
         Write-mdiWarning ('{0} required network probe(s) could not be measured, so the run cannot be reported as ready.' -f ($untestedRequiredPorts.Count + $untestedNnr.Count))
+    }
+    if ($unreadableRequirementPorts.Count -gt 0) {
+        Write-mdiWarning ('{0} network probe(s) carry a requirement this run could not read, so whether they had to pass was never established and the run cannot be reported as ready.' -f $unreadableRequirementPorts.Count)
     }
 
     # A domain that contributed no LDAP probe target was never in the shared port plan, so no sensor
@@ -20820,6 +20934,7 @@ function Test-mdiReadinessResult {
     ($unmeasuredDomains.Count -eq 0) -and
     ($blockingPorts.Count -eq 0) -and
     ($untestedRequiredPorts.Count -eq 0) -and
+    ($unreadableRequirementPorts.Count -eq 0) -and
     ($untestedNnr.Count -eq 0) -and
     ($ldapPlanGap.Count -eq 0) -and
     ($nnrPlanGap.Count -eq 0) -and
