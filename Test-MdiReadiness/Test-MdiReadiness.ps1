@@ -5224,6 +5224,18 @@ function Get-mdiSensorV3Readiness {
     # it with a $null build is meaningless and the answer would be indistinguishable from "this build is
     # newer than the table".
     $expectedUpdate = if ($null -eq $osBuild) { $null } else { $v3.JulyCumulativeUpdate[$osBuild] }
+    # A hashtable keyed by EXACT build misses for any build that is not one of the three it holds -
+    # not only for a newer one. The detail below asserted "newer than the builds known to this
+    # script" for every miss, and that claim is simply false for Windows Server, version 23H2: build
+    # 25398 is a real, supported, domain-controller-capable SKU that is OLDER than 26100, which the
+    # table does know. Measured on the shipped function: build 25398 produced 'OS build 25398.9999 is
+    # newer than the builds known to this script', so the report told the operator the opposite of
+    # the truth about their own server, and a reader who trusts "newer" concludes the CU level is
+    # almost certainly fine when in fact this script has no opinion at all.
+    # The tri-state is right either way - an informational N/A leaving the verdict intact - so only
+    # the wording is at issue, and it is branched on the actual table rather than on an assumption.
+    $newestKnownBuild = @($v3.JulyCumulativeUpdate.Keys | ForEach-Object { Get-mdiMeasuredInteger -Value $_ } |
+            Where-Object { $null -ne $_ } | Sort-Object -Descending)[0]
     # The operating system state is compared as a string: $isOsOk is tri-state, and a bare
     # `$isOsOk -eq 'N/A'` casts the RIGHT operand to the left's type, where [bool]'N/A' is $true, so the
     # comparison is true even when $isOsOk is $true. Casting the left operand to [string] first is the
@@ -5257,7 +5269,13 @@ function Get-mdiSensorV3Readiness {
     & $addCheck 'July 2026 or later cumulative update' $isCuOk $(
         if ([string] $isOsOk -eq 'N/A') { 'Not tested - {0}' -f $unreadable }
         elseif ($isOsOk -eq $false) { 'Not evaluated - the operating system is not supported by the v3.x sensor' }
-        elseif ($null -eq $expectedUpdate) { 'OS build {0}.{1} is newer than the builds known to this script, verify the cumulative update level manually' -f $osBuild, $ubr }
+        elseif ($null -eq $expectedUpdate) {
+            if ($null -ne $newestKnownBuild -and $osBuild -gt $newestKnownBuild) {
+                'OS build {0}.{1} is newer than the builds known to this script (newest known: {2}), verify the cumulative update level manually' -f $osBuild, $ubr, $newestKnownBuild
+            } else {
+                'OS build {0}.{1} is not one of the builds this script carries a July 2026 update level for (it knows {2}), verify the cumulative update level manually' -f $osBuild, $ubr, (@($v3.JulyCumulativeUpdate.Keys | ForEach-Object { Get-mdiMeasuredInteger -Value $_ } | Where-Object { $null -ne $_ } | Sort-Object) -join ', ')
+            }
+        }
         elseif ($ubrResult.Readable -ne $true) { 'Not tested - the registry could not be read on this server: {0}' -f [string] $ubrResult.Error }
         elseif ($null -eq $ubr) { 'Not tested - the update revision (UBR) could not be read from the registry on this server' }
         elseif ($ubr -ge [int] $expectedUpdate.Revision) { '{0} build {1}.{2} meets the July 2026 level ({3}.{4}, {5})' -f [string] $expectedUpdate.OS, $osBuild, $ubr, $osBuild, [int] $expectedUpdate.Revision, [string] $expectedUpdate.KB }
@@ -10067,11 +10085,43 @@ function Get-mdiCapacityPlanning {
     } catch { $processors = @() }
     if ($processors.Count -eq 0) { return & $notSized 'Missing core data' 'Unable to read the processor information over WMI' }
 
+    # Every OTHER reading in this function is gated: the processor COLLECTION four lines above, the
+    # RAM below, and the packet rate through Get-mdiPacketRateReading. The core COUNT was the single
+    # exception - a bare [int] cast whose result is compared against the sizing table and then
+    # printed as a hardware order. [int] $null and [int] '' are a clean 0, and 0 physical cores is a
+    # perfectly plausible-looking number to everything downstream. Measured on the shipped function
+    # with a Win32_Processor instance whose NumberOfCores did not arrive - $null, '', or the property
+    # absent entirely, which is the shape a partial or property-filtered WMI read returns:
+    #
+    #     isCapacityOk  = False    Status  = 'Yes, but additional resources required'
+    #     PhysicalCores = 0        Missing = '4 more physical core(s)'
+    #
+    # so a server whose processors were never inspected was told, as a MEASURED fact, to buy four
+    # cores. The identical cause on the very next reading - RAM that did not arrive - correctly
+    # returned 'N/A' / 'Missing RAM data' on the same call. One cause, two opposite verdicts.
+    #
+    # Two further shapes were worse than wrong rather than merely wrong: 'four' and an Object[] both
+    # THREW inside the cast, and this loop sits outside any try, so the exception escaped
+    # Get-mdiCapacityPlanning entirely and took the whole server's capacity section with it. $true
+    # converted silently to 1.
+    #
+    # Get-mdiMeasuredInteger is the predicate the rest of the script reads WMI integers through:
+    # $null, empty, non-numeric and Int32 overflow all come back $null instead of as a number. A
+    # count of zero readings is then unsized rather than sized at zero, exactly as the RAM is.
     $physicalCores = 0
     $logicalCores = 0
+    $coreReadings = 0
     foreach ($cpu in $processors) {
-        $physicalCores += [int] $cpu.NumberOfCores
-        $logicalCores += [int] $cpu.NumberOfLogicalProcessors
+        $cores = Get-mdiMeasuredInteger -Value $cpu.NumberOfCores
+        if ($null -ne $cores) {
+            $physicalCores += $cores
+            $coreReadings++
+        }
+        $logical = Get-mdiMeasuredInteger -Value $cpu.NumberOfLogicalProcessors
+        if ($null -ne $logical) { $logicalCores += $logical }
+    }
+    if ($coreReadings -eq 0 -or $physicalCores -le 0) {
+        return & $notSized 'Missing core data' ('The processor information on {0} was returned without a usable physical core count, so capacity cannot be sized' -f $ComputerName)
     }
     # 'We recommend that you don't work with hyper-threaded cores, which can result in health issues'
     $hyperThreaded = $logicalCores -gt $physicalCores
@@ -11512,6 +11562,35 @@ function Get-mdiDsSacl {
                 }
             })
 
+
+        # A SACL that WAS read and holds no audit entries at all is an ANSWER, and the clearest one
+        # this tool can get: auditing is not configured here. It must be answered before the
+        # comparison, because an empty applied set makes the projection below yield nothing, which
+        # binds $null to -DifferenceObject, and Compare-Object REFUSES that. The resulting throw
+        # landed in the catch, whose whole premise is that reaching it means the SACL was never read.
+        #
+        # Measured on the shipped function with a descriptor whose SACL is present and empty (SDDL
+        # ending 'S:', binary round-tripped so it is the shape the directory delivers), for all three
+        # shipped expectation tables:
+        #
+        #     isAuditingOk = 'N/A'   Measured = $false
+        #     details      = "Cannot bind argument to parameter 'DifferenceObject' because it is null."
+        #
+        # so a domain with NO MDI auditing whatsoever was indistinguishable from one the caller was
+        # not allowed to read: it blocked readiness as unread instead of naming the gap, and offered
+        # a PowerShell parameter-binding error as the reason. One single unrelated ACE on the very
+        # same descriptor made it report correctly as misconfigured, so the blindness was at exactly
+        # zero - the one state this check exists to find.
+        #
+        # The guard is explicit rather than a wrapped projection: @() does NOT rescue it, because
+        # Compare-Object refuses an empty array for the same reason it refuses $null.
+        if ($appliedAuditing.Count -eq 0) {
+            return [PSCustomObject]@{
+                isAuditingOk = $false
+                Measured     = $true
+                details      = 'The SACL of ' + $LdapPath + ' was read and contains no audit entries at all, so none of the required auditing is configured'
+            }
+        }
 
         $properties = ($expectedAuditing | Get-Member -MemberType NoteProperty).Name
         $compareParams = @{
