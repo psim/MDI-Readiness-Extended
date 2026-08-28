@@ -15,7 +15,7 @@ The version is defined once, in the `$settings` block of the script, and appears
 footer, in the `-AsJson` output and in each baseline history entry, so any report or trend can be
 traced back to the build that produced it.
 
-## [1.2.0] - 2026-08-21
+## [1.2.0] - 2026-08-28
 
 Correctness release, on one theme: a value the script could not read must never come back looking
 like a measurement, and two surfaces reading the same fact must not disagree about it.
