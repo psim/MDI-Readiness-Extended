@@ -110,7 +110,18 @@ $dcRows = @(
     [PSCustomObject]@{ FQDN = 'dcfab02.fabrikam.local'; Domain = 'fabrikam.local'; OperatingSystem = 'Windows Server 2022' }
 )
 $unexaminedWhenResolved = @(Get-mdiUnexaminedDomain -ScopedDomain @($answered.Result) -Server $dcRows -DomainControllerServer $dcRows)
-$unexaminedWhenKept = @(Get-mdiUnexaminedDomain -ScopedDomain @('FABCORP') -Server $dcRows -DomainControllerServer $dcRows)
+# RESTATED, 21 Aug, after w210. The control below used to be
+#     ScopedDomain @('FABCORP') over these same rows  ->  ['FABCORP']
+# which was the false red this file's subject exists to avoid. Get-mdiUnexaminedDomain now absorbs
+# exactly that shape - a SINGLE dotless scope entry over rows agreeing on ONE readable domain is read
+# as the NetBIOS spelling of the domain that was scanned - so it no longer charges, and the old
+# control can no longer hold.
+#
+# The point it was making is still true and still worth pinning, so it is measured on the shape w210
+# deliberately does NOT absorb: a dotless entry BESIDE another scope entry says nothing about which
+# domain the rows came from, so it must still be charged. Failing to resolve the NetBIOS name still
+# costs a false red there - which is why the ADWS fallback this file tests continues to matter.
+$unexaminedWhenKept = @(Get-mdiUnexaminedDomain -ScopedDomain @('FABCORP', 'mdilab.local') -Server $dcRows -DomainControllerServer $dcRows)
 
 Assert-True 'the function declares a reader that does not depend on Active Directory Web Services' (
     (Get-Command Resolve-mdiDomainScopeDnsName).Definition -match 'ActiveDirectory\.Domain'
@@ -173,8 +184,8 @@ Assert-True 'control: an unreadable domain name reads nothing and returns nothin
 Assert-True 'the resolved scope costs no unexamined domain over a fully scanned estate' (
     $unexaminedWhenResolved.Count -eq 0
 ) ("unexamined={0}" -f (@($unexaminedWhenResolved) -join ','))
-Assert-True 'control: the unresolved NetBIOS spelling is what produces the false red' (
-    $unexaminedWhenKept.Count -eq 1 -and $unexaminedWhenKept[0] -eq 'FABCORP'
+Assert-True 'control: an unresolved NetBIOS spelling beside another scope entry still produces the false red' (
+    $unexaminedWhenKept.Count -ge 1 -and $unexaminedWhenKept -contains 'FABCORP'
 ) ("unexamined={0}" -f (@($unexaminedWhenKept) -join ','))
 
 Write-Host ("RESULT: {0} passed / {1} failed" -f $script:passed, $script:failed) -ForegroundColor $(if ($script:failed) { 'Red' } else { 'Green' })

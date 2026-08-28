@@ -1386,7 +1386,7 @@ function Test-mdiTcpPort {
                 # first {1} ms probe timed out"); only the failure path had lost one. $FirstMs is
                 # zero when this function is called with -IsRetry directly, and the single budget it
                 # was actually given is named instead - a number that was never used must not appear.
-                Detail = ('Blocked - no response within {0} and still silent (consistent with a firewall dropping the traffic)' -f
+                Detail = ('Blocked - no response within {0} and still silent. Over TCP a dropped packet and an unreachable host look identical, so this is consistent with a firewall dropping the traffic OR with the host not being reachable at all - confirm the host answers before opening a port' -f
                     $(if ($FirstMs -gt 0) { '{0} ms, retried for {1} ms' -f $FirstMs, $TimeoutMs } else { '{0} ms, retried' -f $TimeoutMs }))
                 LatencyMs = $null
             }
@@ -2446,8 +2446,58 @@ function Invoke-mdiPortProbePlan {
                             Detail = 'Not tested - re-run with -WorkspaceName to validate connectivity to the sensor API URL'
                         }) $false
                 } else {
-                    $outcome = Test-mdiCloudConnectivity -Url $Plan.SensorApiUrl -TimeoutMs ([Math]::Max($timeoutMs, 10000))
-                    & $addResult $probe ([uri] $Plan.SensorApiUrl).Host $null $outcome
+                    # PARSED BEFORE IT IS TRUSTED, and parsed with TryCreate rather than a [uri] cast.
+                    # The URL is not a constant: New-mdiPortProbePlan builds it by pasting the
+                    # operator's -WorkspaceName into a hostname ('{0}sensorapi.atp.azure.com'), and the
+                    # only guard before this point is IsNullOrEmpty above, which every malformed URL
+                    # passes. A bare [uri] cast THROWS on such a value, and the throw was evaluated
+                    # inside an argument list in this loop with no try between it and the caller - so
+                    # it did not cost the cloud row, it ended the whole pass. Measured on the shipped
+                    # functions with a two-probe plan:
+                    #
+                    #   -WorkspaceName 'contoso'                    no throw, 2 records
+                    #   -WorkspaceName 'my workspace'  cloud first  THREW,    0 records
+                    #   -WorkspaceName 'my workspace'  cloud LAST   THREW,    0 records
+                    #
+                    # The third line is the damaging one: the other probe had ALREADY been measured and
+                    # its record was still lost, because the function returns nothing rather than what
+                    # it had collected. Six ordinary inputs reach it - a space, a colon, a backslash,
+                    # '[', a bad percent escape and a bare '%'. This function is in the shipped
+                    # function list, so it runs inside the remote command line on every scanned server.
+                    #
+                    # This is the SAME defect the DNS payload above already had and was fixed for: the
+                    # comment at that block records a 256-byte label taking "the pass from results to
+                    # NONE, so every other probe beside it lost its record entirely rather than
+                    # failing", and it is resolved the same way here - refuse, record, continue.
+                    #
+                    # The authority is required to be the WHOLE of what was built, not merely a
+                    # parseable prefix of it. A '/', '#' or '?' in the workspace name ENDS the
+                    # authority, so 'ws/x' yields https://ws/xsensorapi.atp.azure.com whose host is
+                    # 'ws', and '@' makes everything before it userinfo. Those parse cleanly and throw
+                    # nothing, and the probe then measures a DIFFERENT MACHINE and files the answer
+                    # under the sensor API's name - a measurement of the wrong thing, which is the same
+                    # harm as a measurement nobody took. Measured: 'ws/x', 'ws#frag' and 'ws?q=1' all
+                    # resolved to host 'ws'.
+                    $sensorUri = $null
+                    $sensorUrlUsable = [uri]::TryCreate([string] $Plan.SensorApiUrl, [UriKind]::Absolute, [ref] $sensorUri) -and
+                        $null -ne $sensorUri -and
+                        -not [string]::IsNullOrWhiteSpace($sensorUri.Host) -and
+                        [string]::IsNullOrEmpty($sensorUri.UserInfo) -and
+                        [string]::IsNullOrEmpty($sensorUri.Query) -and
+                        [string]::IsNullOrEmpty($sensorUri.Fragment) -and
+                        ([string] $sensorUri.AbsolutePath) -eq '/'
+                    if (-not $sensorUrlUsable) {
+                        # Applicable=$false, exactly as the "no -WorkspaceName" branch above chooses:
+                        # nothing was measured, so this must not become a rank-3 measured failure and
+                        # invent a blocked port out of an unusable name.
+                        & $addResult $probe '<workspace>sensorapi.atp.azure.com' $null ([PSCustomObject]@{
+                                Success = $false
+                                Detail  = ('Not tested - the sensor API URL built from -WorkspaceName is not a usable URL: {0}' -f $Plan.SensorApiUrl)
+                            }) $false
+                    } else {
+                        $outcome = Test-mdiCloudConnectivity -Url $Plan.SensorApiUrl -TimeoutMs ([Math]::Max($timeoutMs, 10000))
+                        & $addResult $probe $sensorUri.Host $null $outcome
+                    }
                 }
             }
 
@@ -15812,6 +15862,51 @@ function Get-mdiUnexaminedDomain {
     # is still reported.
     if (-not $anyServerSeen) { return @() }
 
+    # A SINGLE DOTLESS SCOPE NAME IS THE NETBIOS SPELLING OF THE ONE DOMAIN THAT WAS SCANNED.
+    #
+    # -Domain is documented as "Domain Name or FQDN", and the name every Windows dialog shows an
+    # administrator of a DISJOINT namespace is the NetBIOS one: DNS fabrikam.local, NetBIOS FABCORP.
+    # Resolve-mdiDomainScopeDnsName turns one into the other when it can, but it deliberately KEEPS
+    # the operator's spelling when the directory cannot be asked - and both of its readers fail
+    # together on a workstation with no RSAT, or when ADWS 9389 is filtered and the DC locator is
+    # unreachable, which is the ordinary case for the host this tool documents itself as runnable
+    # from. The scope then stays FABCORP while every scanned row says fabrikam.local, and this
+    # function charged an unexamined domain against a fully scanned estate. Measured:
+    #
+    #     scope fabrikam.local, rows fabrikam.local   -> <none>      correct
+    #     scope mdilab.local,   rows fabrikam.local   -> [mdilab]    correct, still charges
+    #     scope FABCORP,        rows fabrikam.local   -> [FABCORP]   FALSE RED
+    #
+    # That costs readiness on all three surfaces sharing this definition - the statistics, the issue
+    # list and the verdict.
+    #
+    # This is READING the name from the scan, not inventing one: by the time this function runs the
+    # scanned rows already agree on exactly one readable DNS domain. That is the distinction
+    # Resolve-mdiDomainScopeDnsName's objection turns on ("inventing a domain name nobody read would
+    # be a worse failure than the false red this removes") - nothing is invented here, and no name is
+    # written anywhere; a finding is simply not raised.
+    #
+    # NARROWED TO A SINGLE SCOPE ENTRY, AND THAT NARROWING IS THE WHOLE SAFETY ARGUMENT. The probe
+    # measured the shape that must keep charging:
+    #
+    #     scope @('FABCORP','mdilab.local'), rows mdilab.local only  -> FABCORP must STILL be charged
+    #
+    # A dotless entry sitting beside other scope entries says nothing about which domain the rows
+    # came from, so a naive "dotless scope + one observed domain = covered" rule would certify a
+    # genuinely unscanned domain - turning a false red into a FALSE GREEN, which this codebase rates
+    # strictly worse. With exactly one scope entry the inference is sound: without -Forest the scope
+    # is @($Domain), so the rows can only have come from whatever that single name resolved to at the
+    # LDAP layer.
+    #
+    # Requires exactly ONE examined domain as well. Zero means nothing was named and the charge must
+    # stand; more than one means the rows disagree and no single name can be attributed to the scope.
+    $scopeIsOneDotlessName = $false
+    if ($scoped.Count -eq 1 -and $examined.Count -eq 1) {
+        $onlyScope = & $normalise $scoped[0]
+        $scopeIsOneDotlessName = (-not [string]::IsNullOrWhiteSpace($onlyScope)) -and ($onlyScope -notmatch '\.')
+    }
+    if ($scopeIsOneDotlessName) { return @() }
+
     # De-duplicated on the way out as well: two spellings of one missing domain are one finding.
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     @(foreach ($s in $scoped) {
@@ -16799,6 +16894,40 @@ function ConvertTo-mdiRecordObject {
             # properties, so they are carried under a prefixed name instead of being dropped silently.
             if ($name -in @('PSObject', 'PSBase', 'PSAdapted', 'PSExtended', 'PSTypeNames', 'pstypenames')) {
                 $bag['_' + $name] = $entry.Value
+                continue
+            }
+            # A KEY THAT COLLIDES ONLY BY CASE MUST NOT OVERWRITE THE ONE ALREADY COPIED. $bag is
+            # [ordered]@{}, which is CASE-INSENSITIVE, and the source need not be: a
+            # Generic.Dictionary[string,object] built with an ORDINAL comparer legitimately holds
+            # 'Requirement' and 'requirement' as two separate entries. Copying both collapsed them -
+            # the LAST enumerated won, and the surviving property kept the FIRST key's spelling with
+            # the SECOND key's value. Measured, source holding Requirement='Required' and
+            # requirement='Optional':
+            #
+            #     source entries 4  ->  converted properties 3, .Requirement = 'Optional', 0 warnings
+            #
+            # Property access is case-insensitive, so a consumer reading .Requirement got 'Optional'.
+            # A required port measured as refused therefore read as OPTIONAL - word for word the
+            # consequence this function's own header warns about, and a false green.
+            #
+            # Carried under a prefix, which is this function's OWN existing precedent immediately
+            # above for a name that cannot be represented as a property: nothing is dropped, and the
+            # name that survives keeps the value that was recorded under it. Which of two
+            # case-variants was "meant" is unknowable, so the rule chosen is the one that cannot
+            # silently mislead - a name and its value belong together.
+            #
+            # GIVING $bag AN ORDINAL COMPARER WOULD NOT FIX THIS. Both entries would survive the copy
+            # and the object would then carry two properties differing only in case; since property
+            # access is case-insensitive the consumer would still get an arbitrary one. The loss
+            # would move, not go away.
+            if ($bag.Contains($name)) {
+                $alternate = '_' + $name
+                $suffix = 1
+                while ($bag.Contains($alternate)) {
+                    $alternate = '_{0}_{1}' -f $suffix, $name
+                    $suffix++
+                }
+                $bag[$alternate] = $entry.Value
                 continue
             }
             $bag[$name] = $entry.Value
@@ -18186,7 +18315,21 @@ function Get-mdiServiceStateClass {
     # the rule forbidding a bare 'N/A' test is SYNTACTIC on purpose - it cannot see that $value was
     # already stringified above, and the one time it would be allowed to make that judgement is the
     # time a bool slips through and [bool]'N/A' quietly returns true.
-    if ([string]::IsNullOrWhiteSpace($value) -or [string] $value -eq 'N/A') { return 'muted-cell' }
+    # 'Unknown' joins them, and it is the SCM's own word rather than one of ours. The service control
+    # manager reports it when it cannot determine a service's state, so it is the third member of the
+    # same "could not determine" family as a blank and 'N/A' - and it was the only one painted as a
+    # measured failure, with the word 'Unknown' printed beside it:
+    #
+    #     state       class        text          reading
+    #     'Stopped'   red          Stopped       correct - a measured failure
+    #     ''          muted-cell   Not tested    correct
+    #     'N/A'       muted-cell   Not tested    correct
+    #     'Unknown'   RED          Unknown       a failure asserted about a value nobody determined
+    #
+    # Only that ONE token is added. A state this code does not enumerate - 'Paused', 'StartPending' -
+    # is still a state that WAS read, and must keep its answer; widening this to "anything
+    # unrecognised is unread" would hide real failures behind the same muted cell.
+    if ([string]::IsNullOrWhiteSpace($value) -or [string] $value -eq 'N/A' -or [string] $value -eq 'Unknown') { return 'muted-cell' }
     if ($value -eq 'Running') { return 'green' }
     if ($value -eq 'Not installed') { return 'grey' }
     'red'
@@ -18204,7 +18347,10 @@ function Get-mdiServiceStateText {
     )
 
     $value = if ($State -is [string]) { $State.Trim() } else { '' }
-    if ([string]::IsNullOrWhiteSpace($value) -or [string] $value -eq 'N/A') { return 'Not tested' }
+    # 'Unknown' is added here as well as in the class, and that is the whole point of this pair: the
+    # words and the colour are computed by two functions and must not be able to disagree. A muted
+    # cell reading 'Unknown' would be the same contradiction in a quieter form.
+    if ([string]::IsNullOrWhiteSpace($value) -or [string] $value -eq 'N/A' -or [string] $value -eq 'Unknown') { return 'Not tested' }
     $value
 }
 

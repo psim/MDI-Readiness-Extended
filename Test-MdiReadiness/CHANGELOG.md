@@ -42,6 +42,53 @@ is added, so an existing `-BaselinePath` history and any `-AsJson` consumer keep
 
 ### Fixed
 
+- A NetBIOS domain name the directory could not resolve was charged as an unexamined domain against
+  an estate that had just been fully scanned. `-Domain` is documented as "Domain Name or FQDN", and
+  the name shown to an administrator of a disjoint namespace is the NetBIOS one. When both readers
+  fail - no RSAT, or ADWS 9389 filtered and the DC locator unreachable, the ordinary case on the
+  workstation this tool documents itself as runnable from - the scope stays `FABCORP` while every
+  scanned row says `fabrikam.local`, and the run lost readiness on all three surfaces that share
+  that definition. A single dotless scope entry over rows agreeing on one readable domain is now
+  read as its NetBIOS spelling. Deliberately narrowed to a single scope entry: a dotless name
+  sitting beside others says nothing about which domain the rows came from, and is still charged.
+- A record entry could be silently dropped and the wrong value kept under the surviving name.
+  `ConvertTo-mdiRecordObject` copies any dictionary into an ordered bag, which is case-insensitive,
+  while the source need not be - a dictionary built with an ordinal comparer legitimately holds
+  `Requirement` and `requirement` as two entries. The last one enumerated won, so a consumer reading
+  `.Requirement` on a required port measured as refused got `Optional`. A colliding key is now
+  carried under a prefixed name, which is this function's existing precedent for a name that cannot
+  be a property. No shipped producer creates this shape; foreign report objects can.
+- The service control manager's own `Unknown` was the only member of the "could not determine"
+  family painted as a measured failure. A blank and `N/A` already read as `Not tested` on a muted
+  cell; `Unknown` fell through to red with the word printed beside it, so a reader could not tell a
+  service that FAILED from one nobody could read. Both halves of the pair were changed together, so
+  the words and the colour still cannot disagree. Only that one token moved - a state this code does
+  not enumerate, such as `Paused`, is still a state that was read.
+- A port that stayed silent through both probe budgets was reported as `Blocked` naming only a
+  firewall, although the probe performs no reachability check. Over TCP a dropped packet and an
+  unreachable host are indistinguishable, so the detail now names both causes and says so. The
+  leading `Blocked - ` token is unchanged, because the report's filters key on it.
+
+- A malformed sensor API URL destroyed the whole port probe pass instead of costing its own row.
+  `-WorkspaceName` is pasted straight into a hostname to build the cloud probe's target, and the
+  host was then read back with a bare `[uri]` cast evaluated inside an argument list in the probe
+  loop, with no `try` between it and the caller. A `[uri]` cast throws on a malformed URL, so the
+  failure was not the cloud row but the entire pass: measured with a two-probe plan, a valid name
+  returned both records while `-WorkspaceName 'my workspace'` returned none - and it returned none
+  even when the other probe had already run and been collected, because the function returns
+  nothing rather than the results it holds. A probe with no record cannot be counted as missing by
+  anything downstream, so the estate rendered as though those ports were never required. Six
+  ordinary inputs reach it: a space, a colon, a backslash, `[`, a bad percent escape and a bare
+  `%`. `Invoke-mdiPortProbePlan` is in the shipped function list, so this ran inside the remote
+  command line on every scanned server. The URL is now parsed with `[uri]::TryCreate` before it is
+  trusted, and an unusable one is recorded as not tested instead of ending the pass - the same
+  resolution the DNS question in the same function already had.
+- A workspace name containing `/`, `#`, `?` or `@` silently retargeted the cloud probe at a
+  different machine and filed the answer under the sensor API's name. Those characters end the URL
+  authority, so `ws/x`, `ws#frag` and `ws?q=1` all resolved to the host `ws`, and none of them
+  throws. The authority is now required to be the whole of what was built - no userinfo, no query,
+  no fragment and an absolute path of `/` - so a name that would move the probe is refused rather
+  than followed.
 - A process termination whose outcome was never read was reported as a completed termination. When a
   remote command outruns its timeout the process is terminated with `Win32_Process.Terminate`, which
   reports failure through a return value rather than by throwing. The status was read as
