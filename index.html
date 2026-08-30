@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Test-MdiReadiness.ps1 (extended) — Defender for Identity readiness check for Active Directory</title>
+<meta name="description" content="An extended, unofficial build of Microsoft's Test-MdiReadiness.ps1: forest-wide scanning, network port and NNR validation, sensor v3.x upgrade readiness, capacity planning and a redesigned HTML report. A prerequisite it cannot read is reported as unread, never as a pass.">
+<link rel="canonical" href="https://psim.github.io/MDI-Readiness-Extended/">
+
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="MDI-Readiness-Extended">
+<meta property="og:title" content="Test-MdiReadiness.ps1 (extended) — Defender for Identity readiness check">
+<meta property="og:description" content="Forest-wide scanning, port and NNR validation, sensor v3.x readiness, capacity planning and a redesigned HTML report. A prerequisite it cannot read is never reported as a pass.">
+<meta property="og:url" content="https://psim.github.io/MDI-Readiness-Extended/">
+<meta property="og:image" content="https://psim.github.io/MDI-Readiness-Extended/img/report-overview.png">
+<meta name="twitter:card" content="summary_large_image">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "MDI-Readiness-Extended",
+  "alternateName": "Test-MdiReadiness.ps1 (extended build)",
+  "description": "An extended, unofficial build of Microsoft's Test-MdiReadiness.ps1 readiness script for Microsoft Defender for Identity. Adds forest-wide scanning, required network port and NNR validation, sensor v3.x upgrade readiness, capacity planning, a generated remediation script and a redesigned HTML report.",
+  "codeRepository": "https://github.com/psim/MDI-Readiness-Extended",
+  "programmingLanguage": "PowerShell",
+  "runtimePlatform": "Windows PowerShell 5.1",
+  "license": "https://opensource.org/licenses/MIT",
+  "softwareVersion": "1.2.0",
+  "author": { "@type": "Person", "name": "Pietro Di Simplicio", "url": "https://github.com/psim" },
+  "about": "Microsoft Defender for Identity sensor prerequisites and Active Directory readiness assessment",
+  "isBasedOn": "https://github.com/microsoft/Microsoft-Defender-for-Identity"
+}
+</script>
+
+<style>
+  :root { --ink:#16213a; --muted:#5a6478; --accent:#2f5496; --line:#dfe4ee; --bg:#fff; --soft:#f5f7fb; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  .wrap { max-width:880px; margin:0 auto; padding:0 22px; }
+  header { background:linear-gradient(115deg,#1b3c86,#4b2fa8); color:#fff; padding:52px 0 40px; }
+  header .eyebrow { text-transform:uppercase; letter-spacing:.12em; font-size:12px; opacity:.85; margin:0 0 10px; }
+  header h1 { margin:0 0 12px; font-size:34px; line-height:1.2; }
+  header p { margin:0 0 22px; font-size:18px; opacity:.94; max-width:64ch; }
+  .btn { display:inline-block; padding:11px 20px; border-radius:7px; text-decoration:none;
+         font-weight:600; font-size:15px; margin:0 10px 10px 0; }
+  .btn-primary { background:#fff; color:#1b3c86; }
+  .btn-ghost { border:1px solid rgba(255,255,255,.55); color:#fff; }
+  main { padding:44px 0 10px; }
+  h2 { font-size:24px; margin:40px 0 12px; color:var(--accent); }
+  h3 { font-size:18px; margin:26px 0 8px; }
+  p, li { color:#243049; }
+  code, pre { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; }
+  code { background:var(--soft); padding:2px 6px; border-radius:4px; font-size:14px; }
+  pre { background:var(--soft); border-left:4px solid var(--accent); padding:14px 16px;
+        overflow-x:auto; border-radius:0 6px 6px 0; font-size:14px; }
+  table { border-collapse:collapse; width:100%; margin:18px 0; font-size:15px; }
+  th, td { border:1px solid var(--line); padding:9px 12px; text-align:left; }
+  th { background:var(--accent); color:#fff; }
+  tbody tr:nth-child(even) { background:var(--soft); }
+  td.yes { color:#1e6b3a; font-weight:600; }
+  figure { margin:26px 0; }
+  figure img { width:100%; border:1px solid var(--line); border-radius:6px; display:block; }
+  figcaption { font-size:13.5px; color:var(--muted); text-align:center; margin-top:8px; font-style:italic; }
+  .notice { background:#fff6e5; border:1px solid #e2b657; border-left:6px solid #d9a441;
+            padding:14px 18px; border-radius:6px; margin:34px 0; font-size:14.5px; color:#6d4700; }
+  footer { border-top:1px solid var(--line); margin-top:46px; padding:24px 0 44px;
+           color:var(--muted); font-size:14px; }
+  a { color:#0b5cd5; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <p class="eyebrow">Microsoft Defender for Identity</p>
+    <h1>Test-MdiReadiness.ps1 &mdash; extended build</h1>
+    <p>Checks whether Active Directory is ready for a Defender for Identity sensor &mdash;
+       across the whole forest, including the network ports, name resolution and sensor v3.x
+       prerequisites the original script does not test.</p>
+    <a class="btn btn-primary" href="https://github.com/psim/MDI-Readiness-Extended/releases/latest">Download v1.2.0</a>
+    <a class="btn btn-ghost" href="https://github.com/psim/MDI-Readiness-Extended">Source on GitHub</a>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <p>A single self-contained PowerShell script &mdash; no modules, no dependencies, no installation.
+     Copy one file to a domain-joined machine and run it. The HTML report it produces is
+     self-contained too, so it opens on an isolated domain controller with no internet access.</p>
+
+  <pre>.\Test-MdiReadiness.ps1 -Forest -OpenHtmlReport</pre>
+
+  <h2>Why it exists</h2>
+
+  <p>Microsoft's original script answers &ldquo;is this environment ready?&rdquo; with
+     <strong>ready</strong> or <strong>not ready</strong>. The problem is the third case, which
+     happens constantly on a real network: <strong>the script could not read the answer.</strong></p>
+
+  <p>No RSAT. ADWS filtered. Remote registry denied across a trust. WMI unreachable. In those cases
+     a prerequisite has not passed and has not failed &mdash; nobody looked.</p>
+
+  <p>Every release of this build has pushed on that one point: <strong>a value the script could not
+     read must never come back looking like a measurement.</strong> An unread check does not sit in
+     the failed column, it is not quietly counted as a pass, and it stops the run from claiming
+     READY. The report says &ldquo;not measured&rdquo; and explains why.</p>
+
+  <p>That matters most in the case you would never catch by eye: a scan that reads almost nothing
+     still prints a confident verdict &mdash; and the confident verdict is the one people forward
+     to a customer.</p>
+
+  <h2>Compared with the original script</h2>
+
+  <table>
+    <thead>
+      <tr><th></th><th>Original</th><th>Extended build v1.2.0</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Parameters</td><td>8</td><td class="yes">30</td></tr>
+      <tr><td>Functions</td><td>24</td><td class="yes">197</td></tr>
+      <tr><td>Lines of code</td><td>1,092</td><td class="yes">21,252</td></tr>
+      <tr><td>Regression tests</td><td>none</td><td class="yes">341 files / 11,290 assertions</td></tr>
+      <tr><td>Forest-wide scanning</td><td>no</td><td class="yes">yes</td></tr>
+      <tr><td>Network port validation</td><td>no</td><td class="yes">11 requirements, probed per sensor</td></tr>
+      <tr><td>NNR troubleshooting matrix</td><td>no</td><td class="yes">yes</td></tr>
+      <tr><td>Sensor v3.x upgrade readiness</td><td>no</td><td class="yes">8 prerequisites per server</td></tr>
+      <tr><td>Capacity planning</td><td>no</td><td class="yes">yes</td></tr>
+      <tr><td>Remediation script</td><td>no</td><td class="yes">generated every run</td></tr>
+      <tr><td>Trend tracking</td><td>no</td><td class="yes">on by default</td></tr>
+      <tr><td>Pipeline / CI gate</td><td>no</td><td class="yes">yes, with distinct exit codes</td></tr>
+    </tbody>
+  </table>
+
+  <h2>What it checks</h2>
+
+  <h3>Required network ports</h3>
+  <p>All 11 documented sensor requirements, probed <strong>from each sensor server</strong>, so it
+     tests the real sensor&nbsp;&rarr;&nbsp;target direction rather than the reverse. UDP ports are
+     validated with a genuine protocol request &mdash; an NBSTAT node status request on 137, a DNS
+     query on 53 and a CLDAP rootDSE search on 389 &mdash; because a UDP &ldquo;connect&rdquo; alone
+     proves nothing.</p>
+
+  <h3>Network Name Resolution (NNR)</h3>
+  <p>A matrix showing, per sensor and per target, which of the four name-resolution methods
+     succeeded. This is what you need when a tenant reports the
+     <em>Low success rate of active name resolution</em> health alert.</p>
+
+  <h3>Sensor v3.x upgrade readiness</h3>
+  <p>The eight v3.x prerequisites and in-place migration eligibility for every server, with the
+     exact blocker named for each one.</p>
+
+  <h3>Capacity planning</h3>
+  <p>Samples the packet rate of every domain controller concurrently and maps it to the published
+     sizing table. Short samples are labelled estimates rather than presented as verdicts.</p>
+
+  <h3>And also</h3>
+  <p>Sensor service health, clock skew across sensor servers, Deleted Objects container
+     permissions, and probe latency &mdash; so you can tell a blocked port from one that is
+     reachable but slow.</p>
+
+  <h2>The report</h2>
+
+  <p>A single self-contained HTML file: tabbed, each tab deep-linkable and filterable, CSV export
+     per tab, a print stylesheet that expands everything for PDF, and a layout that adapts from
+     ultrawide down to phone width. A <em>Classic view</em> button returns the original single-page
+     layout for anyone who prefers the report they already know.</p>
+
+  <figure>
+    <img src="img/report-overview.png" width="1500" height="553" loading="lazy"
+         alt="Readiness report overview with KPI cards: servers scanned, servers fully ready, required ports open, NNR resolvable targets, sensor health and sensor v3.x readiness">
+    <figcaption>The overview: &ldquo;not measured&rdquo; is reported separately from &ldquo;failed&rdquo; throughout.</figcaption>
+  </figure>
+
+  <figure>
+    <img src="img/report-ports.png" width="1444" height="1250" loading="lazy"
+         alt="Network port matrix showing each documented Defender for Identity sensor port requirement against every sensor server">
+    <figcaption>The port matrix: every documented requirement against every sensor server.</figcaption>
+  </figure>
+
+  <figure>
+    <img src="img/report-sensor-v3.png" width="1444" height="910" loading="lazy"
+         alt="Sensor v3.x upgrade readiness table listing each prerequisite per domain controller and the exact blocker for each server">
+    <figcaption>Sensor v3.x readiness, with the exact blocker named per server.</figcaption>
+  </figure>
+
+  <h2>Running it as a compliance gate</h2>
+
+  <p><code>-FailOnIssues</code> exits with the issue count and <code>-AsJson</code> emits the whole
+     report object. Exit code <code>255</code> means <em>the scan never ran</em> and is kept
+     deliberately distinct from <em>the scan found problems</em>, so a scheduled job cannot read a
+     scan that looked at nothing as a pass.</p>
+
+  <pre>.\Test-MdiReadiness.ps1 -Forest -FailOnIssues
+if ($LASTEXITCODE -eq 255) { throw "MDI readiness scan could not enumerate any domain controller" }
+if ($LASTEXITCODE -ne 0)   { throw "MDI readiness regressed ($LASTEXITCODE issue(s))" }</pre>
+
+  <h2>How it is tested</h2>
+
+  <p>Every fix ships with a regression test, and the whole suite runs before anything is released:
+     <strong>341 test files, 11,290 assertions, 0 failures.</strong> On top of that, each release is
+     verified end to end on a live multi-domain lab &mdash; staged to a member server by SHA256 and
+     run as a domain account through a scheduled task &mdash; because a green unit suite says
+     nothing about whether a real identity can log on, reach the directory and produce a report.</p>
+
+  <div class="notice">
+    <strong>Personal project &mdash; not an official Microsoft product.</strong>
+    This is an unofficial, modified version of Microsoft's <code>Test-MdiReadiness.ps1</code>.
+    It is not endorsed or supported by Microsoft and is not covered by any Microsoft support
+    agreement &mdash; do not open Microsoft support cases about it. For the official, supported
+    tool use the
+    <a href="https://github.com/microsoft/Microsoft-Defender-for-Identity">upstream repository</a>.
+    Provided &ldquo;as is&rdquo;, with no warranty and no liability of any kind. It reads
+    configuration from your domain controllers and opens network connections to them: review the
+    code, test it in a non-production environment first, and verify its findings against the
+    current
+    <a href="https://learn.microsoft.com/defender-for-identity/">official documentation</a>
+    before acting on them. Original work Copyright (c) Microsoft Corporation, used under the
+    upstream repository's MIT licence.
+  </div>
+
+</main>
+
+<footer class="wrap">
+  <p>Written by <a href="https://github.com/psim">Pietro Di Simplicio</a> &middot;
+     Source and issues on <a href="https://github.com/psim/MDI-Readiness-Extended">GitHub</a></p>
+</footer>
+
+</body>
+</html>
